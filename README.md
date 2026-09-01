@@ -12,7 +12,7 @@ closed-source commercial plugins without ever seeing their source. You bring you
 nothing is patched and nothing is redistributed.
 
 > Status: early. The Go MCP layer and the C++ control listener are working and tested; the child-plugin host
-> (the JUCE `AudioPluginFormatManager` wrapper) is an MVP. See the [roadmap](#roadmap).
+> (the JUCE `AudioPluginFormatManager` wrapper) is an MVP.
 
 ## Why
 
@@ -124,17 +124,6 @@ sidechain.RegisterParamTools(srv, myCatalog, func() sidechain.LiveEndpoint { ret
 The C++ `sidechain::ControlListener` is a single header: drop it into any JUCE plugin or app, construct it with
 a `juce::AudioProcessor&` + `juce::MidiKeyboardState&` + a port, and it exposes that processor over the same
 wire protocol.
-
-## Roadmap
-
-- [x] Generic MCP param tools (list/get/set, batch set) with GCF encoding + JSON fallback.
-- [x] C++ `ControlListener` (loopback control, message-thread apply, opaque full-state round-trip).
-- [x] Headless child-plugin host MVP (load a VST3/AU, enumerate its catalog, serve control).
-- [ ] Plugin scanning / discovery (list installed plugins, not just load-by-path).
-- [ ] Crash sandboxing / isolation for misbehaving plugins.
-- [ ] Parameter-name normalization + an LLM semantics layer for plugins with poor metadata.
-- [ ] Preset/program access (enumerate + recall a plugin's own presets by index).
-- [ ] An in-DAW wrapper-plugin shape (single-binary, embedded control) alongside the headless host.
 
 ## License
 
