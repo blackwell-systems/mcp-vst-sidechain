@@ -220,3 +220,87 @@ func TestChangeNotifications(t *testing.T) {
 		}
 	}
 }
+
+// TestGovernedLive exercises the C3 governed conflict tier wired into ControlServer's message-thread drain
+// (GovernedState.h). Two controllers drive the governed coordination state over the socket: controller A takes the
+// exclusive solo lease (applied); controller B's acquire is rejected while A holds it (the reject policy); A sets a
+// voice budget then switches to a single-voice mode, which is compensated (budget clamped to 1, not rejected); and
+// B observes the changes as pushed governed_changed events. Gated on the sweep env; skipped otherwise.
+func TestGovernedLive(t *testing.T) {
+	portStr := os.Getenv("SIDECHAIN_SWEEP_PORT")
+	if portStr == "" || os.Getenv("SIDECHAIN_SWEEP_CATALOG") == "" {
+		t.Skip("set SIDECHAIN_SWEEP_PORT + SIDECHAIN_SWEEP_CATALOG to run the governed-state test")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("bad port: %v", err)
+	}
+
+	dial := func() *liveClient {
+		lc, err := dialLive("127.0.0.1", port)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		return lc
+	}
+
+	governed := func(m map[string]any) map[string]any {
+		g, _ := m["governed"].(map[string]any)
+		return g
+	}
+
+	a, b := dial(), dial()
+	defer a.Close()
+	defer b.Close()
+	if a.clientID == 0 || b.clientID == 0 || a.clientID == b.clientID {
+		t.Fatalf("expected two distinct nonzero client ids, got A=%d B=%d", a.clientID, b.clientID)
+	}
+
+	// A takes the exclusive lease.
+	resp, err := a.request(map[string]any{"cmd": "govern", "op": "acquire_solo"})
+	if err != nil {
+		t.Fatalf("A acquire_solo: %v", err)
+	}
+	if resp["resolution"] != "applied" || int(governed(resp)["solo_lease"].(float64)) != a.clientID {
+		t.Fatalf("A should hold the lease: %v", resp)
+	}
+
+	// B's acquire is rejected; A stays the holder.
+	resp, err = b.request(map[string]any{"cmd": "govern", "op": "acquire_solo"})
+	if err != nil {
+		t.Fatalf("B acquire_solo: %v", err)
+	}
+	if resp["resolution"] != "rejected" || int(governed(resp)["solo_lease"].(float64)) != a.clientID {
+		t.Fatalf("B's acquire should be rejected with A still holding: %v", resp)
+	}
+
+	// A sets a budget of 4, then switches to mono: the mode change compensates the budget to 1 (not rejected).
+	if _, err := a.request(map[string]any{"cmd": "govern", "op": "set_voice_budget", "n": 4}); err != nil {
+		t.Fatalf("A set_voice_budget: %v", err)
+	}
+	resp, err = a.request(map[string]any{"cmd": "govern", "op": "set_voice_mode", "mode": "mono"})
+	if err != nil {
+		t.Fatalf("A set_voice_mode: %v", err)
+	}
+	g := governed(resp)
+	if resp["resolution"] != "compensated" || g["mode"] != "mono" || int(g["voice_budget"].(float64)) != 1 {
+		t.Fatalf("mono switch should compensate the budget to 1: %v", resp)
+	}
+
+	// B, which issued no request since, must observe the change as a pushed governed_changed event.
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case ev := <-b.Events():
+			if ev["event"] != "governed_changed" {
+				continue
+			}
+			if eg := governed(ev); eg["mode"] == "mono" && int(eg["voice_budget"].(float64)) == 1 {
+				t.Logf("governed OK: A(%d) holds lease, mono compensated budget->1, B(%d) saw governed_changed", a.clientID, b.clientID)
+				return
+			}
+		case <-deadline:
+			t.Fatalf("B did not receive the governed_changed event for the mono switch within the window")
+		}
+	}
+}

@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include "GovernedState.h"
 #include "PluginBridge.h"
 
 // ================================================================================================
@@ -40,8 +41,11 @@
 // each gets a clientID at the ping handshake. The server also PUSHES unsolicited `param_changed` events, so the
 // protocol is multiplexed async (a reply carries the request `id`; an event carries an `event` field). Requests:
 //   ping · get_param{param} · set_param{param,(value|normalized|choice)} · note_on{chan,note,vel} ·
-//   note_off{chan,note} · all_notes_off · reset_init · load_state{state} · get_full_state · get_state.
-//   (load_state/get_full_state carry `state`: base64 of the plugin's own opaque state bytes, handled by the bridge.)
+//   note_off{chan,note} · all_notes_off · reset_init · load_state{state} · get_full_state · get_state ·
+//   govern{op,...} · get_governed.
+//   (load_state/get_full_state carry `state`: base64 of the plugin's own opaque state bytes, handled by the bridge.
+//    govern applies a command to the C3 governed coordination state on the single applier and pushes a
+//    `governed_changed` event; see GovernedState.h and docs/CONCURRENCY.md.)
 // ================================================================================================
 
 namespace sidechain
@@ -96,9 +100,12 @@ private:
         bool        loadOk  = false;
         bool        stateOk = false;
         std::string state;
+        Resolution  govRes  = Resolution::Applied;   // Govern: how the conflict tier resolved the command
+        GovState    govState;                        // Govern / GetGoverned: the governed state after the command
     };
 
-    enum class Kind : uint8_t { SetParam, NoteOn, NoteOff, AllNotesOff, ResetInit, LoadState, GetFullState };
+    enum class Kind : uint8_t { SetParam, NoteOn, NoteOff, AllNotesOff, ResetInit, LoadState, GetFullState,
+                                Govern, GetGoverned };
     struct Command
     {
         Kind  kind = Kind::SetParam;
@@ -106,6 +113,7 @@ private:
         int   b = 0;
         float f = 0.0f;
         std::string                 payload;    // LoadState: the base64 opaque blob
+        GovCmd                      gov;        // Govern: the governed command
         std::shared_ptr<Completion> done;       // null => fire-and-forget
         int   clientId = 0;                      // originating controller (attribution for change events)
     };
@@ -285,6 +293,12 @@ private:
         if (cmd == "get_state")
             return handleGetState (id);
 
+        if (cmd == "govern")
+            return handleGovern (req, id, clientId);
+
+        if (cmd == "get_governed")
+            return handleGetGoverned (id);
+
         return errorReply ("unknown_cmd", id);
     }
 
@@ -365,6 +379,91 @@ private:
             o.setProperty ("count",  (int) all.size());
             o.setProperty ("params", juce::var (params));
         });
+    }
+
+    // -------- governed coordination state (C3 conflict tier; see GovernedState.h / docs/CONCURRENCY.md) ---------
+    // A governed command is a MUTATION, so it flows through the same MPSC queue as set_param and applies on the
+    // single message thread via GovState::apply. The reply carries the resolution (applied/compensated/rejected)
+    // and the resulting governed state. Lease ops attribute to the originating controller (by = clientId).
+    juce::String handleGovern (const juce::var& req, const juce::var& id, int clientId)
+    {
+        const juce::String op = req.getProperty ("op", juce::var()).toString();
+        GovCmd g;
+        if      (op == "acquire_solo")     { g.op = GovOp::AcquireSolo; g.by = clientId; }
+        else if (op == "release_solo")     { g.op = GovOp::ReleaseSolo; g.by = clientId; }
+        else if (op == "set_voice_mode")   { g.op = GovOp::SetMode;   g.mode = parseMode (req.getProperty ("mode", "poly").toString()); }
+        else if (op == "set_voice_budget") { g.op = GovOp::SetBudget; g.n = (int) req.getProperty ("n", 1); }
+        else if (op == "set_panic")        { g.op = GovOp::SetPanic;  g.on = (bool) req.getProperty ("on", false); }
+        else if (op == "set_playing")      { g.op = GovOp::SetPlaying; g.on = (bool) req.getProperty ("on", false); }
+        else return errorReply ("unknown_op", id);
+
+        Command c; c.kind = Kind::Govern; c.gov = g; c.clientId = clientId;
+        auto done = submit (std::move (c), 250);
+        if (done == nullptr)
+            return errorReply ("timeout", id);
+        return okReply (id, [&] (juce::DynamicObject& o)
+        {
+            o.setProperty ("resolution", juce::String (resStr (done->govRes)));   // a rejection is an ok reply, not an error
+            o.setProperty ("governed",   govToVar (done->govState));
+        });
+    }
+
+    juce::String handleGetGoverned (const juce::var& id)
+    {
+        Command c; c.kind = Kind::GetGoverned;
+        auto done = submit (std::move (c), 250);
+        if (done == nullptr || ! done->stateOk)
+            return errorReply ("timeout", id);
+        return okReply (id, [&] (juce::DynamicObject& o) { o.setProperty ("governed", govToVar (done->govState)); });
+    }
+
+    static const char* modeStr (VoiceMode m) noexcept
+    {
+        switch (m)
+        {
+            case VoiceMode::Poly:   return "poly";
+            case VoiceMode::Mono:   return "mono";
+            case VoiceMode::Legato: return "legato";
+        }
+        return "poly";
+    }
+    static VoiceMode parseMode (const juce::String& m) noexcept
+    {
+        if (m == "mono")   return VoiceMode::Mono;
+        if (m == "legato") return VoiceMode::Legato;
+        return VoiceMode::Poly;
+    }
+    static const char* resStr (Resolution r) noexcept
+    {
+        switch (r)
+        {
+            case Resolution::Applied:     return "applied";
+            case Resolution::Compensated: return "compensated";
+            case Resolution::Rejected:    return "rejected";
+        }
+        return "applied";
+    }
+    static juce::var govToVar (const GovState& g)
+    {
+        auto* o = new juce::DynamicObject();
+        o->setProperty ("solo_lease",   g.soloLease);
+        o->setProperty ("mode",         juce::String (modeStr (g.mode)));
+        o->setProperty ("voice_budget", g.voiceBudget);
+        o->setProperty ("panic",        g.panicLatch);
+        o->setProperty ("playing",      g.playing);
+        return juce::var (o);
+    }
+
+    void broadcastGovernedChanged (int by, Resolution res)
+    {
+        auto* o = new juce::DynamicObject();
+        o->setProperty ("event",      "governed_changed");
+        o->setProperty ("governed",   govToVar (governed));
+        o->setProperty ("resolution", juce::String (resStr (res)));
+        o->setProperty ("by",         by);
+        const std::string line = juce::JSON::toString (juce::var (o), true).toStdString() + "\n";
+        std::lock_guard<std::mutex> lk (clientsMutex);
+        for (auto& c : clients) c.out->push (line);
     }
 
     // -------- change events (this : ParamChangeSink; the bridge calls us) -----------------------
@@ -465,6 +564,31 @@ private:
                 if (c.done)
                     c.done->stateOk = bridge.saveState (c.done->state);
                 break;
+            case Kind::Govern:
+                {
+                    // The conflict tier, on the single applier thread: fold the command into the governed state and
+                    // report how it resolved. LWW still governs the continuous params (bridge.applyParam); this
+                    // governs only the small invariant-bearing coordination state.
+                    Resolution res;
+                    const GovState next = governed.apply (c.gov, res);
+                    const bool changed = ! (next == governed);
+                    governed = next;
+                    if (c.done)
+                    {
+                        c.done->govRes   = res;
+                        c.done->govState = next;
+                    }
+                    if (changed)
+                        broadcastGovernedChanged (c.clientId, res);   // cross-controller visibility (C2 parity)
+                }
+                break;
+            case Kind::GetGoverned:
+                if (c.done)
+                {
+                    c.done->govState = governed;
+                    c.done->stateOk  = true;
+                }
+                break;
         }
     }
 
@@ -496,6 +620,8 @@ private:
     std::unique_ptr<std::atomic<bool>[]> dirty;          // per-param "changed off the message thread" flag
     int                                  dirtyCount = 0;
     std::atomic<int>                     applyingClientId { 0 };  // set around an apply so a synchronous change event is attributed
+
+    GovState governed;   // C3 governed coordination state; message-thread-owned (single applier), like the params
 
     std::mutex                queueMutex;
     std::deque<Command>       queue;

@@ -138,6 +138,17 @@ engine before the real conflicts appear tends to model the wrong invariants. The
    that its declarative ergonomics and reusable verified engine pay for the dependency. At that point the move is
    porting a proven model into gsm, not guessing at one.
 
+**Status.** Steps 2 and 3 are built. The model lives in `governed.go` (the `reduce`/`ok`/`repair` shape plus the
+conflict tier `apply`) with its exhaustive-enumeration proof in `governed_test.go`, and a faithful C++ port
+(`cpp/GovernedState.h`) is **wired into `ControlServer`'s message-thread drain**: `govern` / `get_governed` wire
+commands flow through the same MPSC queue as `set_param`, `GovState::apply` runs on the single applier alongside
+the LWW param path, and a governed change is broadcast as a `governed_changed` event (C2 parity). Covered by the
+gated `TestGovernedLive` (lease acquired / rejected / mode compensated, observed cross-controller). The governed
+schema (an exclusive-edit lease, a voice-mode gate, a panic/playback latch) is **illustrative**: it exercises both
+policies and is meant to be replaced by the real coordination state once multi-controller use surfaces the actual
+conflicts. gsm (step 4) remains the future engine for when that schema outgrows the hand-rolled model. The
+continuous params are untouched by any of this: they stay last-writer-wins.
+
 The reason this works without reaching for CRDTs or consensus: there is ONE host, ONE applier thread, and one
 copy of the state (invariant 2). C3 is not a distributed-convergence problem; it is keeping a small discrete
 invariant-bearing state consistent under a serial applier where per-variable LWW is too coarse. If the scope ever

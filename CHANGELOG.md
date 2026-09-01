@@ -80,6 +80,19 @@ All notable changes to this project are documented here. The format is based on
   governed-convergence engine for the small invariant-bearing coordination state. Validated by the gated
   `TestChangeNotifications` (controller A sets a param, controller B receives the attributed event). See
   `docs/CONCURRENCY.md`.
+- **C3 conflict tier wired into the message-thread drain (governed coordination state).** The hand-rolled
+  governed-state model (previously a Go-only stub with an enumeration proof) is ported to C++
+  (`cpp/GovernedState.h`) and wired into `ControlServer`: new `govern{op,...}` and `get_governed` wire commands
+  flow through the same MPSC queue as `set_param`, `GovState::apply` runs on the single applier alongside the LWW
+  param path (so the check-then-commit is atomic), and a governed change is broadcast to every controller as a
+  `governed_changed` event (change-notification parity with C2). The tier resolves each command as
+  **applied / compensated / rejected**: an exclusive-edit lease is a guarded reject (a controller cannot steal a
+  held lease), while the mode/budget/gate commands compensate (repair to the nearest legal state, e.g. switching
+  to a single-voice mode clamps the voice budget to 1). The continuous plugin params are untouched and stay
+  last-writer-wins. The governed schema is illustrative (to be replaced by the real coordination state once
+  multi-controller use surfaces the actual conflicts); `governed_test.go` stays the executable invariant proof,
+  kept in lockstep with the C++ port. Validated by the gated `TestGovernedLive` (lease acquired/rejected, mode
+  compensated, observed cross-controller). See `docs/CONCURRENCY.md`.
 - **`LiveEndpoint` interface:** `SetParam(id, v, isReal)` distinguishes a real-unit value from a normalized one;
   added `SampleText` (the value-text probe primitive).
 - **Denser default probe:** the value-text sweep uses 21 uniform points for a better curve read and seed.

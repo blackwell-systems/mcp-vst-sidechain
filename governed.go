@@ -51,12 +51,12 @@ func initialGovState() govState {
 	return govState{soloLease: 0, mode: modePoly, voiceBudget: 1, panicLatch: false, playing: false}
 }
 
-// ok is the invariant predicate: every reachable state must satisfy it.
+// ok is the invariant predicate: every reachable state must satisfy it. Note soloLease is NOT range-checked: it
+// holds an arbitrary controller id (0 = free), and its numeric value is not an invariant - lease exclusivity is a
+// transition guard in apply, not a state predicate. (allGovStates/allGovCommands bound the controller set only to
+// keep the enumeration finite; the real server assigns unbounded clientIds.)
 func (s govState) ok() bool {
 	if s.voiceBudget < minVoiceBudget || s.voiceBudget > maxVoiceBudget {
-		return false
-	}
-	if s.soloLease < 0 || s.soloLease > maxControllers {
 		return false
 	}
 	if s.mode != modePoly && s.voiceBudget != 1 {
@@ -72,9 +72,6 @@ func (s govState) ok() bool {
 // TOTAL (ok(repair(s)) holds for every s) and idempotent; governed_test.go asserts both. This is the compensation
 // the conflict tier commits when a command would otherwise leave an invariant violated.
 func (s govState) repair() govState {
-	if s.soloLease < 0 || s.soloLease > maxControllers {
-		s.soloLease = 0
-	}
 	if s.voiceBudget < minVoiceBudget {
 		s.voiceBudget = minVoiceBudget
 	}
