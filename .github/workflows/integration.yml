@@ -163,9 +163,9 @@ jobs:
 
       # Concurrency (docs/CONCURRENCY.md): several controllers drive ONE host at once. C1 = independent concurrent
       # control; C2 = one controller's change is pushed to another as a param_changed event. Both run against one
-      # Surge host (plenty of float params). Report-only for now (new); promote to required after a few green runs.
-      - name: Concurrency C1 + C2 (multi-controller, change events) - report-only
-        continue-on-error: true
+      # Surge host (plenty of float params). REQUIRED: the multi-controller substrate is a load-bearing product
+      # property, and both legs have run green on CI (C1 since its landing; C2 on its first run).
+      - name: Concurrency C1 + C2 (multi-controller, change events) - REQUIRED
         run: |
           set -euo pipefail
           HOST="cpp/build/sidechain-host_artefacts/Release/sidechain-host"

@@ -127,12 +127,18 @@ pipeline, and is promoted to required only after it is green across several runs
 The one report-only exception is honest: Surge Effects loads and drives under `xvfb` on Linux, but its state
 round-trip does not restore headless there, unlike macOS. It is surfaced, not hidden.
 
+A separate **concurrency leg (macOS, required)** drives one Surge host with several controllers at once and runs
+`TestMultiClientLive` (C1: distinct identities, independent concurrent control, a state read during a set hammer,
+clean disconnect) and `TestChangeNotifications` (C2: one controller's set is pushed to another as an attributed
+`param_changed` event). See [CONCURRENCY.md](CONCURRENCY.md).
+
 ## Conventions (learned the hard way)
 
 - **Gated tests must skip cleanly with no env set.** Never let a live test fail the default `go test`.
-- **Every test that connects must disconnect.** The host serves ONE client at a time; a test that leaves its
-  connection open blocks the next test's handshake (a 5s timeout). Connect, assert `Connected LIVE`, then
-  `defer s.handleDisconnectLive(...)` (or `defer lc.Close()`).
+- **Every test that connects must disconnect.** The host now serves many connections at once (concurrency C1),
+  so a lingering connection no longer blocks the next handshake, but a leaked connection still holds a handler
+  thread and a socket and muddies the multi-controller identity/attribution assertions. Connect, assert
+  `Connected LIVE`, then `defer s.handleDisconnectLive(...)` (or `defer lc.Close()`).
 - **Run the state round-trip on a freshly loaded plugin.** `save_state`/`load_state` is meant to round-trip a
   natural patch. The full-surface sweep drives every param to extremes (a no-crash stress test) and leaves some
   plugins in an unnatural/modal state their own save/load will not reproduce. The harness runs the state test
