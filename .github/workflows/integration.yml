@@ -175,7 +175,10 @@ jobs:
     runs-on: ubuntu-latest
     continue-on-error: true
     env:
-      SIDECHAIN_HOST_BIN: cpp/build/sidechain-host_artefacts/sidechain-host
+      # JUCE writes the artefact under the $<CONFIG> subdir even on single-config generators when
+      # CMAKE_BUILD_TYPE is set, so the Linux path has the same Release/ segment as macOS (the earlier
+      # no-Release path caused "sidechain-host: not found" under xvfb-run).
+      SIDECHAIN_HOST_BIN: cpp/build/sidechain-host_artefacts/Release/sidechain-host
       SIDECHAIN_XVFB: "1"
     steps:
       - uses: actions/checkout@v7
