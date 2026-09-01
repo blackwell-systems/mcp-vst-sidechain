@@ -60,10 +60,17 @@ type CurveFit struct {
 const fitTol = 0.01
 
 func (f *CurveFit) eval(norm float64) float64 {
-	if f.Model == "exp" {
+	switch f.Model {
+	case "exp":
 		return f.A * math.Exp(f.B*norm)
+	case "power":
+		if norm <= 0 { // real(0) = 0 by definition (norm^B is undefined/degenerate at 0)
+			return 0
+		}
+		return f.A * math.Pow(norm, f.B)
+	default:
+		return f.A + f.B*norm
 	}
-	return f.A + f.B*norm
 }
 
 // invert solves norm for a target real value. ok=false when the model cannot represent the target (e.g. a
@@ -75,6 +82,14 @@ func (f *CurveFit) invert(target float64) (norm float64, ok bool) {
 			return 0, false
 		}
 		return math.Log(target/f.A) / f.B, true
+	case "power":
+		if f.A <= 0 || f.B == 0 || target < 0 {
+			return 0, false
+		}
+		if target == 0 {
+			return 0, true // real(0)=0, so norm 0 lands it exactly
+		}
+		return math.Pow(target/f.A, 1/f.B), true
 	default:
 		if f.B == 0 {
 			return 0, false
@@ -151,7 +166,38 @@ func fitCurve(table []realSample, rng float64) *CurveFit {
 			consider(&CurveFit{Model: "exp", A: math.Exp(p), B: q})
 		}
 	}
+	if f := fitPower(table); f != nil {
+		consider(f)
+	}
 	return best
+}
+
+// fitPower fits real = A*norm^P in log-log space (log(real) = log(A) + P*log(norm)) by least squares over the
+// samples with norm > 0 AND real > 0. Zero-crossing curves (a time knob that renders "0 ms" at norm 0 and
+// "32 s" at norm 1) suit this model where exp cannot: exp needs all reals positive and cannot pass through the
+// origin, whereas real=A*norm^P gives real(0)=0 for free. Non-positive reals are skipped from the fit, but any
+// negative real disqualifies the model entirely (a bipolar param is not a power law); the norm==0 endpoint is
+// skipped from the fit and captured by eval(0)=0. Needs at least 2 usable (norm>0, real>0) points. Returns nil
+// (leaving the fit to linear/exp) when it does not apply. Caller (fitCurve) scores MaxRelErr over ALL samples.
+func fitPower(table []realSample) *CurveFit {
+	var lx, ly []float64
+	for _, s := range table {
+		if s.real < 0 {
+			return nil // bipolar / sign-crossing: power law does not represent it
+		}
+		if s.norm > 0 && s.real > 0 {
+			lx = append(lx, math.Log(s.norm))
+			ly = append(ly, math.Log(s.real))
+		}
+	}
+	if len(lx) < 2 {
+		return nil
+	}
+	a, b, ok := lsq(lx, ly)
+	if !ok {
+		return nil
+	}
+	return &CurveFit{Model: "power", A: math.Exp(a), B: b}
 }
 
 // leading signed number + optional unit token (letters or %). Anything after (e.g. " (Left)") is stripped first.

@@ -6,6 +6,7 @@
 package sidechain
 
 import (
+	"fmt"
 	"math"
 	"testing"
 )
@@ -221,6 +222,83 @@ func TestFitCurveSelection(t *testing.T) {
 	fe := fitCurve(expTable, 20000-20)
 	if fe == nil || fe.Model != "exp" {
 		t.Fatalf("clean exp fit = %+v, want exp", fe)
+	}
+}
+
+func TestFitPowerZeroCrossing(t *testing.T) {
+	// A time knob that renders "0 ms" at norm 0 and grows steeply to "32 s" at norm 1, sampled on real =
+	// 32*norm^6.5 (rendered ms below 1 s, s above). exp cannot fit (log(0) at the origin) and linear is far off,
+	// but the power model captures it and inverts closed-form.
+	real := func(n float64) float64 { return 32 * math.Pow(n, 6.5) }
+	render := func(n float64) string {
+		v := real(n)
+		if v < 1 {
+			return fmt.Sprintf("%.1f ms", v*1000) // 0.3536 s -> "353.6 ms"
+		}
+		return fmt.Sprintf("%.2f s", v)
+	}
+	var samples []ValueSample
+	for _, n := range []float64{0, 0.1, 0.25, 0.5, 0.75, 0.9, 1} {
+		samples = append(samples, ValueSample{Norm: n, Text: render(n)})
+	}
+	pi := inferParam(samples)
+	if pi.Unit != "s" {
+		t.Fatalf("time knob unit = %q, want s", pi.Unit)
+	}
+	if pi.Fit == nil || pi.Fit.Model != "power" {
+		t.Fatalf("time knob fit = %+v, want a power fit", pi.Fit)
+	}
+	if !pi.analyticReliable() {
+		t.Fatalf("power fit should be reliable (rendering rounds slightly), err=%.6f", pi.Fit.MaxRelErr)
+	}
+	// Invert to a few targets and confirm the analytic path lands close in norm space.
+	for _, n := range []float64{0.25, 0.5, 0.75} {
+		target := real(n)
+		if got, ok := pi.NormForReal(target); !ok || !approx(got, n, 0.01) {
+			t.Errorf("power invert(%.4f s) = %v (ok=%v), want norm ~%.4f", target, got, ok, n)
+		}
+	}
+	// norm==0 endpoint: real(0)=0 must invert back to 0 exactly.
+	if got, ok := pi.NormForReal(0); !ok || got != 0 {
+		t.Errorf("power invert(0) = %v (ok=%v), want 0", got, ok)
+	}
+}
+
+func TestFitPowerRejectsBipolar(t *testing.T) {
+	// A table with a negative real must NOT be modeled as a power law (norm^P is single-signed).
+	if f := fitPower([]realSample{{0, -10}, {0.5, 0}, {1, 10}}); f != nil {
+		t.Errorf("fitPower on a bipolar table = %+v, want nil", f)
+	}
+	// Fewer than 2 usable (norm>0, real>0) points => nil (only the norm==0 endpoint is positive here).
+	if f := fitPower([]realSample{{0, 0}, {0.0, 0}}); f != nil {
+		t.Errorf("fitPower with <2 usable points = %+v, want nil", f)
+	}
+}
+
+func TestCurveFitInvertPower(t *testing.T) {
+	p := &CurveFit{Model: "power", A: 32, B: 6.5}
+	// eval(0) is 0 by definition; invert(0) round-trips to 0.
+	if p.eval(0) != 0 {
+		t.Errorf("power eval(0) = %v, want 0", p.eval(0))
+	}
+	if n, ok := p.invert(0); !ok || n != 0 {
+		t.Errorf("power invert(0) = %v,%v want 0,true", n, ok)
+	}
+	// round-trip a mid value.
+	tgt := p.eval(0.5)
+	if n, ok := p.invert(tgt); !ok || !approx(n, 0.5, 1e-9) {
+		t.Errorf("power invert roundtrip = %v,%v want 0.5,true", n, ok)
+	}
+	// negative target: unrepresentable.
+	if _, ok := p.invert(-1); ok {
+		t.Error("power invert(neg) should be ok=false")
+	}
+	// degenerate A / B.
+	if _, ok := (&CurveFit{Model: "power", A: 0, B: 2}).invert(5); ok {
+		t.Error("power A<=0 invert should be ok=false")
+	}
+	if _, ok := (&CurveFit{Model: "power", A: 2, B: 0}).invert(5); ok {
+		t.Error("power B==0 invert should be ok=false")
 	}
 }
 

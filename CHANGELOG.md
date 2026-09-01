@@ -25,6 +25,10 @@ All notable changes to this project are documented here. The format is based on
   `hasRealRange: false`.
 - **Parameter grouping.** The host populates each param's group from the plugin's parameter tree (VST3 units /
   AU clumps) when the plugin exposes one; plugins with a flat tree leave it empty (unchanged).
+- **Power-curve fit for zero-crossing curves.** Curve fitting adds a power model (real = A*norm^P) alongside
+  linear and exp. This captures a knob that starts at zero and grows steeply (a time control 0 ms -> 32 s), which
+  exp cannot fit (log undefined at the 0 endpoint) and linear fits poorly, so `set_param real=` inverts it in
+  closed form instead of falling back to a binary-search refine.
 
 ### Changed
 

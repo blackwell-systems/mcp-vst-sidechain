@@ -29,17 +29,38 @@ import (
 func fakeHz(norm float64) string     { return fmt.Sprintf("%.2f Hz", 20+norm*19980) }
 func fakeHzExpo(norm float64) string { return fmt.Sprintf("%.2f Hz", 20*math.Pow(1000, norm)) }
 
+// fakeHzSigmoid is a monotonic S-curve (a logistic): its concave-then-convex shape fits none of the
+// linear/exp/power models well, so it forces the binary-search refinement path. real(0) > 0 (so it is not a
+// zero-crossing power law) and it is flat at both ends but steep in the middle.
+func fakeHzSigmoid(norm float64) float64 { return 1000 / (1 + math.Exp(-12*(norm-0.5))) }
+
 func renderFor(id string, norm float64) string {
 	switch id {
 	case "expo":
 		return fakeHzExpo(norm)
-	case "cubic": // neither linear nor exp fits (real(0)=0 rules out exp) => forces binary-search refinement
-		return fmt.Sprintf("%.2f Hz", 1000*norm*norm*norm)
+	case "power": // zero-crossing power law real = 32*norm^6.5 s, rendered ms below 1 s, s at/above (a time knob).
+		// Full precision (no rounding) so the samples lie exactly on the curve and the power fit is clean.
+		v := 32 * math.Pow(norm, 6.5)
+		if v < 1 {
+			return fmt.Sprintf("%g ms", v*1000)
+		}
+		return fmt.Sprintf("%g s", v)
+	case "sigmoid": // S-curve: fits no closed-form model => forces binary-search refinement
+		return fmt.Sprintf("%.2f Hz", fakeHzSigmoid(norm))
 	case "toggle": // discrete: labels only, so inference reports !Numeric
 		if norm >= 0.5 {
 			return "On"
 		}
 		return "Off"
+	case "filterType": // discrete-as-float: three bands render LP/BP/HP across thirds of the range
+		switch {
+		case norm < 1.0/3.0:
+			return "LP"
+		case norm < 2.0/3.0:
+			return "BP"
+		default:
+			return "HP"
+		}
 	case "raw": // numeric but unitless: getText echoes the bare number, so inference has Unit==""
 		return fmt.Sprintf("%.4f", norm)
 	default:
@@ -453,30 +474,66 @@ func TestSetRealExponentialAnalytic(t *testing.T) {
 	}
 }
 
-// TestSetRealRefineFallback: a cubic curve fits neither model, so analyticReliable() is false and set_param
-// real= must fall back to binary-search refinement to converge.
-func TestSetRealRefineFallback(t *testing.T) {
+// TestSetRealPowerAnalytic: a zero-crossing time curve (real = 32*norm^6.5 s, rendered ms/s) gets a power fit,
+// so set_param real= inverts in closed form (no binary-search refinement) and lands on the target.
+func TestSetRealPowerAnalytic(t *testing.T) {
 	fh := startFakeHost(t)
 	defer fh.stop()
-	s := newSession(NewCatalog([]ParamDef{{ID: "cubic", Label: "Weird", Type: "float", Min: 0, Max: 1}}))
+	s := newSession(NewCatalog([]ParamDef{{ID: "power", Label: "Attack", Type: "float", Min: 0, Max: 1}}))
 	ctx := context.Background()
 	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: fh.port()}); err != nil {
 		t.Fatalf("connect_live: %v", err)
 	}
-	if _, err := s.inference("cubic"); err != nil { // prime the cache so we can inspect the fit
-		t.Fatalf("probe cubic: %v", err)
+	_, dout, err := s.handleDescribeParam(ctx, nil, describeParamIn{ID: "power"})
+	if err != nil {
+		t.Fatalf("describe: %v", err)
 	}
-	if s.infer["cubic"].analyticReliable() {
-		t.Fatalf("cubic should NOT get a reliable fit, got %+v", s.infer["cubic"].Fit)
+	d, _ := dout.(struct {
+		ID        string         `json:"id"`
+		Label     string         `json:"label"`
+		Inference ParamInference `json:"inference"`
+		Samples   []ValueSample  `json:"samples"`
+	})
+	if d.Inference.Unit != "s" || d.Inference.Fit == nil || d.Inference.Fit.Model != "power" || !d.Inference.analyticReliable() {
+		t.Fatalf("power param should get a reliable power fit in s, got unit=%q fit=%+v", d.Inference.Unit, d.Inference.Fit)
 	}
-	target := 500.0 // 1000*n^3 = 500 => n = 0.7937
-	if _, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: "cubic", Real: &target}); err != nil {
+
+	target := 4.0 // 32*norm^6.5 = 4 => norm = (4/32)^(1/6.5) = 0.7286
+	if _, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: "power", Real: &target}); err != nil {
 		t.Fatalf("set real: %v", err)
 	}
 	fh.mu.Lock()
-	landedNorm := fh.params["cubic"]
+	landedNorm := fh.params["power"]
 	fh.mu.Unlock()
-	if landedHz := 1000 * landedNorm * landedNorm * landedNorm; math.Abs(landedHz-target) > 5 {
+	if landedSec := 32 * math.Pow(landedNorm, 6.5); math.Abs(landedSec-target) > 0.05 {
+		t.Fatalf("analytic power landed at %.3f s (norm %.4f), want ~4", landedSec, landedNorm)
+	}
+}
+
+// TestSetRealRefineFallback: an S-curve (logistic) fits none of the linear/exp/power models, so
+// analyticReliable() is false and set_param real= must fall back to binary-search refinement to converge.
+func TestSetRealRefineFallback(t *testing.T) {
+	fh := startFakeHost(t)
+	defer fh.stop()
+	s := newSession(NewCatalog([]ParamDef{{ID: "sigmoid", Label: "Weird", Type: "float", Min: 0, Max: 1}}))
+	ctx := context.Background()
+	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: fh.port()}); err != nil {
+		t.Fatalf("connect_live: %v", err)
+	}
+	if _, err := s.inference("sigmoid"); err != nil { // prime the cache so we can inspect the fit
+		t.Fatalf("probe sigmoid: %v", err)
+	}
+	if s.infer["sigmoid"].analyticReliable() {
+		t.Fatalf("sigmoid should NOT get a reliable fit, got %+v", s.infer["sigmoid"].Fit)
+	}
+	target := 500.0 // logistic midpoint: sigmoid(0.5) = 500 => n = 0.5
+	if _, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: "sigmoid", Real: &target}); err != nil {
+		t.Fatalf("set real: %v", err)
+	}
+	fh.mu.Lock()
+	landedNorm := fh.params["sigmoid"]
+	fh.mu.Unlock()
+	if landedHz := fakeHzSigmoid(landedNorm); math.Abs(landedHz-target) > 5 {
 		t.Fatalf("refinement landed at %.2f Hz (norm %.4f), want ~500", landedHz, landedNorm)
 	}
 }

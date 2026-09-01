@@ -193,10 +193,18 @@ func TestCurveFit(t *testing.T) {
 		t.Fatalf("vol fit = %+v, want exact linear", vol.Fit)
 	}
 
-	// A curve through zero (time from 0) cannot be exp (log undefined) and is too curved for linear: not reliable.
+	// A curve through zero (a time knob 0 ms -> 353.6 ms -> 32 s) cannot be exp (log undefined at 0) and is too
+	// curved for linear, but the power model real = A*norm^P captures it (real(0)=0 naturally). 353.6 ms = 0.3536
+	// s = 32 * 0.5^6.5, so the samples lie exactly on real = 32*norm^6.5 and the fit should be reliable.
 	tm := inferParam([]ValueSample{{0, "0 ms"}, {0.5, "353.6 ms"}, {1, "32.0 s"}})
-	if tm.analyticReliable() {
-		t.Errorf("0-based steep time curve should not be analytically reliable, got %+v", tm.Fit)
+	if tm.Fit == nil || tm.Fit.Model != "power" {
+		t.Fatalf("0-based steep time curve should fit power, got %+v", tm.Fit)
+	}
+	if !tm.analyticReliable() {
+		t.Errorf("power fit on the 0-based time curve should be reliable, err=%.6f", tm.Fit.MaxRelErr)
+	}
+	if n, ok := tm.NormForReal(0.3536); !ok || !approx(n, 0.5, 0.01) {
+		t.Errorf("analytic power invert(0.3536 s) = %v, want ~0.5", n)
 	}
 }
 
