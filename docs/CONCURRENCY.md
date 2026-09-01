@@ -149,9 +149,12 @@ The governed state models the genuine multi-controller coordination concerns (no
 
 - **Hierarchical edit leases.** A controller takes the whole-instance edit lease or a per-section lease, where a
   **section is a real param group of the loaded plugin** (`acquire_section{group:"Filters"}`). `ControlServer`
-  binds the leasable sections from `PluginBridge::sectionGroups()` at construction (the plugin's parameter-tree
-  groups: Surge exposes 14, a flat plugin exposes none, leaving only the instance lease); a `govern` on an unknown
-  group is refused. The invariant is hierarchical: if one controller holds the whole instance, no other may hold a
+  binds the leasable sections from `PluginBridge::sectionGroups()` at construction; a `govern` on an unknown group
+  is refused. Sections come from the plugin's parameter-tree groups when it has them (Surge exposes 14); for a
+  FLAT plugin the host derives them from shared label prefixes (`JucePluginBridge::deriveLabelSections`, a port of
+  the Go catalog's `sections.go`, so an agent paging a flat plugin by section can lease that same section - TAL
+  yields Amp, Delay, Envelope, Filter, Osc, Reverb, ...). Only a genuinely structureless plugin ends up with no
+  sections, leaving just the instance lease. The invariant is hierarchical: if one controller holds the whole instance, no other may hold a
   section of it. Taking the instance therefore revokes others' section leases (**compensate**); taking a section
   of an instance held by another is refused (**reject** guard); taking an instance already held by another is
   refused (**reject** guard). This is how concurrent editors avoid fighting over the same knobs. In the enumerated

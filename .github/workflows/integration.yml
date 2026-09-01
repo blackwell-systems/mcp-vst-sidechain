@@ -266,6 +266,36 @@ jobs:
           source .github/scripts/drive_plugin.sh
           drive_plugin "TAL-NoiseMaker" "$HOME/plugins/TAL-NoiseMaker.vst3" 51991 1
 
+      # Flat-plugin section leases (C3): TAL exposes NO parameter-tree groups, so the host derives leasable sections
+      # from shared label prefixes (JucePluginBridge, a port of sections.go). This exercises that fallback end to
+      # end: assert the derivation is non-empty (regression-to-empty fails here), then drive group-bound leases on
+      # the derived sections. Report-only for now (new).
+      - name: Flat-plugin section leases (label-prefix derivation, TAL) - report-only
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          xvfb-run -a "$SIDECHAIN_HOST_BIN" --plugin "$HOME/plugins/TAL-NoiseMaker.vst3" --catalog talgov.json --port 52020 >host-talgov.log 2>&1 &
+          HP=$!
+          trap 'kill $HP 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do [ -s talgov.json ] && break; sleep 1; done
+          test -s talgov.json || { echo "host did not write a catalog"; cat host-talgov.log; exit 1; }
+          python3 -c '
+          import socket, json, sys
+          s = socket.create_connection(("127.0.0.1", 52020), 3); f = s.makefile("rwb")
+          def req(o):
+              f.write((json.dumps(o) + "\n").encode()); f.flush()
+              while True:
+                  m = json.loads(f.readline())
+                  if "event" not in m: return m
+          req({"cmd": "ping", "id": 1})
+          secs = req({"cmd": "get_governed", "id": 2}).get("sections") or []
+          print("derived sections:", secs)
+          sys.exit(0 if len(secs) >= 2 else 1)
+          '
+          SIDECHAIN_SWEEP_PORT=52020 SIDECHAIN_SWEEP_CATALOG=talgov.json \
+            go test -run 'TestGovernedLive|TestGovernedDisconnectFreesLease' -v .
+
       # Dexed (REQUIRED): now green on Linux after the state round-trip moved to the fresh-load pass. Its earlier
       # failure was the same sweep-churn artifact as Surge Effects, not async state as first suspected (15/15
       # restored across confirming runs).

@@ -8,6 +8,10 @@
 // Derivation is a catalog-level VIEW only: it never mutates ParamDef.Group (the wire shape is untouched). It is
 // applied as a FALLBACK - only when the catalog is effectively ungrouped (every param is "other"/empty). When a
 // plugin exposes real groups, those are kept verbatim and no derivation happens.
+//
+// The C++ host mirrors this algorithm in JucePluginBridge::deriveLabelSections (cpp/JucePluginBridge.h) to bind
+// the C3 governed layer's leasable SECTIONS on a flat plugin, so an agent paging a flat plugin by section here can
+// lease that same section on the host. Keep the two in lockstep (verified against TAL-NoiseMaker's real labels).
 
 package sidechain
 
