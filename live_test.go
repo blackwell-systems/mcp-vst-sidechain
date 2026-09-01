@@ -35,6 +35,13 @@ func renderFor(id string, norm float64) string {
 		return fakeHzExpo(norm)
 	case "cubic": // neither linear nor exp fits (real(0)=0 rules out exp) => forces binary-search refinement
 		return fmt.Sprintf("%.2f Hz", 1000*norm*norm*norm)
+	case "toggle": // discrete: labels only, so inference reports !Numeric
+		if norm >= 0.5 {
+			return "On"
+		}
+		return "Off"
+	case "raw": // numeric but unitless: getText echoes the bare number, so inference has Unit==""
+		return fmt.Sprintf("%.4f", norm)
 	default:
 		return fakeHz(norm)
 	}
