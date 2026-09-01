@@ -50,6 +50,9 @@ func TestAULive(t *testing.T) {
 	if !strings.Contains(textOf(cres), "Connected LIVE") {
 		t.Fatalf("connect_live to AU host did not connect: %s", textOf(cres))
 	}
+	// The C++ host serves ONE client at a time; leaving this connection open would block any later gated test that
+	// connects to the same host. Always disconnect at the end.
+	defer s.handleDisconnectLive(ctx, nil, emptyIn{})
 
 	// get_param reads a real value off the running AU.
 	if _, _, err := s.handleGetParam(ctx, nil, getParamIn{ID: paramID}); err != nil {

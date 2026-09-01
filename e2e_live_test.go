@@ -55,6 +55,10 @@ func TestE2ESurgeExtras(t *testing.T) {
 	if !strings.Contains(textOf(cres), "Connected LIVE") {
 		t.Fatalf("connect_live did not connect: %s", textOf(cres))
 	}
+	// The C++ host serves ONE client at a time. CI runs the gated live tests together against a single host, so a
+	// test that leaves its connection open blocks every later connect (i/o timeout on the next handshake). Always
+	// disconnect at the end. This test sorts first by file order, so its leak was what broke the two that follow.
+	defer s.handleDisconnectLive(ctx, nil, emptyIn{})
 
 	// --- discrete-hiding-as-float: probe reveals labels; set by a label; the plugin readback confirms it. ---
 	if _, _, err := s.handleDescribeParam(ctx, nil, describeParamIn{ID: discreteID}); err != nil {

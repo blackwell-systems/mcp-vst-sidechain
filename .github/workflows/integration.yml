@@ -27,15 +27,15 @@ jobs:
   smoke:
     runs-on: macos-14
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version: 'stable'
           cache: true
 
       - name: Cache JUCE FetchContent
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: cpp/build/_deps
           key: juce-macos-${{ hashFiles('cpp/CMakeLists.txt') }}
@@ -47,7 +47,7 @@ jobs:
 
       - name: Cache Surge XT
         id: surge-cache
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: ~/surge
           key: surge-xt-${{ env.SURGE_VERSION }}
