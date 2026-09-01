@@ -1,6 +1,7 @@
 #pragma once
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_audio_basics/juce_audio_basics.h>
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <functional>
@@ -51,6 +52,29 @@ public:
             byIndex[(size_t) i] = &byId[id];   // node-based map => pointer stays valid as more are inserted
         }
         for (auto* p : params) p->addListener (this);
+
+        // Collect the distinct parameter groups (VST3 units / AU clumps), in first-seen order, the same way the
+        // catalog does. These are the leasable edit sections the governed layer binds to; a flat plugin yields none.
+        std::function<void (const juce::AudioProcessorParameterGroup&)> walk =
+            [&] (const juce::AudioProcessorParameterGroup& g)
+            {
+                for (auto* node : g)
+                {
+                    if (node->getParameter() != nullptr)
+                    {
+                        const juce::String gn = g.getName();
+                        if (gn.isNotEmpty())
+                        {
+                            const std::string s = gn.toStdString();
+                            if (std::find (groups.begin(), groups.end(), s) == groups.end())
+                                groups.push_back (s);
+                        }
+                    }
+                    else if (auto* sub = node->getGroup())
+                        walk (*sub);
+                }
+            };
+        walk (processor.getParameterTree());
     }
 
     ~JucePluginBridge() override
@@ -67,6 +91,8 @@ public:
 
     // ---- PluginBridge: read side (any thread) ----
     int  paramCount() const override { return (int) byIndex.size(); }
+
+    std::vector<std::string> sectionGroups() const override { return groups; }
 
     bool hasParam (const std::string& id) const override { return byId.find (id) != byId.end(); }
 
@@ -212,6 +238,7 @@ private:
 
     std::unordered_map<std::string, ParamRef> byId;
     std::vector<const ParamRef*>              byIndex;     // parameter index -> ParamRef (for change events)
+    std::vector<std::string>                  groups;      // distinct param groups (leasable sections), first-seen order
     std::atomic<ParamChangeSink*>             sink { nullptr };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (JucePluginBridge)

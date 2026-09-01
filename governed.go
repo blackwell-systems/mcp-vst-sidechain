@@ -9,7 +9,11 @@
 //     invariant is hierarchical: if one controller holds the whole instance, no OTHER controller may hold a
 //     section of it. Taking the instance therefore revokes others' section leases (the compensate path); trying
 //     to take a section of an instance held by another is refused (a reject guard). This is how concurrent editors
-//     avoid fighting over the same knobs.
+//     avoid fighting over the same knobs. Sections here are a fixed, small set of representative scope indices so
+//     the space stays enumerable; the runtime (cpp/GovernedState.h) binds them to the plugin's actual param GROUP
+//     NAMES. The two are equivalent because sections are per-scope-INDEPENDENT (they interact only with the
+//     instance lease, never each other - proven by TestGovSectionsIndependent), so this proof over a few scopes
+//     covers any number of named sections.
 //   - Patch generation. A monotone counter bumped whenever the whole patch changes (a load_state / reset_init).
 //     An agent reads it to detect that the base it was editing moved under it (optimistic concurrency).
 //   - Disconnect cleanup. When a controller disconnects (or crashes), every lease it held is released. Without

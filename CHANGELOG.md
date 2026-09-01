@@ -80,6 +80,16 @@ All notable changes to this project are documented here. The format is based on
   governed-convergence engine for the small invariant-bearing coordination state. Validated by the gated
   `TestChangeNotifications` (controller A sets a param, controller B receives the attributed event). See
   `docs/CONCURRENCY.md`.
+- **Section leases bind to the plugin's param groups.** A governed section lease is now taken on a real param
+  group by name (`govern{op:acquire_section, group:"Filters"}`) rather than an abstract index. `PluginBridge`
+  gained `sectionGroups()` (JucePluginBridge walks the parameter tree for the distinct groups, first-seen order);
+  `ControlServer` binds the leasable sections from it at construction and refuses a `govern` on an unknown group,
+  and `get_governed` returns the leasable group list plus the held section leases as `{group: holder}`. The C++
+  `GovState` now keys section leases by group name (`std::map<string,int>`), so any of a plugin's groups is
+  leasable (Surge exposes 14; a flat plugin exposes none, leaving only the instance lease). The enumerated Go
+  model keeps its fixed representative scopes as the proof, now joined by `TestGovSectionsIndependent` which makes
+  executable the per-scope-independence argument that lets the small enumeration cover any number of named groups.
+  Validated by `TestGovernedLive` driving Surge's real groups.
 - **C3 governed coordination state wired into the message-thread drain.** The conflict tier (a hand-rolled model
   in `governed.go` with an exhaustive-enumeration proof in `governed_test.go`) is ported to C++
   (`cpp/GovernedState.h`) and wired into `ControlServer`: new `govern{op,...}` and `get_governed` wire commands

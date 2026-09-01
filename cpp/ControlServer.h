@@ -42,7 +42,7 @@
 // protocol is multiplexed async (a reply carries the request `id`; an event carries an `event` field). Requests:
 //   ping · get_param{param} · set_param{param,(value|normalized|choice)} · note_on{chan,note,vel} ·
 //   note_off{chan,note} · all_notes_off · reset_init · load_state{state} · get_full_state · get_state ·
-//   govern{op:(acquire_instance|release_instance|acquire_section{scope}|release_section{scope})} · get_governed.
+//   govern{op:(acquire_instance|release_instance|acquire_section{group}|release_section{group})} · get_governed.
 //   (load_state/get_full_state carry `state`: base64 of the plugin's own opaque state bytes, handled by the bridge.
 //    govern applies a command to the C3 governed coordination state (hierarchical edit leases + patch generation)
 //    on the single applier and pushes a `governed_changed` event; a whole-patch change bumps the generation and a
@@ -67,6 +67,7 @@ public:
     {
         dirtyCount = bridge.paramCount();
         dirty = std::make_unique<std::atomic<bool>[]> ((size_t) juce::jmax (1, dirtyCount));
+        leasableSections = bridge.sectionGroups();   // the param groups a controller may take a section lease on
         bridge.setChangeSink (this);   // start hearing parameter changes
 
         status.store (Status::Listening);
@@ -179,7 +180,7 @@ private:
                     // Free any leases the departing controller held (disconnect cleanup). Fire-and-forget onto the
                     // message thread; skipped during teardown, where the drain is already stopping.
                     Command gone; gone.kind = Kind::Govern;
-                    gone.gov = GovCmd { GovOp::ControllerGone, cid, 0 };
+                    gone.gov = GovCmd { GovOp::ControllerGone, cid, {} };
                     gone.clientId = cid;
                     enqueue (std::move (gone));
                 }
@@ -401,8 +402,14 @@ private:
         GovCmd g; g.by = clientId;   // a lease is acquired/released AS the calling controller
         if      (op == "acquire_instance") g.op = GovOp::AcquireInstance;
         else if (op == "release_instance") g.op = GovOp::ReleaseInstance;
-        else if (op == "acquire_section")  { g.op = GovOp::AcquireSection; g.scope = (int) req.getProperty ("scope", 0); }
-        else if (op == "release_section")  { g.op = GovOp::ReleaseSection; g.scope = (int) req.getProperty ("scope", 0); }
+        else if (op == "acquire_section" || op == "release_section")
+        {
+            const juce::String grp = req.getProperty ("group", juce::var()).toString();
+            if (! isLeasableSection (grp))
+                return errorReply ("unknown_section", id);   // section leases bind to the plugin's param groups
+            g.op = (op == "acquire_section") ? GovOp::AcquireSection : GovOp::ReleaseSection;
+            g.section = grp.toStdString();
+        }
         else return errorReply ("unknown_op", id);   // BumpGeneration / ControllerGone are internal, not wire-reachable
 
         Command c; c.kind = Kind::Govern; c.gov = g; c.clientId = clientId;
@@ -422,7 +429,19 @@ private:
         auto done = submit (std::move (c), 250);
         if (done == nullptr || ! done->stateOk)
             return errorReply ("timeout", id);
-        return okReply (id, [&] (juce::DynamicObject& o) { o.setProperty ("governed", govToVar (done->govState)); });
+        return okReply (id, [&] (juce::DynamicObject& o)
+        {
+            o.setProperty ("governed", govToVar (done->govState));
+            juce::Array<juce::var> secs;                       // the leasable param-group names, so an agent can discover them
+            for (const auto& s : leasableSections) secs.add (juce::String (s));
+            o.setProperty ("sections", secs);
+        });
+    }
+
+    bool isLeasableSection (const juce::String& grp) const
+    {
+        const std::string s = grp.toStdString();
+        return std::find (leasableSections.begin(), leasableSections.end(), s) != leasableSections.end();
     }
 
     static const char* resStr (Resolution r) noexcept
@@ -437,12 +456,12 @@ private:
     }
     static juce::var govToVar (const GovState& g)
     {
-        juce::Array<juce::var> sections;
-        for (int i = 0; i < kScopeCount; ++i)
-            sections.add (g.sectionLease[i]);
+        auto* secs = new juce::DynamicObject();          // held section leases only: { "<group>": <holder> }
+        for (const auto& kv : g.sectionLease)
+            secs->setProperty (juce::String (kv.first), kv.second);
         auto* o = new juce::DynamicObject();
         o->setProperty ("instance_lease", g.soloInstanceLease);
-        o->setProperty ("section_leases", sections);
+        o->setProperty ("section_leases", juce::var (secs));
         o->setProperty ("generation",     g.generation);
         return juce::var (o);
     }
@@ -548,7 +567,7 @@ private:
             case Kind::AllNotesOff: bridge.allNotesOff(); break;
             case Kind::ResetInit:
                 bridge.resetInit();
-                applyGoverned (GovCmd { GovOp::BumpGeneration, c.clientId, 0 }, c.clientId);   // whole patch changed
+                applyGoverned (GovCmd { GovOp::BumpGeneration, c.clientId, {} }, c.clientId);   // whole patch changed
                 break;
             case Kind::LoadState:
                 {
@@ -558,7 +577,7 @@ private:
                     if (okLoad)
                     {
                         if (c.done) c.done->loadOk = true;
-                        applyGoverned (GovCmd { GovOp::BumpGeneration, c.clientId, 0 }, c.clientId);   // whole patch changed
+                        applyGoverned (GovCmd { GovOp::BumpGeneration, c.clientId, {} }, c.clientId);   // whole patch changed
                     }
                 }
                 break;
@@ -632,7 +651,8 @@ private:
     int                                  dirtyCount = 0;
     std::atomic<int>                     applyingClientId { 0 };  // set around an apply so a synchronous change event is attributed
 
-    GovState governed;   // C3 governed coordination state; message-thread-owned (single applier), like the params
+    GovState governed;                          // C3 governed coordination state; message-thread-owned (single applier)
+    std::vector<std::string> leasableSections;  // the plugin's param groups (bound at construction); the leasable sections
 
     std::mutex                queueMutex;
     std::deque<Command>       queue;

@@ -57,6 +57,10 @@ public:
 
     // ---- read side (any thread) ----
     virtual int  paramCount() const = 0;
+
+    // The plugin's distinct parameter groups, in first-seen order (empty for a flat plugin). These are the
+    // leasable edit "sections" the C3 governed layer binds its section leases to (see ControlServer / GovernedState.h).
+    virtual std::vector<std::string> sectionGroups() const = 0;
     virtual bool hasParam (const std::string& id) const = 0;
     virtual bool readParam (const std::string& id, ParamValue& out) const = 0;
     virtual bool describeIndex (int index, std::string& idOut, ParamValue& out) const = 0;

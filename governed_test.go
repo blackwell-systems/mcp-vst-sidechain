@@ -113,6 +113,30 @@ func TestGovAcquireInstanceCompensates(t *testing.T) {
 	}
 }
 
+// TestGovSectionsIndependent makes the parametric argument executable: section leases interact only with the
+// instance lease, never with each other. A command changes a section's lease only if it names that section or is
+// a cross-cutting op that acts through the instance/controller (AcquireInstance's compensation, ControllerGone).
+// No section command touches another section. This per-scope independence is why enumerating a fixed, small set of
+// representative scopes here covers the runtime, where sections are keyed by the plugin's actual param-group names
+// (cpp/GovernedState.h) - any number of them - rather than a fixed array.
+func TestGovSectionsIndependent(t *testing.T) {
+	for _, s := range allGovStates() {
+		if !s.ok() {
+			continue // only reason about legal states
+		}
+		for _, c := range allGovCommands() {
+			n, _ := s.apply(c)
+			crossCutting := c.kind == cmdAcquireInstance || c.kind == cmdControllerGone
+			for i := 0; i < scopeCount; i++ {
+				named := (c.kind == cmdAcquireSection || c.kind == cmdReleaseSection) && c.scope == i
+				if !crossCutting && !named && n.sectionLease[i] != s.sectionLease[i] {
+					t.Fatalf("section %d changed by an unrelated command %+v: %+v -> %+v", i, c, s, n)
+				}
+			}
+		}
+	}
+}
+
 // TestGovDisconnectFreesLeases checks the cleanup transition: a departing controller's leases (instance and
 // sections) are all released.
 func TestGovDisconnectFreesLeases(t *testing.T) {

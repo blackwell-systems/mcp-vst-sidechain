@@ -147,21 +147,26 @@ message-thread drain**: `govern` / `get_governed` wire commands flow through the
 
 The governed state models the genuine multi-controller coordination concerns (not the plugin's musical state):
 
-- **Hierarchical edit leases.** A controller takes the whole-instance edit lease or a per-section lease (a section
-  is an edit region a deployment maps to a param group). The invariant is hierarchical: if one controller holds
-  the whole instance, no other may hold a section of it. Taking the instance therefore revokes others' section
-  leases (**compensate**); taking a section of an instance held by another is refused (**reject** guard); taking
-  an instance already held by another is refused (**reject** guard). This is how concurrent editors avoid fighting
-  over the same knobs.
+- **Hierarchical edit leases.** A controller takes the whole-instance edit lease or a per-section lease, where a
+  **section is a real param group of the loaded plugin** (`acquire_section{group:"Filters"}`). `ControlServer`
+  binds the leasable sections from `PluginBridge::sectionGroups()` at construction (the plugin's parameter-tree
+  groups: Surge exposes 14, a flat plugin exposes none, leaving only the instance lease); a `govern` on an unknown
+  group is refused. The invariant is hierarchical: if one controller holds the whole instance, no other may hold a
+  section of it. Taking the instance therefore revokes others' section leases (**compensate**); taking a section
+  of an instance held by another is refused (**reject** guard); taking an instance already held by another is
+  refused (**reject** guard). This is how concurrent editors avoid fighting over the same knobs. In the enumerated
+  proof, sections are a fixed representative set of scope indices; the runtime keys them by group name. The two are
+  equivalent because sections are per-scope-independent (they interact only with the instance lease, never each
+  other, proven by `TestGovSectionsIndependent`), so the enumeration over a few scopes covers any number of groups.
 - **Patch generation.** A monotone counter bumped whenever the whole patch changes (a `load_state` / `reset_init`,
   wired in the drain), so an agent can detect that the base it was editing moved under it (optimistic concurrency).
 - **Disconnect cleanup.** When a controller disconnects (or crashes), `ControlServer` raises a `ControllerGone`
   command that releases every lease it held. This is the invariant that makes leases safe: a dead agent cannot
   hold an edit lease forever.
 
-Covered by the gated `TestGovernedLive` (hierarchical acquire / reject / compensate + generation bump on
-`load_state`, observed cross-controller) and `TestGovernedDisconnectFreesLease` (a holder disconnects, its lease
-frees, another acquires). gsm (step 4) remains the future engine for when this schema outgrows the hand-rolled
+Covered by the gated `TestGovernedLive` (group-bound section leases discovered via `get_governed`, hierarchical
+acquire / reject / compensate + generation bump on `load_state`, observed cross-controller) and
+`TestGovernedDisconnectFreesLease` (a holder disconnects, its lease frees, another acquires). gsm (step 4) remains the future engine for when this schema outgrows the hand-rolled
 model. The continuous params are untouched by any of this: they stay last-writer-wins.
 
 The reason this works without reaching for CRDTs or consensus: there is ONE host, ONE applier thread, and one

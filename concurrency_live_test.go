@@ -248,12 +248,13 @@ func TestGovernedLive(t *testing.T) {
 		g, _ := m["governed"].(map[string]any)
 		return g
 	}
-	sectionLease := func(m map[string]any, i int) int {
-		secs, _ := governed(m)["section_leases"].([]any)
-		if i >= len(secs) {
-			return -1
+	sectionHolder := func(m map[string]any, group string) int {
+		secs, _ := governed(m)["section_leases"].(map[string]any)
+		h, ok := secs[group]
+		if !ok {
+			return 0 // absent == free
 		}
-		return int(secs[i].(float64))
+		return int(h.(float64))
 	}
 	govern := func(lc *liveClient, req map[string]any) map[string]any {
 		req["cmd"] = "govern"
@@ -271,6 +272,17 @@ func TestGovernedLive(t *testing.T) {
 		t.Fatalf("expected two distinct nonzero client ids, got A=%d B=%d", a.clientID, b.clientID)
 	}
 
+	// Discover the leasable sections (the plugin's param groups) and pick two.
+	gv, err := a.request(map[string]any{"cmd": "get_governed"})
+	if err != nil {
+		t.Fatalf("get_governed: %v", err)
+	}
+	secList, _ := gv["sections"].([]any)
+	if len(secList) < 2 {
+		t.Skip("plugin exposes fewer than two param groups; section-lease test needs at least two")
+	}
+	grpA, grpB := secList[0].(string), secList[1].(string)
+
 	// A takes the whole instance; B's acquire is rejected while A holds it.
 	if resp := govern(a, map[string]any{"op": "acquire_instance"}); resp["resolution"] != "applied" ||
 		int(governed(resp)["instance_lease"].(float64)) != a.clientID {
@@ -280,23 +292,23 @@ func TestGovernedLive(t *testing.T) {
 		t.Fatalf("B's instance acquire should be rejected: %v", resp)
 	}
 	// B cannot take a section of an instance A holds (the hierarchy guard).
-	if resp := govern(b, map[string]any{"op": "acquire_section", "scope": 0}); resp["resolution"] != "rejected" {
+	if resp := govern(b, map[string]any{"op": "acquire_section", "group": grpA}); resp["resolution"] != "rejected" {
 		t.Fatalf("B should not take a section of A's instance: %v", resp)
 	}
 
-	// A releases; now A and B take different sections.
+	// A releases; now A and B take different sections (by group name).
 	govern(a, map[string]any{"op": "release_instance"})
-	if resp := govern(a, map[string]any{"op": "acquire_section", "scope": 0}); resp["resolution"] != "applied" || sectionLease(resp, 0) != a.clientID {
-		t.Fatalf("A should take section 0: %v", resp)
+	if resp := govern(a, map[string]any{"op": "acquire_section", "group": grpA}); resp["resolution"] != "applied" || sectionHolder(resp, grpA) != a.clientID {
+		t.Fatalf("A should take section %q: %v", grpA, resp)
 	}
-	if resp := govern(b, map[string]any{"op": "acquire_section", "scope": 1}); resp["resolution"] != "applied" || sectionLease(resp, 1) != b.clientID {
-		t.Fatalf("B should take section 1: %v", resp)
+	if resp := govern(b, map[string]any{"op": "acquire_section", "group": grpB}); resp["resolution"] != "applied" || sectionHolder(resp, grpB) != b.clientID {
+		t.Fatalf("B should take section %q: %v", grpB, resp)
 	}
 
-	// A now takes the whole instance: compensated (B's section 1 revoked, A's section 0 kept).
+	// A now takes the whole instance: compensated (B's section revoked, A's section kept).
 	resp := govern(a, map[string]any{"op": "acquire_instance"})
 	if resp["resolution"] != "compensated" || int(governed(resp)["instance_lease"].(float64)) != a.clientID ||
-		sectionLease(resp, 1) != 0 || sectionLease(resp, 0) != a.clientID {
+		sectionHolder(resp, grpB) != 0 || sectionHolder(resp, grpA) != a.clientID {
 		t.Fatalf("A taking the instance should compensate by revoking B's section: %v", resp)
 	}
 
@@ -319,7 +331,7 @@ func TestGovernedLive(t *testing.T) {
 				continue
 			}
 			if gen := int(governed(ev)["generation"].(float64)); gen > gen0 {
-				t.Logf("governed OK: hierarchical leases (reject+compensate) + disconnect-safe, load_state bumped generation %d->%d, B(%d) saw governed_changed", gen0, gen, b.clientID)
+				t.Logf("governed OK: group-bound section leases %q/%q (reject+compensate), load_state bumped generation %d->%d, B(%d) saw governed_changed", grpA, grpB, gen0, gen, b.clientID)
 				return
 			}
 		case <-deadline:
