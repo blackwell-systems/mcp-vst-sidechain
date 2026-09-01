@@ -73,7 +73,7 @@ type emptyIn struct{}
 // ---- input types ----
 
 type listParamsIn struct {
-	Group  string `json:"group,omitempty" jsonschema:"filter by group/category (best-effort plugin metadata; may be 'other')"`
+	Group  string `json:"group,omitempty" jsonschema:"filter by group/category. Normally best-effort plugin metadata; when a plugin exposes no groups these are DERIVED from shared label prefixes (e.g. 'Filter', 'Amp', 'Osc') so a flat catalog is still pageable by section. Call list_params with no args to see the available group names."`
 	Filter string `json:"filter,omitempty" jsonschema:"case-insensitive substring on the param id OR label (a large plugin's catalog is best paged)"`
 }
 

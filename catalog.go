@@ -52,15 +52,22 @@ type ParamCatalog interface {
 
 // Catalog is the whole parameter set, indexed by ID for O(1) lookup. StateRootTag/StateVersion are optional
 // provenance a host may stamp on its state blobs; the generic bridge treats full state as opaque.
+//
+// effGroup is the per-param "effective group" used by the navigation surface (Groups/Filter). It equals each
+// param's real Group when the plugin exposes real groups; when the plugin is effectively ungrouped (every param
+// is "other"), effGroup instead holds a section DERIVED from label prefixes (see sections.go). It is a view -
+// ParamDef.Group and the wire shape are never touched. derived records which case we are in.
 type Catalog struct {
 	StateRootTag string
 	StateVersion int
 	Params       []ParamDef
 	byID         map[string]*ParamDef
+	effGroup     []string // parallel to Params: the effective (real-or-derived) group per param
+	derived      bool     // true when effGroup holds label-prefix sections rather than real groups
 }
 
 // NewCatalog builds a Catalog from an enumerated param list (the runtime path: the C++ host enumerated a loaded
-// plugin and handed these rows over). It indexes by ID.
+// plugin and handed these rows over). It indexes by ID and computes the effective-group view once.
 func NewCatalog(params []ParamDef) *Catalog {
 	c := &Catalog{Params: params, byID: make(map[string]*ParamDef, len(params))}
 	for i := range c.Params {
@@ -69,7 +76,31 @@ func NewCatalog(params []ParamDef) *Catalog {
 		}
 		c.byID[c.Params[i].ID] = &c.Params[i]
 	}
+	c.computeEffectiveGroups()
 	return c
+}
+
+// computeEffectiveGroups fills effGroup once. If any param carries a real group (a non-empty group other than
+// "other"), the catalog keeps its real groups verbatim (no derivation). Only when the catalog is effectively
+// ungrouped (every param is "other") does it fall back to label-prefix sections.
+func (c *Catalog) computeEffectiveGroups() {
+	c.effGroup = make([]string, len(c.Params))
+	hasReal := false
+	for i := range c.Params {
+		if g := c.Params[i].Group; g != "" && g != "other" {
+			hasReal = true
+			break
+		}
+	}
+	if hasReal {
+		c.derived = false
+		for i := range c.Params {
+			c.effGroup[i] = c.Params[i].Group
+		}
+		return
+	}
+	c.derived = true
+	c.effGroup = deriveSections(c.Params)
 }
 
 // loadCatalogJSON parses a catalog JSON blob (the shape the C++ host emits: {stateRootTag, stateVersion,
@@ -99,14 +130,19 @@ func (c *Catalog) Get(id string) *ParamDef { return c.byID[id] }
 // All returns every param (unfiltered).
 func (c *Catalog) All() []ParamDef { return c.Params }
 
-// Groups returns the distinct group names in a stable order.
+// Groups returns the distinct group names in a stable order. When the plugin exposes real groups these are the
+// real groups (alphabetical); when it is effectively ungrouped these are the label-prefix sections derived as a
+// navigation fallback (alphabetical, with "other" last).
 func (c *Catalog) Groups() []string {
+	if c.derived {
+		return sortedSections(c.effGroup)
+	}
 	seen := map[string]bool{}
 	var g []string
-	for i := range c.Params {
-		if !seen[c.Params[i].Group] {
-			seen[c.Params[i].Group] = true
-			g = append(g, c.Params[i].Group)
+	for i := range c.effGroup {
+		if !seen[c.effGroup[i]] {
+			seen[c.effGroup[i]] = true
+			g = append(g, c.effGroup[i])
 		}
 	}
 	sort.Strings(g)
@@ -114,13 +150,15 @@ func (c *Catalog) Groups() []string {
 }
 
 // Filter returns params matching an optional group (exact, case-insensitive) AND/OR an id/label substring
-// (case-insensitive). Empty filters return everything. Result is sorted by ID for determinism.
+// (case-insensitive). The group match is against the effective group: the plugin's real group, or - for an
+// ungrouped plugin - the derived label-prefix section. Empty filters return everything. Result is sorted by ID
+// for determinism.
 func (c *Catalog) Filter(group, substr string) []ParamDef {
 	group = strings.ToLower(strings.TrimSpace(group))
 	substr = strings.ToLower(strings.TrimSpace(substr))
 	var out []ParamDef
-	for _, p := range c.Params {
-		if group != "" && strings.ToLower(p.Group) != group {
+	for i, p := range c.Params {
+		if group != "" && strings.ToLower(c.effGroup[i]) != group {
 			continue
 		}
 		if substr != "" && !strings.Contains(strings.ToLower(p.ID), substr) &&
