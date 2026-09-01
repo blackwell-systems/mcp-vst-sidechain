@@ -1,0 +1,118 @@
+# Concurrency
+
+Concurrency is a core property of Sidechain, not an afterthought. The product is a control substrate that
+multiple controllers drive at once: several agents, an agent alongside a plugin's own GUI, multiple tools. This
+document is the contract. Every change is checked against the invariants here, and the design assumes the full
+target (multiple concurrent controllers of one plugin instance) even where it is implemented in stages.
+
+Peer documents: [ARCHITECTURE.md](ARCHITECTURE.md) (the system), [TESTING.md](TESTING.md) (how it is verified),
+[PHASE3-SCOPING.md](PHASE3-SCOPING.md) (the semantic store, whose per-fingerprint storage is part of this model).
+
+## The layers and their concurrency invariants
+
+The system is a stack of threads and processes. Each layer has one rule that must hold.
+
+| Layer | Concurrency rule (invariant) |
+|---|---|
+| Audio thread (`processBlock`) | Lock-free, no allocation, no blocking, ever. Reads parameter atomics only. Sacred. |
+| Message thread (JUCE) | The SINGLE point where mutations apply (`setValueNotifyingHost`, state, MIDI). All writes serialize here. |
+| Control plane (host sockets) | May use locks freely: it runs at control rate (tens of ms), never on the audio thread. |
+| Go server (per process) | Reads may run concurrently; mutations serialize. The socket round-trip is atomic per request. |
+| Semantic store (Phase 3) | A directory of per-fingerprint files; atomic temp+rename; merge-on-write. No global file, no global lock. |
+
+Two of these are already true and load-bearing: the **audio thread is lock-free**, and the **message thread is
+the single applier** of every mutation. The target model builds on both without weakening either.
+
+## The target model: multiple concurrent controllers of one instance
+
+Any number of controllers connect to one host hosting one plugin. All of them can read and drive it at once, and
+each sees the others' changes. Correctness comes from one idea: **who may enqueue a command becomes many; where a
+command applies stays one (the message thread).** Multi-controller does not add write concurrency to the DSP or
+parameter state; it adds producers to a queue drained by a single consumer.
+
+### Host: many connections, one applier
+
+- The accept loop spawns a handler per connection instead of serving one client at a time. A thread-safe client
+  registry tracks connected controllers (add on accept, remove on disconnect).
+- The command queue goes single-producer/single-consumer to **multi-producer/single-consumer**: many socket
+  handlers enqueue, the message thread drains. Recommended: one command queue guarded by a short control-plane
+  lock (a lock is fine here, it is not the audio thread). Alternative: a per-client lock-free SPSC queue plus a
+  registry the drain iterates. The queue carries the originating client id.
+- **Reads need no queue.** `get_param` snapshots the parameter atomic from any thread, so concurrent readers are
+  already safe. State reads (`get_full_state`) still route through the message thread, because
+  `getStateInformation` is not safe to call concurrently with processing.
+- **Conflict policy: last-writer-wins per parameter,** in message-thread drain order. Deterministic and benign at
+  control rate. No per-parameter locks or leases in v1 (that is a later, optional refinement).
+
+### Visibility: change notifications (bidirectional protocol)
+
+Multi-controller requires that a change by controller A (or by the plugin's own GUI or host automation) becomes
+visible to controller B. The host listens for parameter changes (`AudioProcessorParameter::Listener` /
+`audioProcessorParameterChanged`) and pushes an event to every connected client:
+`{ event: "param_changed", param, normalized, value, text, by: <clientID> }`.
+
+This evolves the wire protocol from strict request/response to a **multiplexed async protocol**: replies are
+correlated to requests by `id` (the id, currently decorative, becomes load-bearing), and server-pushed events
+arrive unsolicited. A controller may ignore events attributed to its own `clientID` (echo suppression).
+
+### Go client: async reader and finer locking
+
+- The `liveClient` gains a single background reader goroutine that demultiplexes the socket: replies route to the
+  waiting caller by `id`, events route to a subscriber channel. This replaces the current one-reply-per-request
+  read, which cannot receive unsolicited events.
+- The session lock becomes finer-grained: concurrent reads (`get_param`, `describe_param`) proceed without
+  blocking each other or writes; mutations serialize. (Within one Go server there is one agent; the multi-
+  controller concurrency lives at the host across connections.)
+
+### Identity
+
+Each connection gets a `clientID`, assigned by the host at the `connect_live` handshake and returned to the
+client. It attributes change events, scopes logging, and enables echo suppression. It is the "who is controlling"
+concept the current single-endpoint design lacks.
+
+## Invariants (the contract)
+
+Every change must preserve all of these:
+
+1. The audio thread never takes a lock, allocates, or blocks.
+2. Every parameter/state/MIDI mutation applies on the message thread, one at a time.
+3. Control-plane locks are allowed; they must never be held across an audio-thread boundary.
+4. Reads (parameter atomics) are safe from any thread and never block a writer.
+5. Concurrent writers resolve last-writer-wins in message-thread order; no lost-update corruption, no deadlock.
+6. The semantic store never uses a global file or global lock: per-fingerprint files, atomic writes,
+   merge-on-write.
+7. A slow or dead controller cannot stall another: per-connection handlers, bounded queues, no shared blocking.
+
+## Phased implementation path
+
+The invariants hold at every step; capability grows.
+
+- **C0 (today):** single controller. The message thread is already the single applier; the queue is SPSC. This
+  document defines the target so nothing regresses.
+- **C1: many connections.** Per-connection handlers, a client registry, the MPSC command queue, `clientID` in the
+  handshake. Multiple controllers can drive one instance; visibility is still poll-based (re-read to observe
+  others).
+- **C2: change notifications.** Host listens for parameter changes and pushes `param_changed` events; the wire
+  protocol becomes multiplexed async; the Go client gains its reader/dispatcher. Full cross-controller visibility.
+- **C3: refinements.** Echo suppression tuning, optional per-parameter ownership/leases, richer events (state
+  loaded, notes), backpressure policy.
+
+## Testing (a first-class category)
+
+Concurrency gets its own test level, run under the race detector:
+
+- N concurrent controllers driving one host: no torn state, no deadlock, last-writer-wins is deterministic.
+- Connect/disconnect churn while others drive: clean handoff, no stall (the failure mode that produced the
+  one-client reconnect bug).
+- Change-notification delivery: a set by one controller is observed by another (C2+).
+- A wedged controller (stops reading) does not block others (invariant 7).
+- The `fakeHost` and Go client gain multi-client support so these run headless.
+
+## Non-goals
+
+- No changes to the realtime audio path. It is correct; the work is entirely in the control plane, the protocol,
+  and identity.
+- No distributed / multi-host orchestration (one host still hosts one plugin; "concurrency" here is many
+  controllers of that one instance, plus safe multi-process use of the shared store).
+- No per-parameter locking in v1. Last-writer-wins is the model; leases are a C3 option only if a real use case
+  demands exclusivity.

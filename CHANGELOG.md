@@ -98,6 +98,13 @@ All notable changes to this project are documented here. The format is based on
 
 ### Docs
 
+- **`docs/CONCURRENCY.md`** (new, design/contract): elevates concurrency to a first-class product property. States
+  the per-layer invariants (audio thread lock-free and sacred; the message thread is the single applier of every
+  mutation; control-plane locks are fine; the semantic store is per-fingerprint files with no global lock), and
+  the target model of multiple concurrent controllers of one plugin instance (many connections feeding a
+  multi-producer queue drained by the one message thread; change-notification events for cross-controller
+  visibility; client identity; last-writer-wins). Includes the contract invariants, a phased path (C0..C3), and a
+  concurrency test category. Design only; C0 (single controller) is today's reality.
 - **`docs/PHASE3-SCOPING.md`** (new, design only): a buildable spec for the planned persistent semantic store.
   Resolves the open decisions (fingerprint-as-equivalence for cache reuse, storage, lifecycle, invalidation),
   folds in the two-axis equivalence model (a derived behavior-class signature plus soft agent-authored role
