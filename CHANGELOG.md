@@ -25,6 +25,11 @@ All notable changes to this project are documented here. The format is based on
   `hasRealRange: false`.
 - **Parameter grouping.** The host populates each param's group from the plugin's parameter tree (VST3 units /
   AU clumps) when the plugin exposes one; plugins with a flat tree leave it empty (unchanged).
+- **Set a discrete-hiding-as-float param by label.** `set_param choice=<name>` now works on a live hosted param
+  that the catalog types as a plain float but that probes as a discrete control (a filter type, an on/off toggle
+  whose value text renders labels like "LP"/"BP"/"HP" or "Off"/"On"). The bridge maps the label to a
+  representative normalized position from the probe and reports whether the plugin's readback confirms it; an
+  unknown label lists the observed labels. `get_param` surfaces the observed labels once a param has been probed.
 - **Power-curve fit for zero-crossing curves.** Curve fitting adds a power model (real = A*norm^P) alongside
   linear and exp. This captures a knob that starts at zero and grows steeply (a time control 0 ms -> 32 s), which
   exp cannot fit (log undefined at the 0 endpoint) and linear fits poorly, so `set_param real=` inverts it in

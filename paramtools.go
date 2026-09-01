@@ -131,7 +131,14 @@ func (s *session) handleGetParam(ctx context.Context, _ *mcp.CallToolRequest, in
 			IsSet      bool     `json:"isSet"`
 			Live       bool     `json:"live"`
 		}{Param: *p, Value: val, Normalized: norm, IsSet: true, Live: true}
-		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("LIVE %s = %s (%s)", p.ID, formatFloat(val), txt)}}}, out, nil
+		line := fmt.Sprintf("LIVE %s = %s (%s)", p.ID, formatFloat(val), txt)
+		// If we have already probed this param and it turned out to be a discrete-as-float control, surface the
+		// observed labels so the agent knows it can drive it with choice=. (We do NOT probe here, only reuse a
+		// cached inference; list_params deliberately does not do this, as it would probe every param.)
+		if pi, ok := s.infer[p.ID]; ok && !pi.Numeric && len(pi.Labels) > 0 {
+			line += fmt.Sprintf(" [discrete; labels: %s; set with choice=]", strings.Join(pi.Labels, ", "))
+		}
+		return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: line}}}, out, nil
 	}
 
 	cur, isSet := s.params[in.ID]
@@ -164,6 +171,13 @@ func (s *session) handleSetParam(ctx context.Context, _ *mcp.CallToolRequest, in
 
 	if in.Real != nil {
 		return s.setParamReal(p, *in.Real, in)
+	}
+
+	// choice= on a param the catalog does NOT type as "choice": many plugins expose a discrete control (a filter
+	// type, an on/off toggle) as a plain float. If it probes as discrete with a matching label, set it by label.
+	// The real-catalog "choice" path is left to resolveReal below.
+	if strings.TrimSpace(in.Choice) != "" && p.Type != "choice" {
+		return s.setParamDiscreteChoice(p, in.Choice, in)
 	}
 
 	real, errMsg := resolveReal(p, in.Value, in.Normalized, in.Choice)
@@ -239,6 +253,54 @@ func (s *session) setParamReal(p *ParamDef, target float64, in setParamIn) (*mcp
 		how = "sampled+refined"
 	}
 	return textResult(fmt.Sprintf("Set LIVE %s to ~%s %s (norm %.4f, %s; plugin reports %q).", p.ID, formatFloat(target), pi.Unit, norm, how, text)), nil, nil
+}
+
+// setParamDiscreteChoice sets a discrete-hiding-as-float param by label. Many plugins expose an enum/toggle as
+// a plain type: float whose value text renders labels (e.g. "LP"/"BP"/"HP", "Off"/"On"); the catalog cannot see
+// this, so the ordinary choice path (resolveReal) rejects it. When the param probes as discrete and one of its
+// observed labels matches (case-insensitive), forward that label's representative normalized value. Live only;
+// requires the inference to be discrete. Caller holds s.mu.
+func (s *session) setParamDiscreteChoice(p *ParamDef, choice string, in setParamIn) (*mcp.CallToolResult, any, error) {
+	if in.Value != nil || in.Normalized != nil || in.Real != nil {
+		return textResult("set_param: 'choice' is mutually exclusive with value/normalized/real."), nil, nil
+	}
+	if s.live == nil {
+		return textResult(fmt.Sprintf("set_param: %q is not a catalog choice param; setting it by label needs a live plugin (it reads the plugin's value text to map the label). connect_live first, or use normalized 0..1.", p.ID)), nil, nil
+	}
+	pi, err := s.inference(p.ID)
+	if err != nil {
+		return textResult("set_param (choice): probe failed: " + err.Error()), nil, nil
+	}
+	if pi.Numeric || len(pi.discreteNorms) == 0 {
+		return textResult(fmt.Sprintf("set_param: %q does not probe as a discrete control, so choice= does not apply; use value/normalized/real.", p.ID)), nil, nil
+	}
+	norm, label, ok := lookupDiscreteNorm(pi, choice)
+	if !ok {
+		return textResult(fmt.Sprintf("set_param: %q is not an observed label for %q. Observed: %s", choice, p.ID, strings.Join(pi.Labels, ", "))), nil, nil
+	}
+	_, _, text, err := s.live.SetParam(p.ID, norm, false)
+	if err != nil {
+		return textResult("set_param (choice) failed: " + err.Error()), nil, nil
+	}
+	match := ""
+	if strings.EqualFold(strings.TrimSpace(text), label) {
+		match = " (plugin confirms)"
+	} else {
+		match = fmt.Sprintf(" (plugin reports %q)", text)
+	}
+	return textResult(fmt.Sprintf("Set LIVE %s to %q (norm %.4f)%s.", p.ID, label, norm, match)), nil, nil
+}
+
+// lookupDiscreteNorm resolves a label (case-insensitive) to its representative norm in a discrete inference,
+// returning the canonical (observed) label spelling alongside.
+func lookupDiscreteNorm(pi ParamInference, choice string) (norm float64, label string, ok bool) {
+	choice = strings.TrimSpace(choice)
+	for lbl, n := range pi.discreteNorms {
+		if strings.EqualFold(lbl, choice) {
+			return n, lbl, true
+		}
+	}
+	return 0, "", false
 }
 
 const refineMaxIters = 16
@@ -558,7 +620,7 @@ func registerParamToolsOn(srv *mcp.Server, s *session, live func() LiveEndpoint)
 			sync()
 			return s.handleGetParam(ctx, r, in)
 		})
-	mcp.AddTool(srv, &mcp.Tool{Name: "set_param", Description: "Set one parameter by id: value (for a hasRealRange param, real units such as Hz/dB; for a hosted param, the normalized 0..1 or discrete index), normalized (always 0..1), choice NAME, or real (target in real units for a live hosted param, mapped via its value text - run describe_param first). Validated + clamped against the plugin's range/choices."},
+	mcp.AddTool(srv, &mcp.Tool{Name: "set_param", Description: "Set one parameter by id: value (for a hasRealRange param, real units such as Hz/dB; for a hosted param, the normalized 0..1 or discrete index), normalized (always 0..1), choice NAME (a catalog choice param, or a live hosted param that probes as discrete: a filter type or on/off toggle exposed as a plain float, matched against the labels in its value text), or real (target in real units for a live hosted param, mapped via its value text - run describe_param first). Validated + clamped against the plugin's range/choices."},
 		func(ctx context.Context, r *mcp.CallToolRequest, in setParamIn) (*mcp.CallToolResult, any, error) {
 			sync()
 			return s.handleSetParam(ctx, r, in)

@@ -40,15 +40,18 @@ type ParamInference struct {
 	Labels  []string  `json:"labels,omitempty"`  // distinct rendered strings when !Numeric
 	Fit     *CurveFit `json:"fit,omitempty"`     // closed-form model for norm<->real, when one fits well
 
-	table []realSample // sorted by Norm; retained for inversion
+	table         []realSample       // sorted by Norm; retained for inversion
+	discreteNorms map[string]float64 // when !Numeric: label -> representative (median) norm that renders it, for set_param choice=
 }
 
 type realSample struct{ norm, real float64 }
 
 // CurveFit is a closed-form model of the norm->real mapping recovered by least squares. "linear" is
-// real = A + B*norm; "exp" is real = A*exp(B*norm) (fit in log space, valid when all reals are positive).
-// MaxRelErr is the worst sample error as a fraction of the real range; a small value means the model captures
-// the plugin's curve and can be inverted analytically (no per-set probing).
+// real = A + B*norm; "exp" is real = A*exp(B*norm) (fit in log space, valid when all reals are positive);
+// "power" is real = A*norm^B (fit in log-log space, for zero-crossing curves like a time knob 0 ms -> 32 s
+// where exp cannot apply because log(0) is undefined). MaxRelErr is the worst sample error as a fraction of the
+// real range; a small value means the model captures the plugin's curve and can be inverted analytically (no
+// per-set probing).
 type CurveFit struct {
 	Model     string  `json:"model"`
 	A         float64 `json:"a"`
@@ -239,6 +242,7 @@ func inferParam(samples []ValueSample) ParamInference {
 	var table []realSample
 	var labels []string
 	unitCount := map[string]int{}
+	labelNorms := map[string][]float64{} // label -> the norms that rendered it (for a discrete-as-float set path)
 	for _, s := range samples {
 		v, u, numeric := parseValueText(s.Text)
 		if !numeric {
@@ -246,6 +250,7 @@ func inferParam(samples []ValueSample) ParamInference {
 			if !containsStr(labels, lbl) {
 				labels = append(labels, lbl)
 			}
+			labelNorms[lbl] = append(labelNorms[lbl], s.Norm)
 			continue
 		}
 		nv, bu := normalizeUnit(v, u)
@@ -255,9 +260,15 @@ func inferParam(samples []ValueSample) ParamInference {
 		}
 	}
 
-	// Any non-numeric sample => this is really a discrete control (Off/On, waveform names, ...).
+	// Any non-numeric sample => this is really a discrete control (Off/On, waveform names, ...). Record a
+	// representative norm per label (the median of the norms that rendered it) so set_param choice= can land the
+	// control on a chosen label even though the catalog only exposes it as a float.
 	if len(labels) > 0 {
-		return ParamInference{Numeric: false, Labels: labels}
+		dn := make(map[string]float64, len(labels))
+		for lbl, ns := range labelNorms {
+			dn[lbl] = medianOf(ns)
+		}
+		return ParamInference{Numeric: false, Labels: labels, discreteNorms: dn}
 	}
 	if len(table) == 0 {
 		return ParamInference{Numeric: false}
@@ -374,6 +385,21 @@ func clamp01(v float64) float64 {
 		return 1
 	}
 	return v
+}
+
+// medianOf returns the median of a non-empty slice (average of the two middle values for an even count). It
+// sorts a copy, so the caller's slice order is preserved.
+func medianOf(vs []float64) float64 {
+	c := append([]float64(nil), vs...)
+	sort.Float64s(c)
+	n := len(c)
+	if n == 0 {
+		return 0
+	}
+	if n%2 == 1 {
+		return c[n/2]
+	}
+	return (c[n/2-1] + c[n/2]) / 2
 }
 
 func containsStr(ss []string, s string) bool {
