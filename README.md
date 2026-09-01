@@ -3,13 +3,13 @@
 **An agent's control input for any plugin. One MCP endpoint, every VST.**
 
 `mcp-vst-sidechain` is a generic [MCP](https://modelcontextprotocol.io) bridge that hosts any VST3/AU plugin
-and exposes its parameters to an AI agent in realtime. Point it at your licensed Serum, Diva, Kontakt, or a
-free effect, and an agent can enumerate the plugin's entire automatable control surface, read and set any
-parameter live, play notes, and save or recall its full state, all over one MCP endpoint.
+and exposes its parameters to an AI agent in realtime. Point it at your licensed Serum, Diva, or Kontakt (or a
+free effect), and through a single MCP endpoint an agent can enumerate the plugin's full automatable control
+surface, read and set any parameter live, play notes, and save or recall its complete state.
 
-Sidechain talks to plugins only through the standardized VST3/AU API, the same way every DAW hosts thousands of
-closed-source commercial plugins it has no source for. You bring your own licensed binaries; no source is
-touched and nothing is redistributed.
+Sidechain talks to plugins only through the standard VST3/AU API, the same way a DAW hosts thousands of
+closed-source commercial plugins without ever seeing their source. You bring your own licensed binaries;
+nothing is patched and nothing is redistributed.
 
 > Status: early. The Go MCP layer and the C++ control listener are working and tested; the child-plugin host
 > (the JUCE `AudioPluginFormatManager` wrapper) is an MVP. See the [roadmap](#roadmap).
@@ -20,17 +20,16 @@ Producers already automate plugins in a DAW. An LLM should be able to do the sam
 "open the filter a little," "make this pad wider," "give me a darker version of this patch." That needs a
 generic, realtime control bridge between an agent and an arbitrary plugin. Sidechain is that bridge.
 
-The niche is contested but unowned. Existing attempts are prototypes, host-controllers, or heavy agent-DAWs;
-none is a polished, standalone, cross-platform generic bridge, and none has a token-efficiency story for the
-huge parameter surfaces real plugins expose.
+There's no polished, standalone tool for this yet. The existing attempts are prototypes, DAW-specific
+controllers, or heavy agent-DAWs; none is a cross-platform generic bridge, and none handles the token cost of
+the huge parameter surfaces real plugins expose.
 
-### The unfair advantage: GCF
+### Built on GCF for large parameter sets
 
-A plugin with hundreds of parameters is a token nightmare to serialize into an agent's context as JSON.
-Sidechain encodes the big read tool (`list_params`) as [GCF](https://github.com/blackwell-systems/gcf-go), a
-token-compact wire format that is 50-92% smaller than JSON and comprehended zero-shot. `set_params` also takes
-a GCF table as input, so authoring a whole patch is one compact call rather than one-per-parameter. Nothing
-else in this space has this.
+A plugin with hundreds of parameters is expensive to serialize into an agent's context as JSON. Sidechain
+encodes the large `list_params` output as [GCF](https://github.com/blackwell-systems/gcf-go), a wire format
+50-92% smaller than JSON that frontier models read with no examples. `set_params` also accepts a GCF table, so
+authoring a whole patch is one compact call instead of one per parameter.
 
 ## How it works
 
