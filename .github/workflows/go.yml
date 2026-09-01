@@ -57,9 +57,22 @@ jobs:
           echo '### Go coverage' >> "$GITHUB_STEP_SUMMARY"
           go tool cover -func=cover.out | tail -1 >> "$GITHUB_STEP_SUMMARY"
 
-  # Report-only for now: staticcheck and govulncheck run but do not fail the workflow. Promote to a required
-  # gate once we have confirmed a clean baseline (remove continue-on-error).
-  lint:
+  # Required gate: staticcheck is clean today, and pinned so a new release cannot red the build unexpectedly.
+  staticcheck:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.8.1 ./...
+
+  # Report-only: govulncheck's findings here are dominated by Go stdlib CVEs fixed in newer patch releases, so
+  # making it required would red the build on toolchain-version drift rather than on our code. Watch its output
+  # and bump the Go toolchain (or a dependency) when it flags something we actually call.
+  govulncheck:
     runs-on: ubuntu-latest
     continue-on-error: true
     steps:
@@ -68,7 +81,5 @@ jobs:
         with:
           go-version: 'stable'
           cache: true
-      - name: staticcheck
-        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
       - name: govulncheck
         run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
