@@ -25,6 +25,10 @@ All notable changes to this project are documented here. The format is based on
   `hasRealRange: false`.
 - **Parameter grouping.** The host populates each param's group from the plugin's parameter tree (VST3 units /
   AU clumps) when the plugin exposes one; plugins with a flat tree leave it empty (unchanged).
+- **Label-prefix sectioning for ungrouped plugins.** When a plugin reports no parameter groups (every param is
+  "other"), `list_params` derives navigable sections from shared label prefixes (e.g. "Filter", "Amp", "Osc")
+  so a large flat surface can be paged with `group=`. Real groups always win when present; the derivation is a
+  catalog-level view and never mutates `ParamDef.Group` or the wire shape.
 - **Set a discrete-hiding-as-float param by label.** `set_param choice=<name>` now works on a live hosted param
   that the catalog types as a plain float but that probes as a discrete control (a filter type, an on/off toggle
   whose value text renders labels like "LP"/"BP"/"HP" or "Off"/"On"). The bridge maps the label to a
