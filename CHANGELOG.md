@@ -37,7 +37,13 @@ All notable changes to this project are documented here. The format is based on
 - **Power-curve fit for zero-crossing curves.** Curve fitting adds a power model (real = A*norm^P) alongside
   linear and exp. This captures a knob that starts at zero and grows steeply (a time control 0 ms -> 32 s), which
   exp cannot fit (log undefined at the 0 endpoint) and linear fits poorly, so `set_param real=` inverts it in
-  closed form instead of falling back to a binary-search refine.
+  closed form instead of falling back to a binary-search refine. Unit-tested only: a survey of the plugins on
+  hand found no plugin whose clean power-law params carry a real unit (the ones that fit render bare numbers), so
+  there is no real-plugin power-fit E2E - see the note by `fitPower` in `infer.go` and `TestScanPowerFits`.
+- **AU (AudioUnit) load by component identifier.** The host accepts an AU identifier
+  (`AudioUnit:Effects/aufx,dcmp,appl` = type,subtype,manufacturer) in addition to a `.vst3`/`.component` path.
+  On macOS an AU is resolved through the system AudioComponent registry rather than a path, so the identifier is
+  the reliable handle (a raw `.component` path loads only when that component is also registered with the OS).
 
 ### Changed
 
@@ -56,6 +62,16 @@ All notable changes to this project are documented here. The format is based on
   one control socket. The note verbs previously released the session lock before their socket call.
 - **Plugin paths with spaces:** the host CLI now resolves paths like `.../Surge XT.vst3` correctly (JUCE wraps
   space-containing args in quotes when it reconstructs the command line; those quotes are now stripped).
+
+### Tests
+
+- **AU load+drive smoke.** A gated `TestAULive` and a report-only integration step load an Apple built-in AU by
+  identifier, enumerate its catalog, and drive it over the control socket (ping + get_param + set_param +
+  read-back), closing the AU gap (everything prior exercised VST3 only). Report-only for now; promotable to a
+  required CI step once confirmed green headlessly.
+- **Power-fit survey.** A gated `TestScanPowerFits` probes every param on a running host and flags any clean
+  analytic power fit, used to hunt for a real plugin that exercises the power model. Finding recorded (none of
+  the surveyed plugins expose a power-law param the real-unit set path can drive).
 
 ### Docs
 

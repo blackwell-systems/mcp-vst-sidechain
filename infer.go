@@ -175,6 +175,16 @@ func fitCurve(table []realSample, rng float64) *CurveFit {
 	return best
 }
 
+// NOTE ON REAL-PLUGIN COVERAGE: the power model is exercised by unit tests only (see TestSetRealPowerAnalytic
+// with the synthetic 32*norm^6.5 s curve). A survey of the plugins on hand (Surge XT VST3+AU, Apple's built-in
+// AUs, TAL-NoiseMaker, and several in-house plugins - see the gated TestScanPowerFits) found no plugin that
+// yields a clean power fit the real-unit set path can actually drive: the clean power-law params that do exist
+// render their value text as bare unitless numbers (Unit==""), so set_param real= declines them (it needs a real
+// unit to map). Meanwhile the zero-crossing curves that would suit a power law - e.g. Surge's envelope times,
+// which render "0 ms" at norm 0 up to "32 s" at norm 1 - are exponential with a hard zero floor, not polynomial,
+// so power loses to neither-fits and they drive the binary-search refinement fallback instead. Hence no
+// real-plugin power-fit E2E: adding one would mean fabricating a plugin that does not exist in this survey.
+//
 // fitPower fits real = A*norm^P in log-log space (log(real) = log(A) + P*log(norm)) by least squares over the
 // samples with norm > 0 AND real > 0. Zero-crossing curves (a time knob that renders "0 ms" at norm 0 and
 // "32 s" at norm 1) suit this model where exp cannot: exp needs all reals positive and cannot pass through the
