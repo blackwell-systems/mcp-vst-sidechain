@@ -98,6 +98,12 @@ All notable changes to this project are documented here. The format is based on
 
 ### Docs
 
+- **`docs/TESTING.md`** (new): documents the testing approach: the four layers (pure unit, fake-host loopback,
+  in-memory MCP transport, gated real-plugin E2E), how to run each locally (including the gated env vars), the
+  three CI workflows and the required-vs-report-only plugin/OS matrix, the conventions learned the hard way
+  (disconnect discipline, state-first round-trip, promote-on-actual-result), and how to add a plugin.
+- **`docs/ARCHITECTURE.md`** expanded into a comprehensive component/wire-protocol/tool-surface/data-flow
+  document (base64 opaque state, the full tool set, the Phase-1 semantic layer).
 - `docs/EXTRACTION-REVIEW.md` corrected: reframed the finding as real-unit-vs-normalized (skew being the visible
   part), scoped the fix to native ranged params (hosted commercial plugins stay normalized by necessity), fixed
   the self-contradicting "test with a commercial VST3" recommendation, and noted the fix has been applied.
