@@ -24,10 +24,13 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-14]
+        # VST3 hosting builds on all three platforms; AU is macOS only (the
+        # JUCE_PLUGINHOST_AU define is a no-op elsewhere). fail-fast:false keeps
+        # a single leg failing from redding the others (this gate is best-effort).
+        os: [ubuntu-latest, macos-14, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux JUCE deps
         if: runner.os == 'Linux'
@@ -38,13 +41,36 @@ jobs:
             libxinerama-dev libxrandr-dev libxrender-dev libwebkit2gtk-4.1-dev libglu1-mesa-dev
 
       - name: Cache JUCE FetchContent
-        uses: actions/cache@v4
+        uses: actions/cache@v6
         with:
           path: cpp/build/_deps
           key: juce-${{ runner.os }}-${{ hashFiles('cpp/CMakeLists.txt') }}
 
       - name: Configure
-        run: cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+        # CMAKE_EXPORT_COMPILE_COMMANDS gives clang-tidy the exact flags (JUCE
+        # include paths, defines) for our two translation units.
+        run: cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_EXPORT_COMPILE_COMMANDS=ON
 
       - name: Build
         run: cmake --build cpp/build --target sidechain-host --config Release
+
+      # Report-only lint of OUR sources only. --header-filter is restricted to
+      # cpp/ so JUCE's third-party headers (which ship their own .clang-tidy)
+      # are not linted; -p points clang-tidy at the compile database for flags.
+      # continue-on-error keeps this non-blocking; promote to a required gate
+      # once it is confirmed clean on CI. Linux leg only (clang-tidy preinstalled).
+      - name: clang-tidy (report-only)
+        if: runner.os == 'Linux'
+        continue-on-error: true
+        run: |
+          clang-tidy --version
+          clang-tidy -p cpp/build \
+            --header-filter='(^|/)cpp/' \
+            cpp/main.cpp cpp/Host.cpp
+
+      # TODO(warnings-as-errors): the sidechain-host target already links
+      # juce::juce_recommended_warning_flags. Flipping warnings to errors
+      # (e.g. -DCMAKE_CXX_FLAGS="-Werror" or MSVC /WX) is deferred until a
+      # clean warning baseline is confirmed on CI across all three legs; do
+      # not enable blind, since a single upstream-triggered warning would red
+      # this leg. Promote once the CI logs show a warning-free build.
