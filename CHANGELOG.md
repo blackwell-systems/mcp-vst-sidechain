@@ -98,6 +98,11 @@ All notable changes to this project are documented here. The format is based on
 
 ### Docs
 
+- **`docs/PHASE3-SCOPING.md`** (new, design only): a buildable spec for the planned persistent semantic store.
+  Resolves the open decisions (fingerprint-as-equivalence for cache reuse, storage, lifecycle, invalidation),
+  folds in the two-axis equivalence model (a derived behavior-class signature plus soft agent-authored role
+  strings with a suggested vocabulary rather than an enforced ontology), names the one C++ prerequisite (emit
+  plugin identity in the catalog), and defines the tool schemas and test plan. Not yet implemented.
 - **`docs/TESTING.md`** (new): documents the testing approach: the four layers (pure unit, fake-host loopback,
   in-memory MCP transport, gated real-plugin E2E), how to run each locally (including the gated env vars), the
   three CI workflows and the required-vs-report-only plugin/OS matrix, the conventions learned the hard way
