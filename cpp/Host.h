@@ -29,8 +29,10 @@ public:
     Host();
     ~Host();
 
-    // Load a plugin binary by filesystem path (a .vst3 bundle or .component AU). Returns an error string on
-    // failure (empty on success). Prepares the plugin at the given sample rate / block size.
+    // Load a plugin by filesystem path (a .vst3 bundle or .component AU) OR by an AudioUnit component identifier
+    // of the form "AudioUnit:Synths/aumu,dls ,appl" (type,subtype,manufacturer). The identifier form is how an AU
+    // is reliably referenced on macOS - the OS resolves it through the AudioComponent registry, not a path.
+    // Returns an error string on failure (empty on success). Prepares the plugin at the given rate / block size.
     juce::String load (const juce::String& pluginPath, double sampleRate = 48000.0, int blockSize = 512);
 
     bool isLoaded() const noexcept { return plugin != nullptr; }

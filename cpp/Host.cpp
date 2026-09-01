@@ -23,9 +23,21 @@ juce::String Host::load (const juce::String& pluginPath, double sampleRate, int 
     stopControl();
     plugin.reset();
 
-    juce::File file (pluginPath);
-    if (! file.exists())
-        return "plugin not found: " + pluginPath;
+    // An AudioUnit is normally referenced not by a filesystem path but by a component IDENTIFIER of the form
+    // "AudioUnit:Synths/aumu,dls ,appl" (type,subtype,manufacturer). This is how JUCE's KnownPluginList records
+    // and reloads AUs, and it is the reliable handle on macOS: the OS resolves an AU through the AudioComponent
+    // registry (AudioComponentFindNext), not by scanning an arbitrary path. A raw ".component" path only loads
+    // when that component is ALSO registered with the system (installed under ~/Library/Audio/Plug-Ins/Components
+    // or /Library/... and picked up by AudioComponentRegistrar); JUCE parses the path's Info.plist but still does
+    // the registry lookup. So we accept either form: an identifier bypasses the file check (there is no file to
+    // stat), a path is validated as before.
+    const bool isAUIdentifier = pluginPath.startsWithIgnoreCase ("AudioUnit:");
+    if (! isAUIdentifier)
+    {
+        juce::File file (pluginPath);
+        if (! file.exists())
+            return "plugin not found: " + pluginPath;
+    }
 
     // Ask each registered format to describe the binary. A single plugin file may host several sub-plugins
     // (shell format); we take the first described type.

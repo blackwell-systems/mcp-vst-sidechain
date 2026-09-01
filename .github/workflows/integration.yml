@@ -89,3 +89,53 @@ jobs:
           SIDECHAIN_LIVE_DISCRETE="$DISCRETE" \
           SIDECHAIN_LIVE_TIME="$TIME" \
             go test -run 'TestWiredLive|TestInferLive|TestE2ESurgeExtras' -v .
+
+      # AU (.component / AudioUnit) load+drive smoke. Report-only for now (continue-on-error): the whole point of
+      # this run is to catch a headless-AU wrinkle without reding the green VST3 job above. It mirrors the
+      # report-only staticcheck/govulncheck pattern. Promote it to a required step (drop continue-on-error) once
+      # it has been confirmed green on CI for a few runs.
+      #
+      # We drive an APPLE BUILT-IN AU by component identifier ("AudioUnit:Effects/aufx,dcmp,appl" =
+      # AUDynamicsProcessor). On macOS an AU is resolved through the system AudioComponent registry
+      # (AudioComponentFindNext), NOT by scanning a path: a third-party .component only loads once it is installed
+      # under ~/Library/Audio/Plug-Ins/Components AND registered by AudioComponentRegistrar, which is unreliable on
+      # a headless runner. Apple's own units are always registered, so an identifier is the deterministic AU load.
+      # (We still try Surge's .component by path first, purely to record on CI whether an unregistered path load
+      # works on the runner - a failure there is expected and does not fail this step.)
+      - name: Load and drive an AU (report-only)
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          HOST="cpp/build/sidechain-host_artefacts/Release/sidechain-host"
+
+          # Informational: does an unregistered third-party .component load by path on this runner? Extract Surge's
+          # AU from the already-downloaded zip and try. Expected to fail (not registered) - do not gate on it.
+          unzip -qo ~/surge/surge.zip -d ~/surge "Surge XT.component/*" || true
+          if [ -d "$HOME/surge/Surge XT.component" ]; then
+            echo "--- probing Surge XT.component load-by-path (informational) ---"
+            "$HOST" --plugin "$HOME/surge/Surge XT.component" --catalog surge-au.json --port 52001 2>surge-au.log &
+            SPID=$!
+            for i in $(seq 1 10); do [ -s surge-au.json ] && break; sleep 1; done
+            if [ -s surge-au.json ]; then
+              echo "load-by-path SUCCEEDED (component is registered on this runner): $(python3 -c "import json;print(json.load(open('surge-au.json'))['count'])") params"
+            else
+              echo "load-by-path did not enumerate (expected if unregistered):"; cat surge-au.log || true
+            fi
+            kill $SPID 2>/dev/null || true
+          fi
+
+          # The real smoke: load an Apple AU by identifier, enumerate its catalog, and drive it over the socket.
+          echo "--- AU load+drive: AUDynamicsProcessor by identifier ---"
+          "$HOST" --plugin "AudioUnit:Effects/aufx,dcmp,appl" --catalog aucat.json --port 52000 &
+          AU_PID=$!
+          trap 'kill $AU_PID 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do [ -s aucat.json ] && break; sleep 1; done
+          test -s aucat.json || { echo "AU host did not write a catalog (AU load failed)"; exit 1; }
+          AU_COUNT=$(python3 -c "import json; print(json.load(open('aucat.json'))['count'])")
+          echo "AU enumerated $AU_COUNT params"
+          [ "$AU_COUNT" -gt 0 ] || { echo "AU enumerated zero params"; exit 1; }
+          AU_PARAM=$(python3 -c "import json; print(json.load(open('aucat.json'))['params'][0]['id'])")
+          SIDECHAIN_AU_PORT=52000 \
+          SIDECHAIN_AU_CATALOG=aucat.json \
+          SIDECHAIN_AU_PARAM="$AU_PARAM" \
+            go test -run 'TestAULive' -v .
