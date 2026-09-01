@@ -137,14 +137,6 @@ wire protocol.
 - [ ] Preset/program access (enumerate + recall a plugin's own presets by index).
 - [ ] An in-DAW wrapper-plugin shape (single-binary, embedded control) alongside the headless host.
 
-## Prior art
-
-Generic bridges and adjacent efforts exist (`vst3-mcp`, `carla-mcp-server`, `ATRI_AGENT`, Spotify's
-`pedalboard` as a hosting foundation, and DAW-specific MCPs). Sidechain's bet is execution: a production-grade
-JUCE host plus a Go MCP layer plus the GCF token-efficiency edge, as a polished standalone bridge rather than a
-prototype or a whole agent-DAW. "VST" is a Steinberg trademark, used here descriptively for compatibility, not
-to claim affiliation.
-
 ## License
 
 MIT. Copyright (c) 2026 Dayna Blackwell. The realtime control substrate and Go MCP forwarder here originated in
