@@ -102,12 +102,10 @@ jobs:
           SIDECHAIN_LIVE_TIME="$TIME" \
             go test -run 'TestWiredLive|TestInferLive|TestE2ESurgeExtras' -v .
 
-      # Surge XT EFFECTS VST3 (report-only): proves the SAME generic surface drives a NON-synth. Run WITHOUT the
-      # MIDI smoke (an effect has no MIDI in). continue-on-error keeps it non-blocking; promote to required (drop
-      # continue-on-error) once it has been green on CI for a few runs. Mirrors the AU/staticcheck report-only
-      # pattern already in the repo.
-      - name: Drive Surge XT Effects VST3 (effect, no MIDI) - report-only
-        continue-on-error: true
+      # Surge XT EFFECTS VST3 (REQUIRED on macOS): proves the SAME generic surface drives a NON-synth. Run WITHOUT
+      # the MIDI smoke (an effect has no MIDI in). Promoted from report-only after several green macOS runs. (The
+      # Linux effect leg stays report-only; it does not yet host headless there.)
+      - name: Drive Surge XT Effects VST3 (effect, no MIDI) - REQUIRED
         env:
           SIDECHAIN_HOST_BIN: cpp/build/sidechain-host_artefacts/Release/sidechain-host
         run: |
@@ -115,10 +113,8 @@ jobs:
           source .github/scripts/drive_plugin.sh
           drive_plugin "Surge XT Effects" "$HOME/surge/Surge XT Effects.vst3" 51992 0
 
-      # AU (.component / AudioUnit) load+drive smoke. Report-only for now (continue-on-error): the whole point of
-      # this run is to catch a headless-AU wrinkle without reding the green VST3 job above. It mirrors the
-      # report-only staticcheck/govulncheck pattern. Promote it to a required step (drop continue-on-error) once
-      # it has been confirmed green on CI for a few runs.
+      # AU (.component / AudioUnit) load+drive smoke - REQUIRED on macOS (promoted after several green runs: the
+      # Apple-AU-by-identifier load is deterministic on the runner).
       #
       # We drive an APPLE BUILT-IN AU by component identifier ("AudioUnit:Effects/aufx,dcmp,appl" =
       # AUDynamicsProcessor). On macOS an AU is resolved through the system AudioComponent registry
@@ -127,8 +123,7 @@ jobs:
       # a headless runner. Apple's own units are always registered, so an identifier is the deterministic AU load.
       # (We still try Surge's .component by path first, purely to record on CI whether an unregistered path load
       # works on the runner - a failure there is expected and does not fail this step.)
-      - name: Load and drive an AU (report-only)
-        continue-on-error: true
+      - name: Load and drive an AU - REQUIRED
         run: |
           set -euo pipefail
           HOST="cpp/build/sidechain-host_artefacts/Release/sidechain-host"
@@ -166,14 +161,14 @@ jobs:
             go test -run 'TestAULive' -v .
 
   # ---------------------------------------------------------------------------------------------------------------
-  # Linux leg. ENTIRELY report-only (continue-on-error) for now: headless JUCE plugin hosting on Linux is
-  # unproven in this repo, so nothing here may red the pipeline until it has been green on CI for a few runs.
-  # Each plugin drives the SAME generic gated suite under xvfb-run (a JUCE plugin instantiates its editor-less
-  # processor but still touches X at construction, so an X server must be present even though we never open a UI).
-  # Promote individual legs to required by moving them to a job without job-level continue-on-error once proven.
+  # Linux leg. Headless JUCE VST3 hosting under xvfb-run (a plugin touches X at construction even with no editor).
+  # The job is now REQUIRED, but the individual drive steps are mixed: Surge XT and TAL-NoiseMaker are proven
+  # green across several runs and gate the pipeline; Dexed (async state recall) and the Surge Effects leg do not
+  # yet host headless on Linux, so those two steps keep step-level continue-on-error (report-only). All steps run
+  # regardless of prior failures (if: !cancelled()) so every plugin reports each run. Promote Dexed/Effects by
+  # dropping their step-level continue-on-error once they are green here for a few runs.
   smoke-linux:
     runs-on: ubuntu-latest
-    continue-on-error: true
     env:
       # JUCE writes the artefact under the $<CONFIG> subdir even on single-config generators when
       # CMAKE_BUILD_TYPE is set, so the Linux path has the same Release/ segment as macOS (the earlier
@@ -238,31 +233,38 @@ jobs:
 
           ls -la ~/plugins
 
-      # One host build; loop the plugins. Each drive is its own step; job-level continue-on-error makes them all
-      # report-only, and per-step failures are isolated in the log. The host runs under xvfb-run -a (SIDECHAIN_XVFB).
-      - name: Drive Surge XT VST3 (synth) - report-only
+      # One host build; loop the plugins. Each drive is its own step, and all run regardless of prior-step outcome
+      # (if: !cancelled()) so every plugin reports each run. Surge XT + TAL are REQUIRED (proven green); Dexed and
+      # the Effects leg keep step-level continue-on-error (report-only) until they host headless here. Host runs
+      # under xvfb-run -a (SIDECHAIN_XVFB).
+      - name: Drive Surge XT VST3 (synth) - REQUIRED
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           source .github/scripts/drive_plugin.sh
           drive_plugin "Surge XT" "$HOME/plugins/Surge XT.vst3" 51990 1
 
-      - name: Drive TAL-NoiseMaker VST3 (synth) - report-only
+      - name: Drive TAL-NoiseMaker VST3 (synth) - REQUIRED
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           source .github/scripts/drive_plugin.sh
           drive_plugin "TAL-NoiseMaker" "$HOME/plugins/TAL-NoiseMaker.vst3" 51991 1
 
+      # Dexed: loads/sweeps/batch/MIDI pass on Linux, but save_state/load_state does not restore (Dexed applies
+      # state asynchronously). Report-only until fixed.
       - name: Drive Dexed VST3 (FM synth) - report-only
         if: ${{ !cancelled() }}
+        continue-on-error: true
         run: |
           set -euo pipefail
           source .github/scripts/drive_plugin.sh
           drive_plugin "Dexed" "$HOME/plugins/Dexed.vst3" 51992 1
 
+      # Surge Effects hosts fine on macOS but not yet under Linux xvfb. Report-only until it does.
       - name: Drive Surge XT Effects VST3 (effect, no MIDI) - report-only
         if: ${{ !cancelled() }}
+        continue-on-error: true
         run: |
           set -euo pipefail
           source .github/scripts/drive_plugin.sh
