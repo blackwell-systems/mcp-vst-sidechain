@@ -241,24 +241,28 @@ jobs:
       # One host build; loop the plugins. Each drive is its own step; job-level continue-on-error makes them all
       # report-only, and per-step failures are isolated in the log. The host runs under xvfb-run -a (SIDECHAIN_XVFB).
       - name: Drive Surge XT VST3 (synth) - report-only
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           source .github/scripts/drive_plugin.sh
           drive_plugin "Surge XT" "$HOME/plugins/Surge XT.vst3" 51990 1
 
       - name: Drive TAL-NoiseMaker VST3 (synth) - report-only
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           source .github/scripts/drive_plugin.sh
           drive_plugin "TAL-NoiseMaker" "$HOME/plugins/TAL-NoiseMaker.vst3" 51991 1
 
       - name: Drive Dexed VST3 (FM synth) - report-only
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           source .github/scripts/drive_plugin.sh
           drive_plugin "Dexed" "$HOME/plugins/Dexed.vst3" 51992 1
 
       - name: Drive Surge XT Effects VST3 (effect, no MIDI) - report-only
+        if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
           source .github/scripts/drive_plugin.sh
