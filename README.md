@@ -141,3 +141,6 @@ wire protocol.
 
 MIT. Copyright (c) 2026 Dayna Blackwell. The realtime control substrate and Go MCP forwarder here originated in
 the author's own synth work and are published as a standalone, generic OSS bridge.
+
+"VST" is a trademark of Steinberg Media Technologies GmbH, used here descriptively for compatibility, not to
+claim affiliation.
