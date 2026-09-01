@@ -1,5 +1,5 @@
 // main.cpp - the headless Sidechain host CLI. It loads a VST3/AU plugin by path, writes its parameter catalog
-// as JSON (for the Go MCP server to read), starts the ControlListener on a loopback port, and then pumps the
+// as JSON (for the Go MCP server to read), starts the ControlServer on a loopback port, and then pumps the
 // JUCE message loop so the socket serves and parameter/state applies happen on the message thread.
 //
 //   sidechain-host --plugin /path/to/Plugin.vst3 [--catalog out.json] [--port 51703]
@@ -27,7 +27,7 @@ juce::String argValue (const juce::StringArray& args, const juce::String& flag, 
 }
 }
 
-// A minimal JUCE app so there IS a message loop for the ControlListener's AsyncUpdater to drain on.
+// A minimal JUCE app so there IS a message loop for the ControlServer's AsyncUpdater to drain on.
 class SidechainHostApp : public juce::JUCEApplicationBase
 {
 public:
@@ -47,12 +47,12 @@ public:
 
         const juce::String pluginPath = argValue (args, "--plugin");
         const juce::String catalogOut = argValue (args, "--catalog", "plugin-catalog.json");
-        const int          port       = argValue (args, "--port", juce::String (sidechain::ControlListener::kDefaultPort)).getIntValue();
+        const int          port       = argValue (args, "--port", juce::String (sidechain::ControlServer::kDefaultPort)).getIntValue();
 
         if (pluginPath.isEmpty())
         {
             std::fprintf (stderr, "usage: sidechain-host --plugin <path.vst3|.component> [--catalog out.json] [--port %d]\n",
-                          sidechain::ControlListener::kDefaultPort);
+                          sidechain::ControlServer::kDefaultPort);
             setApplicationReturnValue (2);
             quit();
             return;

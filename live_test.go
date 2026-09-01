@@ -1,9 +1,9 @@
 // live_test.go - loopback test for the live-control path. Stands up a FAKE host listener (a goroutine speaking
-// the ControlListener line-JSON protocol against an in-memory param map) and drives it through the session's
+// the ControlServer line-JSON protocol against an in-memory param map) and drives it through the session's
 // live path: connect_live -> set_param forwards + the fake records it -> get_param reads it back -> play_note
 // reaches the fake -> all_notes_off panics it -> disconnect_live returns to headless.
 //
-// This exercises the Go forwarder end to end without a running C++ host; the real cpp/ControlListener.h speaks
+// This exercises the Go forwarder end to end without a running C++ host; the real cpp/ControlServer.h speaks
 // the identical protocol, so this is "same bytes on the socket."
 
 package sidechain
@@ -68,7 +68,7 @@ func renderFor(id string, norm float64) string {
 	}
 }
 
-// fakeHost is a minimal stand-in for cpp/ControlListener: it accepts one client and answers the same commands
+// fakeHost is a minimal stand-in for cpp/ControlServer: it accepts one client and answers the same commands
 // over the same line-delimited JSON protocol, backed by an in-memory normalized-value map.
 type fakeHost struct {
 	ln     net.Listener

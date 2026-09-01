@@ -1,6 +1,6 @@
-// live.go - the live-control client: a localhost TCP, line-delimited-JSON socket to a ControlListener
-// (cpp/ControlListener.h) embedded in a host that has a plugin loaded. set_param / get_param / play_note /
-// all_notes_off forward over this socket to the running instance. The wire protocol mirrors ControlListener
+// live.go - the live-control client: a localhost TCP, line-delimited-JSON socket to a ControlServer
+// (cpp/ControlServer.h) embedded in a host that has a plugin loaded. set_param / get_param / play_note /
+// all_notes_off forward over this socket to the running instance. The wire protocol mirrors ControlServer
 // 1:1 (one JSON object per line, one JSON reply per line, with an {ok:bool} field). This client is a thin
 // forwarder that also satisfies the LiveEndpoint interface the generic tools depend on.
 
@@ -21,12 +21,12 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
-// DefaultPort is the ControlListener's default loopback port (matches cpp/ControlListener.h kDefaultPort and
+// DefaultPort is the ControlServer's default loopback port (matches cpp/ControlServer.h kDefaultPort and
 // the SIDECHAIN_PORT env bring-up).
 const DefaultPort = 51703
 
 // LiveEndpoint is the transport the generic param tools drive when connected to a running instance. One impl
-// (*liveClient) speaks the ControlListener wire protocol; a host may provide its own.
+// (*liveClient) speaks the ControlServer wire protocol; a host may provide its own.
 //
 // SetParam takes a value plus isReal: when isReal is true, v is a REAL-unit value (only for HasRealRange params)
 // and the endpoint forwards it as `value` so the plugin applies its own (possibly skewed) real->normalized
@@ -66,7 +66,7 @@ type liveClient struct {
 	closeOnce sync.Once
 }
 
-// dialLive connects to the ControlListener, starts the reader, and handshakes with a ping. Bound to the
+// dialLive connects to the ControlServer, starts the reader, and handshakes with a ping. Bound to the
 // caller-supplied host (default 127.0.0.1); the listener only ever binds loopback, so a remote host fails to dial.
 func dialLive(host string, port int) (*liveClient, error) {
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
@@ -289,8 +289,8 @@ func (lc *liveClient) Close() {
 // ---- live tools ----
 
 type connectLiveIn struct {
-	Host string `json:"host,omitempty" jsonschema:"host running the ControlListener (default 127.0.0.1; the listener only binds loopback)"`
-	Port int    `json:"port,omitempty" jsonschema:"listen port (default 51703; matches SIDECHAIN_PORT and cpp/ControlListener kDefaultPort)"`
+	Host string `json:"host,omitempty" jsonschema:"host running the ControlServer (default 127.0.0.1; the server only binds loopback)"`
+	Port int    `json:"port,omitempty" jsonschema:"listen port (default 51703; matches SIDECHAIN_PORT and cpp/ControlServer kDefaultPort)"`
 }
 
 func (s *session) handleConnectLive(ctx context.Context, _ *mcp.CallToolRequest, in connectLiveIn) (*mcp.CallToolResult, any, error) {

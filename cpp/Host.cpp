@@ -183,13 +183,18 @@ juce::String Host::startControl (int port)
         return "no plugin loaded";
     if (control != nullptr)
         return {};   // already listening
-    control = std::make_unique<ControlListener> (*plugin, keyboardState, port);
+    // The bridge is the plugin-specific half (parameter/state/MIDI access); the server is the VST-agnostic
+    // control plane driving it. The bridge must outlive the server (the server holds a reference to it), so it
+    // is constructed first and torn down last.
+    bridge  = std::make_unique<JucePluginBridge> (*plugin, keyboardState);
+    control = std::make_unique<ControlServer> (*bridge, port);
     return {};
 }
 
 void Host::stopControl()
 {
-    control.reset();
+    control.reset();   // stop the control plane (and its threads) before releasing the bridge it references
+    bridge.reset();
 }
 
 } // namespace sidechain

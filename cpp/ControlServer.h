@@ -1,55 +1,55 @@
 #pragma once
-#include <juce_audio_processors/juce_audio_processors.h>
-#include <juce_audio_basics/juce_audio_basics.h>
+#include <juce_core/juce_core.h>
+#include <juce_events/juce_events.h>
 #include <algorithm>
 #include <atomic>
-#include <cmath>
 #include <deque>
-#include <functional>
 #include <memory>
 #include <mutex>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
+#include "PluginBridge.h"
 
 // ================================================================================================
-// sidechain::ControlListener - an in-process LIVE-CONTROL listener for any juce::AudioProcessor.
+// sidechain::ControlServer - the VST-agnostic LIVE-CONTROL plane. It owns the transport, the wire protocol,
+// controller identity, the command queue, change-event broadcast, and the conflict tier. It drives a plugin
+// only through a PluginBridge (see PluginBridge.h), so it has NO dependency on juce_audio_processors or any
+// concrete plugin/parameter/state type: point it at any PluginBridge and external agents can drive that thing
+// over a localhost socket. The Go MCP server (this repo) is a thin forwarder that speaks the protocol below.
 //
-// Point it at a processor (your own plugin, or a child plugin instance loaded via
-// juce::AudioPluginFormatManager - see Host.h) and external agents can drive it in real time over a
-// localhost socket: move any parameter, play notes, ask for a parameter's current value, and get/set the
-// opaque full-state blob. The Go MCP server (this repo) is a thin forwarder that speaks the wire protocol below.
+// (This is the former ControlListener, split so the transport/protocol/identity/event machinery is reusable
+// beyond a JUCE plugin; JucePluginBridge holds everything plugin-specific.)
 //
 // THREAD MODEL (the load-bearing safety rules; see docs/CONCURRENCY.md):
-//   • The AUDIO thread is untouched: this class never blocks or allocates on it. Reads are parameter atomics.
-//   • MANY SOCKET threads (one per connected controller) parse JSON. A READ snapshots the parameter atomic and
-//     replies directly. A MUTATION pushes a Command carrying a per-request Completion into an MPSC queue and
-//     fires an AsyncUpdate, then waits (bounded) on its OWN Completion. Each connection also has an OUTBOUND
-//     queue; its handler is the SINGLE writer to that socket (replies + broadcast events), so writes never race.
-//   • The MESSAGE THREAD is the SINGLE applier: it drains the command queue and applies each Command, then
-//     signals that command's Completion. Every mutation serializes here (this is the conflict tier: last-writer-
-//     wins by message-thread order; a governed-convergence engine (gsm) can slot in here at C3).
-//   • CHANGE EVENTS: this registers as an AudioProcessorParameter::Listener. When any parameter changes (by any
-//     controller, the plugin's own editor, or host automation) it BROADCASTS a `param_changed` event to every
-//     connection. The listener callback may fire on any thread, so it only broadcasts directly when on the
-//     message thread; otherwise it marks the param dirty and defers to the drain, keeping the audio path lock-free.
+//   • The AUDIO thread is untouched: this class never blocks or allocates on it. Bridge reads are atomics.
+//   • MANY SOCKET threads (one per connected controller) parse JSON. A READ asks the bridge (safe from any
+//     thread) and replies directly. A MUTATION pushes a Command carrying a per-request Completion into an MPSC
+//     queue and fires an AsyncUpdate, then waits (bounded) on its OWN Completion. Each connection also has an
+//     OUTBOUND queue; its handler is the SINGLE writer to that socket (replies + broadcast events), so writes
+//     never race.
+//   • The MESSAGE THREAD is the SINGLE applier: it drains the command queue and applies each Command via the
+//     bridge, then signals that command's Completion. Every mutation serializes here (this is the conflict tier:
+//     last-writer-wins by message-thread order; a governed-convergence engine (gsm) can slot in here at C3).
+//   • CHANGE EVENTS: the bridge calls onParamChanged(index) when any parameter changes (by any controller, the
+//     plugin's editor, or host automation). That may fire on any thread, so we broadcast directly only when on
+//     the message thread (with attribution); otherwise we mark the param dirty and defer to the drain, keeping
+//     the audio path lock-free.
 //
-// TRANSPORT - localhost TCP, line-delimited JSON. Bound to 127.0.0.1 ONLY. MANY clients may connect at once; each
-// gets a clientID at the ping handshake. Requests mirror the MCP tools 1:1; the server also PUSHES unsolicited
-// `param_changed` events, so the protocol is multiplexed async (a reply carries the request `id`; an event carries
-// an `event` field). Requests:
+// TRANSPORT - localhost TCP, line-delimited JSON. Bound to 127.0.0.1 ONLY. MANY clients may connect at once;
+// each gets a clientID at the ping handshake. The server also PUSHES unsolicited `param_changed` events, so the
+// protocol is multiplexed async (a reply carries the request `id`; an event carries an `event` field). Requests:
 //   ping · get_param{param} · set_param{param,(value|normalized|choice)} · note_on{chan,note,vel} ·
 //   note_off{chan,note} · all_notes_off · reset_init · load_state{state} · get_full_state · get_state.
-//   (load_state/get_full_state carry `state`: base64 of the plugin's own opaque getStateInformation bytes.)
+//   (load_state/get_full_state carry `state`: base64 of the plugin's own opaque state bytes, handled by the bridge.)
 // ================================================================================================
 
 namespace sidechain
 {
 
-class ControlListener : private juce::Thread,
-                        private juce::AsyncUpdater,
-                        private juce::AudioProcessorParameter::Listener
+class ControlServer : private juce::Thread,
+                      private juce::AsyncUpdater,
+                      private ParamChangeSink
 {
 public:
     // Session status. Ordered idle < listening < connected (connected = at least one controller attached).
@@ -57,37 +57,20 @@ public:
 
     static constexpr int kDefaultPort = 51703;   // 127.0.0.1:51703 (the Go server's connect_live default)
 
-    // `proc` and `kbd` are JUCE base types, so this header has NO dependency on any concrete processor type.
-    ControlListener (juce::AudioProcessor& proc, juce::MidiKeyboardState& kbd, int port = kDefaultPort)
-        : juce::Thread ("sidechain-control"), processor (proc), keyboardState (kbd), listenPort (port)
+    ControlServer (PluginBridge& b, int port = kDefaultPort)
+        : juce::Thread ("sidechain-control"), bridge (b), listenPort (port)
     {
-        // Build the id → param map ONCE on the BASE AudioProcessorParameter API (a hosted VST3/AU exposes
-        // HostedAudioProcessorParameter, not RangedAudioParameter). Also build an index → ParamRef view for the
-        // change-event path, and register as a per-parameter listener so we hear ALL changes.
-        const auto& params = processor.getParameters();
-        byIndex.assign ((size_t) params.size(), nullptr);
-        for (int i = 0; i < params.size(); ++i)
-        {
-            auto* p = params[i];
-            std::string id = std::to_string (i);
-            if (auto* hp = dynamic_cast<juce::HostedAudioProcessorParameter*> (p))
-                if (hp->getParameterID().isNotEmpty())
-                    id = hp->getParameterID().toStdString();
-            auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (p);
-            byId[id] = ParamRef { i, p, ranged, ranged != nullptr && ! p->isDiscrete(), id };
-            byIndex[(size_t) i] = &byId[id];   // node-based map => pointer stays valid as more are inserted
-        }
-        dirtyCount = params.size();
+        dirtyCount = bridge.paramCount();
         dirty = std::make_unique<std::atomic<bool>[]> ((size_t) juce::jmax (1, dirtyCount));
-        for (auto* p : params) p->addListener (this);
+        bridge.setChangeSink (this);   // start hearing parameter changes
 
         status.store (Status::Listening);
         startThread (juce::Thread::Priority::normal);
     }
 
-    ~ControlListener() override
+    ~ControlServer() override
     {
-        for (auto* p : processor.getParameters()) p->removeListener (this);   // stop callbacks first
+        bridge.setChangeSink (nullptr);   // stop change callbacks before we tear down
         signalThreadShouldExit();
         listener.close();     // unblocks waitForNextConnection() so no new clients are accepted
         {
@@ -104,20 +87,7 @@ public:
     Status getStatus() const noexcept { return status.load(); }
     int     getPort()   const noexcept { return listenPort; }
 
-    // Optional message-thread action for "reset_init". Null ⇒ a no-op ack. Kept as a callback so this header
-    // stays free of any concrete processor dependency.
-    std::function<void()> onResetInit;
-
 private:
-    struct ParamRef
-    {
-        int index = -1;
-        juce::AudioProcessorParameter* rp = nullptr;
-        juce::RangedAudioParameter*    ranged = nullptr;  // non-null iff the param exposes a NormalisableRange
-        bool                           useReal = false;   // ranged AND continuous: value<->norm uses the plugin's curve
-        std::string                    id;                // the stable string id (for change events)
-    };
-
     // Per-request completion. Heap-allocated and shared between the requesting handler and the message thread, so
     // a bounded timeout can never free it under a late apply. Result fields read only AFTER event.wait() is true.
     struct Completion
@@ -321,62 +291,47 @@ private:
     juce::String handleGetParam (const juce::var& req, const juce::var& id)
     {
         const std::string pid = req.getProperty ("param", juce::var()).toString().toStdString();
-        auto it = byId.find (pid);
-        if (it == byId.end())
+        ParamValue pv;
+        if (! bridge.readParam (pid, pv))
             return errorReply ("unknown_param", id);
-
-        auto* rp = it->second.rp;
-        const float norm = rp->getValue();                 // atomic; safe from any thread (normalized 0..1)
-        const juce::String text = rp->getText (norm, 256);
         return okReply (id, [&] (juce::DynamicObject& o)
         {
             o.setProperty ("param",      juce::String (pid));
-            o.setProperty ("value",      valueForCatalog (it->second, norm));
-            o.setProperty ("normalized", norm);
-            o.setProperty ("text",       text);
+            o.setProperty ("value",      pv.value);
+            o.setProperty ("normalized", pv.normalized);
+            o.setProperty ("text",       juce::String (pv.text));
         });
     }
 
     juce::String handleSetParam (const juce::var& req, const juce::var& id, int clientId)
     {
         const std::string pid = req.getProperty ("param", juce::var()).toString().toStdString();
-        auto it = byId.find (pid);
-        if (it == byId.end())
-            return errorReply ("unknown_param", id);
 
-        auto* rp = it->second.rp;
-        const int steps = rp->getNumSteps();
-        float norm;
-        if (req.hasProperty ("normalized"))
-            norm = juce::jlimit (0.0f, 1.0f, (float) req.getProperty ("normalized", 0.0f));
-        else if (req.hasProperty ("choice"))
-        {
-            const int idx = (int) req.getProperty ("choice", 0);
-            norm = (steps > 1) ? juce::jlimit (0.0f, 1.0f, (float) idx / (float) (steps - 1)) : 0.0f;
-        }
-        else if (req.hasProperty ("value"))
-        {
-            const float v = (float) req.getProperty ("value", 0.0f);
-            if (it->second.useReal)
-                norm = juce::jlimit (0.0f, 1.0f, it->second.ranged->convertTo0to1 (v));
-            else
-                norm = (steps > 1) ? juce::jlimit (0.0f, 1.0f, v / (float) (steps - 1))
-                                   : juce::jlimit (0.0f, 1.0f, v);
-        }
+        SetForm form;
+        double  v = 0.0;
+        if (req.hasProperty ("normalized"))      { form = SetForm::Normalized; v = (double) req.getProperty ("normalized", 0.0); }
+        else if (req.hasProperty ("choice"))     { form = SetForm::Choice;     v = (double) req.getProperty ("choice", 0);       }
+        else if (req.hasProperty ("value"))      { form = SetForm::Value;      v = (double) req.getProperty ("value", 0.0);      }
         else
             return errorReply ("no_value", id);
 
-        Command c; c.kind = Kind::SetParam; c.a = it->second.index; c.f = norm; c.clientId = clientId;
+        int   index = -1;
+        float norm  = 0.0f;
+        if (! bridge.resolveSet (pid, form, v, index, norm))
+            return errorReply ("unknown_param", id);
+
+        Command c; c.kind = Kind::SetParam; c.a = index; c.f = norm; c.clientId = clientId;
         if (submit (std::move (c), 250) == nullptr)
             return errorReply ("timeout", id);
 
-        const float applied = rp->getValue();
+        ParamValue pv;
+        bridge.readParam (pid, pv);   // read back the applied value for the reply
         return okReply (id, [&] (juce::DynamicObject& o)
         {
             o.setProperty ("param",      juce::String (pid));
-            o.setProperty ("normalized", applied);
-            o.setProperty ("value",      valueForCatalog (it->second, applied));
-            o.setProperty ("text",       rp->getText (applied, 256));
+            o.setProperty ("normalized", pv.normalized);
+            o.setProperty ("value",      pv.value);
+            o.setProperty ("text",       juce::String (pv.text));
         });
     }
 
@@ -397,49 +352,48 @@ private:
     juce::String handleGetState (const juce::var& id)
     {
         auto* params = new juce::DynamicObject();
-        for (const auto& kv : byId)
+        const auto all = bridge.snapshotAll();
+        for (const auto& kv : all)
         {
-            auto* rp = kv.second.rp;
-            const float norm = rp->getValue();
             auto* one = new juce::DynamicObject();
-            one->setProperty ("value",      valueForCatalog (kv.second, norm));
-            one->setProperty ("normalized", norm);
+            one->setProperty ("value",      kv.second.value);
+            one->setProperty ("normalized", kv.second.normalized);
             params->setProperty (juce::String (kv.first), juce::var (one));
         }
         return okReply (id, [&] (juce::DynamicObject& o)
         {
-            o.setProperty ("count",  (int) byId.size());
+            o.setProperty ("count",  (int) all.size());
             o.setProperty ("params", juce::var (params));
         });
     }
 
-    // -------- change events (this : juce::AudioProcessorParameter::Listener) --------------------
-    void parameterValueChanged (int index, float newValue) override
+    // -------- change events (this : ParamChangeSink; the bridge calls us) -----------------------
+    void onParamChanged (int index) override
     {
         // Fires for ANY change (our command, the plugin's editor, host automation) and "may be called from any
         // thread". Never lock on a non-message thread (could be the audio thread): broadcast now only if on the
         // message thread (with attribution); otherwise mark dirty and defer to the drain.
         if (juce::MessageManager::existsAndIsCurrentThread())
-            broadcastParamChanged (index, newValue, applyingClientId.load());
+            broadcastParamChanged (index, applyingClientId.load());
         else if (index >= 0 && index < dirtyCount)
         {
             dirty[(size_t) index].store (true, std::memory_order_release);
             triggerAsyncUpdate();
         }
     }
-    void parameterGestureChanged (int, bool) override {}
 
-    void broadcastParamChanged (int index, float norm, int by)
+    void broadcastParamChanged (int index, int by)
     {
-        if (index < 0 || index >= (int) byIndex.size() || byIndex[(size_t) index] == nullptr)
+        std::string pid;
+        ParamValue  pv;
+        if (! bridge.describeIndex (index, pid, pv))
             return;
-        const ParamRef& r = *byIndex[(size_t) index];
         auto* o = new juce::DynamicObject();
         o->setProperty ("event",      "param_changed");
-        o->setProperty ("param",      juce::String (r.id));
-        o->setProperty ("normalized", norm);
-        o->setProperty ("value",      valueForCatalog (r, norm));
-        o->setProperty ("text",       r.rp->getText (norm, 256));
+        o->setProperty ("param",      juce::String (pid));
+        o->setProperty ("normalized", pv.normalized);
+        o->setProperty ("value",      pv.value);
+        o->setProperty ("text",       juce::String (pv.text));
         o->setProperty ("by",         by);   // originating clientID when known (message-thread path), else 0
         const std::string line = juce::JSON::toString (juce::var (o), true).toStdString() + "\n";
         std::lock_guard<std::mutex> lk (clientsMutex);
@@ -485,7 +439,7 @@ private:
         // lock-free). Attribution is unavailable off-thread, so by = 0 (external / plugin / host automation).
         for (int i = 0; i < dirtyCount; ++i)
             if (dirty[(size_t) i].exchange (false, std::memory_order_acq_rel))
-                broadcastParamChanged (i, byIndex[(size_t) i]->rp->getValue(), 0);
+                broadcastParamChanged (i, 0);
     }
 
     void applyCommand (Command& c)
@@ -493,55 +447,25 @@ private:
         switch (c.kind)
         {
             case Kind::SetParam:
-                if (auto* p = processor.getParameters()[c.a])
-                {
-                    applyingClientId.store (c.clientId);   // attribute the resulting change event to this controller
-                    p->setValueNotifyingHost (c.f);
-                    applyingClientId.store (0);
-                }
+                applyingClientId.store (c.clientId);   // attribute the resulting change event to this controller
+                bridge.applyParam (c.a, c.f);
+                applyingClientId.store (0);
                 break;
-            case Kind::NoteOn:      keyboardState.noteOn  (c.a, c.b, c.f); break;
-            case Kind::NoteOff:     keyboardState.noteOff (c.a, c.b, c.f); break;
-            case Kind::AllNotesOff:
-                for (int ch = 1; ch <= 16; ++ch) keyboardState.allNotesOff (ch);
-                break;
-            case Kind::ResetInit:
-                if (onResetInit) onResetInit();
-                break;
+            case Kind::NoteOn:      bridge.noteOn  (c.a, c.b, c.f); break;
+            case Kind::NoteOff:     bridge.noteOff (c.a, c.b, c.f); break;
+            case Kind::AllNotesOff: bridge.allNotesOff(); break;
+            case Kind::ResetInit:   bridge.resetInit();   break;
             case Kind::LoadState:
-                {
-                    juce::MemoryOutputStream decoded;
-                    if (juce::Base64::convertFromBase64 (decoded, juce::String (c.payload)) && decoded.getDataSize() > 0)
-                    {
-                        applyingClientId.store (c.clientId);
-                        processor.setStateInformation (decoded.getData(), (int) decoded.getDataSize());
-                        applyingClientId.store (0);
-                        if (c.done) c.done->loadOk = true;
-                    }
-                }
+                applyingClientId.store (c.clientId);
+                if (bridge.loadState (c.payload) && c.done)
+                    c.done->loadOk = true;
+                applyingClientId.store (0);
                 break;
             case Kind::GetFullState:
-                {
-                    juce::MemoryBlock mb;
-                    processor.getStateInformation (mb);
-                    if (c.done)
-                    {
-                        c.done->state   = juce::Base64::toBase64 (mb.getData(), mb.getSize()).toStdString();
-                        c.done->stateOk = true;
-                    }
-                }
+                if (c.done)
+                    c.done->stateOk = bridge.saveState (c.done->state);
                 break;
         }
-    }
-
-    static double valueForCatalog (const ParamRef& ref, float norm)
-    {
-        if (ref.useReal)
-            return (double) ref.ranged->convertFrom0to1 (norm);
-        const int steps = ref.rp->getNumSteps();
-        if (steps > 1 && ref.rp->isDiscrete())
-            return std::round (norm * (double) (steps - 1));
-        return (double) norm;
     }
 
     // -------- JSON reply helpers ----------------------------------------------------------------
@@ -564,14 +488,10 @@ private:
         return juce::JSON::toString (juce::var (o), true);
     }
 
-    juce::AudioProcessor&    processor;
-    juce::MidiKeyboardState& keyboardState;
-    const int                listenPort;
+    PluginBridge&  bridge;
+    const int      listenPort;
 
     juce::StreamingSocket listener;
-
-    std::unordered_map<std::string, ParamRef> byId;
-    std::vector<const ParamRef*>              byIndex;   // parameter index -> ParamRef (for change events)
 
     std::unique_ptr<std::atomic<bool>[]> dirty;          // per-param "changed off the message thread" flag
     int                                  dirtyCount = 0;
@@ -588,7 +508,7 @@ private:
 
     std::atomic<Status> status { Status::Idle };
 
-    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ControlListener)
+    JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (ControlServer)
 };
 
 } // namespace sidechain

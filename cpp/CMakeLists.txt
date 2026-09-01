@@ -1,5 +1,5 @@
 # CMakeLists.txt - builds the headless Sidechain host (sidechain-host), a JUCE console app that loads a VST3/AU
-# child plugin and serves the ControlListener wire protocol on loopback.
+# child plugin and serves the ControlServer wire protocol on loopback.
 #
 # JUCE is pulled via FetchContent (no submodule, no system install). A first configure downloads JUCE, so it is
 # network- and time-heavy; pin the tag for reproducibility.

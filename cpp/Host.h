@@ -3,15 +3,16 @@
 #include <juce_audio_basics/juce_audio_basics.h>
 #include <memory>
 #include <string>
-#include "ControlListener.h"
+#include "ControlServer.h"
+#include "JucePluginBridge.h"
 
 // ================================================================================================
 // sidechain::Host - a headless child-plugin host. Loads ONE VST3/AU by path via
-// juce::AudioPluginFormatManager, instantiates it, prepares it for playback, and points a ControlListener at
-// the hosted processor so an agent can drive it over the wire protocol.
+// juce::AudioPluginFormatManager, instantiates it, prepares it for playback, and points a ControlServer (via a
+// JucePluginBridge) at the hosted processor so an agent can drive it over the wire protocol.
 //
-// This is Sidechain's reason to exist (the generic control substrate - ControlListener - plus the ability to
-// wrap an arbitrary closed-source plugin the user has licensed). It talks to the plugin only through the
+// This is Sidechain's reason to exist (the generic control substrate - ControlServer over a PluginBridge - plus
+// the ability to wrap an arbitrary closed-source plugin the user has licensed). It talks to the plugin only through the
 // standardized VST3/AU API JUCE exposes: no source, no reverse-engineering, exactly what a DAW does.
 //
 // The parameter catalog (enumerateCatalog) is the runtime replacement for a fixed, codegen'd catalog: it
@@ -44,21 +45,22 @@ public:
     // (fields: id/label/group/type/min/max/step/default/choices). Empty string if no plugin is loaded.
     juce::String enumerateCatalog() const;
 
-    // Start / stop the ControlListener pointed at the hosted processor. Off until startControl is called, so
-    // loading a plugin opens no socket by itself.
-    juce::String startControl (int port = ControlListener::kDefaultPort);
+    // Start / stop the ControlServer pointed at the hosted processor (through a JucePluginBridge). Off until
+    // startControl is called, so loading a plugin opens no socket by itself.
+    juce::String startControl (int port = ControlServer::kDefaultPort);
     void stopControl();
 
-    ControlListener::Status controlStatus() const noexcept
+    ControlServer::Status controlStatus() const noexcept
     {
-        return control != nullptr ? control->getStatus() : ControlListener::Status::Idle;
+        return control != nullptr ? control->getStatus() : ControlServer::Status::Idle;
     }
 
 private:
     juce::AudioPluginFormatManager formatManager;
     juce::MidiKeyboardState        keyboardState;
     std::unique_ptr<juce::AudioPluginInstance> plugin;
-    std::unique_ptr<ControlListener>           control;
+    std::unique_ptr<JucePluginBridge>          bridge;    // must outlive control (control holds bridge&)
+    std::unique_ptr<ControlServer>             control;
 
     double preparedRate = 48000.0;
     int    preparedBlock = 512;

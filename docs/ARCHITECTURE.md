@@ -43,8 +43,9 @@ The decision is "two binaries vs one," not "clean audio vs compromised."
 ## Component map
 
 Four components sit between the agent and the plugin. The C++ host is a separate process; the Go server is a
-separate process; they meet on one localhost socket. The two seam interfaces (`ControlListener` on the C++ side,
-`ParamCatalog` + `LiveEndpoint` on the Go side) are what keep the design generic.
+separate process; they meet on one localhost socket. Three seam interfaces keep the design generic: on the C++
+side `PluginBridge` (what the control plane can drive) with `ControlServer` as the plane above it; on the Go side
+`ParamCatalog` + `LiveEndpoint`.
 
 ```
   ┌──────────────────────────── C++ host process (sidechain-host) ────────────────────────────┐
@@ -52,11 +53,12 @@ separate process; they meet on one localhost socket. The two seam interfaces (`C
   │  main.cpp ──▶ sidechain::Host                                                              │
   │                 • load()            AudioPluginFormatManager: VST3 path / AU by identifier │
   │                 • enumerateCatalog() walks getParameters() -> catalog JSON (to a file)     │
-  │                 • startControl()     constructs the listener on 127.0.0.1:<port>           │
+  │                 • startControl()     JucePluginBridge + ControlServer on 127.0.0.1:<port>  │
   │                                                                                            │
-  │               sidechain::ControlListener  (a juce::Thread + juce::AsyncUpdater)            │
-  │                 socket thread     parse a line, snapshot reads, enqueue mutations          │
-  │                 SPSC ring (256) ──▶ message thread  setValueNotifyingHost / state / MIDI   │
+  │               sidechain::ControlServer  (a juce::Thread + juce::AsyncUpdater)              │
+  │                 many socket threads   parse a line, snapshot reads, enqueue mutations      │
+  │                 MPSC queue ──▶ message thread  bridge.applyParam / state / MIDI            │
+  │                 sidechain::JucePluginBridge   the plugin-specific half (params/state/MIDI) │
   └────────────────────────────────────────────┬───────────────────────────────────────────┘
                                                 │  localhost TCP, line-delimited JSON
   ┌─────────────────────────────────────────────┴──────────────── Go server process (sidechain) ┐
@@ -73,8 +75,8 @@ separate process; they meet on one localhost socket. The two seam interfaces (`C
 
 ### The C++ host (`sidechain::Host`, `cpp/Host.h` / `cpp/Host.cpp`)
 
-A headless child-plugin host. It loads one plugin, enumerates its catalog, and points a `ControlListener` at
-the hosted processor. `main.cpp` is a thin CLI that drives it and pumps a JUCE message loop.
+A headless child-plugin host. It loads one plugin, enumerates its catalog, and points a `ControlServer` (through
+a `JucePluginBridge`) at the hosted processor. `main.cpp` is a thin CLI that drives it and pumps a JUCE message loop.
 
 - **Loader.** `Host::load` registers the platform formats (`addDefaultFormats`: VST3 everywhere, AudioUnit on
   macOS), asks each format to describe the binary via a `KnownPluginList` scan, and instantiates the first
@@ -106,39 +108,48 @@ the hosted processor. `main.cpp` is a thin CLI that drives it and pumps a JUCE m
   hosted continuous param has no such scalar, so it reports `0..1` and `hasRealRange: false`. A discrete param
   (choice/int/bool) reports its index range `0..(steps-1)` on either path (skew is a continuous-value concern).
 
-### The `ControlListener` (`cpp/ControlListener.h`)
+### The control-plane seam: `ControlServer` + `PluginBridge` (`cpp/ControlServer.h`, `cpp/PluginBridge.h`, `cpp/JucePluginBridge.h`)
 
-A single-header, in-process live-control listener for any `juce::AudioProcessor`. It has no dependency on any
-concrete processor type: it takes a `juce::AudioProcessor&`, a `juce::MidiKeyboardState&`, and a port, so it is
-a drop-in for a hosted child plugin or for an embedded native plugin alike.
+The live-control substrate is split at an interface so the transport/protocol/identity/event machinery is
+reusable beyond a JUCE plugin. `ControlServer` is the **VST-agnostic control plane**: it owns the socket
+listener, the wire protocol, controller identity, the command queue, change-event broadcast, and the conflict
+tier, and it depends only on `juce_core` + `juce_events` (no `juce_audio_processors`). It drives a plugin only
+through a `PluginBridge`. `JucePluginBridge` is the **plugin-specific half**: the one class that touches
+`juce::AudioProcessor` (parameter maps, real<->normalized curves, opaque state, MIDI, the parameter-change
+listener). To expose anything else over the same protocol, implement another `PluginBridge`.
 
-- **Thread model (the load-bearing safety rule).** The socket runs on its own background thread (a
-  `juce::Thread`). That thread never touches parameter or DSP state directly (that would race `processBlock`).
-  It only: parses a line of JSON; for **reads**, snapshots the parameter's atomic value and replies directly
-  (reads are safe from any thread); for **mutations**, resolves the target, pushes a `Command` into a lock-free
-  SPSC queue, fires an `AsyncUpdate`, and waits (bounded) for the message thread to apply it before acking. The
-  message thread drains the queue (`handleAsyncUpdate`) and applies each command via `setValueNotifyingHost`,
-  `keyboardState`, or the state calls: exactly the on-screen-keyboard / GUI-edit path, so the editor and the host
-  see the change and it serializes normally.
-- **The SPSC command queue.** A `juce::AbstractFifo` over a fixed 256-deep ring of `Command` structs. The socket
-  thread is the sole producer, the message thread the sole consumer, so no lock is needed. If the ring is full
-  the command is dropped (a human or agent issues commands far slower than a ~20 ms drain, so a drop only means
-  one command did not land, never a crash or a race). A parallel `wantAck` bit array carries whether each command
-  should signal the `appliedEvent` the socket thread is blocked on.
-- **Bounded apply-then-ack.** For a `set_param`, the socket thread resets `appliedEvent`, enqueues, then waits
-  up to 250 ms; the ack therefore means "applied," giving the agent clean request/response semantics (the value
-  is live before the reply lands). `reset_init` waits 500 ms and state verbs wait 2 s (a full-state restore is
-  heavier).
-- **One client at a time, EOF handling.** The listener binds `127.0.0.1` only and serves one connection at a
-  time. The read loop waits for readability first, then reads: when the socket is ready but `read` returns 0 the
-  peer has closed (EOF), so it returns and lets the accept loop take the next client. (An earlier version treated
-  a 0-byte read as "keep waiting," which spun on EOF and stalled the next client's handshake.)
-- **Value semantics.** `valueForCatalog` maps a normalized 0..1 back to the catalog `value`: for a continuous
-  native (ranged) param, the real value via the plugin's own skew-aware curve; for a discrete param, the index
-  `0..(steps-1)`; for a hosted continuous param, the normalized value itself.
-- **The single host hook.** `onResetInit` is a nullable `std::function<void()>` run on the message-thread drain
-  for the `reset_init` command. Null means the command is a no-op ack. It is the one host-specific extension
-  point, kept as a callback so the header stays free of any concrete processor dependency.
+- **Thread model (the load-bearing safety rule).** The accept loop runs on a `juce::Thread`; each connected
+  controller gets its own handler thread. A handler never touches parameter or DSP state directly (that would
+  race `processBlock`). It only: parses a line of JSON; for **reads**, asks the bridge (safe from any thread,
+  parameter atomics) and replies directly; for **mutations**, resolves the target through the bridge, pushes a
+  `Command` into a mutex-guarded MPSC queue, fires an `AsyncUpdate`, and waits (bounded) on its own per-request
+  `Completion` for the message thread to apply it before acking. The message thread drains the queue
+  (`handleAsyncUpdate`) and applies each command via `bridge.applyParam` / note verbs / state calls: exactly the
+  on-screen-keyboard / GUI-edit path, so the editor and the host see the change and it serializes normally.
+- **The MPSC command queue.** Many socket handlers produce; the single message thread consumes. A short
+  control-plane mutex guards a `std::deque<Command>` (bounded at 4096); the message thread is the sole applier,
+  so every mutation serializes there. This is the conflict tier: **last-writer-wins in message-thread order**, and
+  where a governed-convergence engine (gsm) can slot in at C3. See [CONCURRENCY.md](CONCURRENCY.md).
+- **Per-request completion, bounded apply-then-ack.** Each blocking command carries a heap-allocated `Completion`
+  (a `WaitableEvent` plus result slots), shared between the requesting handler and the message thread so a bounded
+  timeout can never free it under a late apply. `set_param` waits up to 250 ms, `reset_init` 500 ms, state verbs
+  2 s; the ack therefore means "applied," giving the agent clean request/response semantics.
+- **Many controllers, identity, EOF handling.** The server binds `127.0.0.1` only and serves many connections at
+  once; each is assigned a `clientID` at the ping handshake. A handler's read loop waits for readability first,
+  then reads: a ready socket that returns 0 bytes is EOF, so the handler returns and the connection is removed
+  cleanly without stalling others (invariant 7). Each connection has a single-writer `Outbound` queue so replies
+  and broadcast events never race on one socket.
+- **Change events (C2).** `JucePluginBridge` registers as a `juce::AudioProcessorParameter::Listener` and calls
+  `ControlServer::onParamChanged(index)` on any change (a controller, the plugin's editor, host automation). The
+  server broadcasts a `param_changed` event to every connection: directly when the change is on the message thread
+  (attributed to the applying controller via `by`), or deferred through an atomic dirty flag + `triggerAsyncUpdate`
+  when it fires off-thread, keeping the audio path lock-free.
+- **Value semantics (in the bridge).** `JucePluginBridge` maps a normalized 0..1 to the catalog `value`: for a
+  continuous native (ranged) param, the real value via the plugin's own skew-aware curve; for a discrete param,
+  the index `0..(steps-1)`; for a hosted continuous param, the normalized value itself. The set forms
+  (`normalized` / `choice` / `value`) invert through the same curve in `resolveSet`.
+- **The single host hook.** `JucePluginBridge::onResetInit` is a nullable `std::function<void()>` run on the
+  message-thread drain for `reset_init`. Null means a no-op ack. It is the one host-specific extension point.
 
 ### The Go server (`server.go`, `paramtools.go`, `live.go`, `catalog.go`)
 
@@ -156,18 +167,22 @@ a drop-in for a hosted child plugin or for an embedded native plugin alike.
   view.
 - **GCF.** The big read tool (`list_params`) encodes its model-facing payload as GCF (see below).
 
-### The two seam interfaces
+### The seam interfaces
 
-**C++ side, `sidechain::ControlListener`.** Point it at any `juce::AudioProcessor` (your own plugin, or a hosted
-child plugin's processor) plus a `juce::MidiKeyboardState` and a port:
+**C++ side, `sidechain::ControlServer` over a `sidechain::PluginBridge`.** The server is the VST-agnostic plane;
+the bridge is what it drives. For a JUCE plugin, hand a `JucePluginBridge` (built from any `juce::AudioProcessor`
+plus a `juce::MidiKeyboardState`) to a `ControlServer` with a port:
 
 ```cpp
-sidechain::ControlListener listener (targetProcessor, keyboardState, /*port*/ 51703);
-listener.onResetInit = []{ /* optional host-supplied init/default recall */ };
+sidechain::JucePluginBridge bridge (targetProcessor, keyboardState);
+bridge.onResetInit = []{ /* optional host-supplied init/default recall */ };
+sidechain::ControlServer server (bridge, /*port*/ 51703);   // bridge must outlive server
 ```
 
-The listener walks `getParameters()` for the id catalog, snapshots atomic values for reads, and routes every
-mutation through the message thread via the SPSC queue. No concrete processor type crosses this boundary.
+The bridge walks `getParameters()` for the id catalog, snapshots atomic values for reads, resolves set targets
+through the plugin's own curve, and applies every mutation on the message thread; the server owns the socket,
+protocol, identity, queue, and events. No concrete processor type crosses into `ControlServer`. To control
+something other than a JUCE plugin, implement `PluginBridge` and reuse the whole plane unchanged.
 
 **Go side, `ParamCatalog` + `LiveEndpoint`.**
 
@@ -374,7 +389,7 @@ The Go layer is tested at four levels; the C++ host is exercised only through th
   `server_test.go`). The power fit is unit-tested only (`TestSetRealPowerAnalytic` with a synthetic
   `32*norm^6.5` s curve): a survey of the plugins on hand found none whose clean power-law params carry a real
   unit, so there is no real-plugin power-fit E2E.
-- **The in-process fake host (`live_test.go`).** A goroutine speaks the `ControlListener` line-JSON protocol
+- **The in-process fake host (`live_test.go`).** A goroutine speaks the `ControlServer` line-JSON protocol
   against an in-memory param map, with rendered value text that mimics real plugins (linear Hz, log Hz, a
   zero-crossing power time knob, a sigmoid that fits no model, an on/off toggle, a discrete-as-float filter type,
   a bare-number unitless param). It drives the whole session live path (connect, set/get, real-unit, discrete,
@@ -436,8 +451,11 @@ prose). The remaining `SIDECHAIN_*` variables are test gates, not runtime config
   redistributed, which would break the "build from source, standard APIs only" guarantee). A VST2-only instrument
   is reachable by wrapping it into a VST3 with an external adapter; the bridge never sees VST2, and wrapper
   fidelity varies.
-- **One client at a time.** The `ControlListener` serves a single connection; a second connect blocks until the
-  first disconnects. The gated E2E tests disconnect explicitly for this reason.
+- **Multiple controllers, one instance.** The `ControlServer` serves many connections at once (concurrency
+  C1/C2): each gets a `clientID`, drives the plugin independently, and receives `param_changed` events for others'
+  changes. The gated E2E tests still disconnect explicitly (a leaked connection holds a handler thread and muddies
+  identity/attribution assertions). "Concurrency" here means many controllers of one instance, not many hosts; see
+  [CONCURRENCY.md](CONCURRENCY.md).
 - **The power fit is unit-tested only.** No surveyed real plugin exposes a clean power-law param the real-unit set
   path can drive (see the note by `fitPower` and `TestScanPowerFits`).
 - **No reverse-engineering, no redistribution.** Hosting a plugin is what DAWs do; the user supplies their own

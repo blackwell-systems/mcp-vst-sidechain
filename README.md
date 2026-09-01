@@ -39,8 +39,9 @@ Two layers, two languages, chosen for what each does best:
   agent  <--stdio MCP-->  Sidechain server (Go)  <--localhost TCP-->  host (C++/JUCE)  --hosts-->  VST3/AU
 ```
 
-- **C++ / JUCE host** wraps one plugin via `AudioPluginFormatManager` and runs a `ControlListener` pointed at
-  the hosted processor. JUCE is the mature, industry-standard plugin-hosting stack with real macOS AU support.
+- **C++ / JUCE host** wraps one plugin via `AudioPluginFormatManager` and runs a `ControlServer` (the
+  VST-agnostic control plane) pointed at the hosted processor through a `PluginBridge`. JUCE is the mature,
+  industry-standard plugin-hosting stack with real macOS AU support.
 - **Go MCP server** speaks stdio JSON-RPC to the agent and forwards control over a localhost socket. It uses
   the official MCP go-sdk, ships as a single binary, and GCF-encodes large payloads via `gcf-go`.
 
@@ -139,9 +140,11 @@ sidechain.RegisterParamTools(srv, myCatalog, func() sidechain.LiveEndpoint { ret
 // ...register your own tools on srv too; they compose on one server.
 ```
 
-The C++ `sidechain::ControlListener` is a single header: drop it into any JUCE plugin or app, construct it with
-a `juce::AudioProcessor&` + `juce::MidiKeyboardState&` + a port, and it exposes that processor over the same
-wire protocol.
+The C++ side is split at a seam: `sidechain::ControlServer` is the VST-agnostic control plane (transport,
+protocol, identity, change events, command queue), and it drives a plugin only through a `sidechain::PluginBridge`.
+`sidechain::JucePluginBridge` is the bundled bridge that hosts a `juce::AudioProcessor` (construct it with a
+`juce::AudioProcessor&` + `juce::MidiKeyboardState&`, hand it to a `ControlServer` with a port). Implement your
+own `PluginBridge` to expose anything else over the same wire protocol.
 
 ## License
 

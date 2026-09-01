@@ -47,7 +47,18 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
-- **Multi-controller host (concurrency C1).** The C++ `ControlListener` now serves MANY connections at once
+- **Control-plane seam: `ControlServer` over a `PluginBridge` (C++).** The single `ControlListener` header is
+  split into a VST-agnostic control plane and a plugin-specific bridge behind an abstract interface.
+  `cpp/ControlServer.h` owns the transport, wire protocol, controller identity, the MPSC command queue,
+  change-event broadcast, and the conflict tier, and depends only on `juce_core` + `juce_events` (no
+  `juce_audio_processors`): it drives a plugin solely through `cpp/PluginBridge.h`. `cpp/JucePluginBridge.h` is the
+  concrete bridge that hosts a real VST3/AU (the only class that touches `juce::AudioProcessor`: parameter maps,
+  real<->normalized curves, opaque state, MIDI, the parameter-change listener). This makes the whole
+  transport/protocol/identity/event substrate reusable for anything controllable, not just a JUCE plugin: to
+  expose something else over the same protocol, implement `PluginBridge` and reuse `ControlServer` unchanged. Pure
+  refactor, behavior-preserving: validated locally against Surge XT across the full gated suite plus the C1
+  (`TestMultiClientLive`) and C2 (`TestChangeNotifications`) concurrency tests. See `docs/ARCHITECTURE.md`.
+- **Multi-controller host (concurrency C1).** The C++ control server now serves MANY connections at once
   instead of one client at a time. Each connection runs on its own handler thread and gets a `clientID` at the
   ping handshake; commands flow through a mutex-guarded multi-producer queue drained by the single message thread
   (still the only applier of every mutation, so the audio path and correctness are unchanged); and each request

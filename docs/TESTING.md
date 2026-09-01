@@ -33,7 +33,7 @@ inversion), `sections.go` (label-prefix derivation), `gcf.go` (env gating, struc
 ### Layer 2: fake-host loopback (`live_test.go`)
 
 `fakeHost` is a goroutine that accepts one client and answers the exact line-delimited JSON the C++
-`ControlListener` speaks, backed by an in-memory value map. The session's live path (`connect_live`, `set_param`,
+`ControlServer` speaks, backed by an in-memory value map. The session's live path (`connect_live`, `set_param`,
 `get_param`, `describe_param`, `set_params`, note verbs, `save_state`/`load_state`, real-unit and discrete-by-label
 control) is driven against it over a real TCP socket. This is "same bytes on the wire" as the C++ host without
 needing a plugin. It renders different value-text shapes per fake param id (linear Hz, exponential, power,
