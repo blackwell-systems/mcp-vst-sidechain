@@ -42,10 +42,11 @@
 // protocol is multiplexed async (a reply carries the request `id`; an event carries an `event` field). Requests:
 //   ping · get_param{param} · set_param{param,(value|normalized|choice)} · note_on{chan,note,vel} ·
 //   note_off{chan,note} · all_notes_off · reset_init · load_state{state} · get_full_state · get_state ·
-//   govern{op,...} · get_governed.
+//   govern{op:(acquire_instance|release_instance|acquire_section{scope}|release_section{scope})} · get_governed.
 //   (load_state/get_full_state carry `state`: base64 of the plugin's own opaque state bytes, handled by the bridge.
-//    govern applies a command to the C3 governed coordination state on the single applier and pushes a
-//    `governed_changed` event; see GovernedState.h and docs/CONCURRENCY.md.)
+//    govern applies a command to the C3 governed coordination state (hierarchical edit leases + patch generation)
+//    on the single applier and pushes a `governed_changed` event; a whole-patch change bumps the generation and a
+//    disconnect frees the departing controller's leases. See GovernedState.h and docs/CONCURRENCY.md.)
 // ================================================================================================
 
 namespace sidechain
@@ -173,6 +174,15 @@ private:
                 std::unique_ptr<juce::StreamingSocket> owned (raw);
                 serveClient (*owned, cid, *out);
                 removeClient (cid);
+                if (! threadShouldExit())
+                {
+                    // Free any leases the departing controller held (disconnect cleanup). Fire-and-forget onto the
+                    // message thread; skipped during teardown, where the drain is already stopping.
+                    Command gone; gone.kind = Kind::Govern;
+                    gone.gov = GovCmd { GovOp::ControllerGone, cid, 0 };
+                    gone.clientId = cid;
+                    enqueue (std::move (gone));
+                }
                 liveHandlers.fetch_sub (1);
             }).detach();
         }
@@ -388,14 +398,12 @@ private:
     juce::String handleGovern (const juce::var& req, const juce::var& id, int clientId)
     {
         const juce::String op = req.getProperty ("op", juce::var()).toString();
-        GovCmd g;
-        if      (op == "acquire_solo")     { g.op = GovOp::AcquireSolo; g.by = clientId; }
-        else if (op == "release_solo")     { g.op = GovOp::ReleaseSolo; g.by = clientId; }
-        else if (op == "set_voice_mode")   { g.op = GovOp::SetMode;   g.mode = parseMode (req.getProperty ("mode", "poly").toString()); }
-        else if (op == "set_voice_budget") { g.op = GovOp::SetBudget; g.n = (int) req.getProperty ("n", 1); }
-        else if (op == "set_panic")        { g.op = GovOp::SetPanic;  g.on = (bool) req.getProperty ("on", false); }
-        else if (op == "set_playing")      { g.op = GovOp::SetPlaying; g.on = (bool) req.getProperty ("on", false); }
-        else return errorReply ("unknown_op", id);
+        GovCmd g; g.by = clientId;   // a lease is acquired/released AS the calling controller
+        if      (op == "acquire_instance") g.op = GovOp::AcquireInstance;
+        else if (op == "release_instance") g.op = GovOp::ReleaseInstance;
+        else if (op == "acquire_section")  { g.op = GovOp::AcquireSection; g.scope = (int) req.getProperty ("scope", 0); }
+        else if (op == "release_section")  { g.op = GovOp::ReleaseSection; g.scope = (int) req.getProperty ("scope", 0); }
+        else return errorReply ("unknown_op", id);   // BumpGeneration / ControllerGone are internal, not wire-reachable
 
         Command c; c.kind = Kind::Govern; c.gov = g; c.clientId = clientId;
         auto done = submit (std::move (c), 250);
@@ -417,22 +425,6 @@ private:
         return okReply (id, [&] (juce::DynamicObject& o) { o.setProperty ("governed", govToVar (done->govState)); });
     }
 
-    static const char* modeStr (VoiceMode m) noexcept
-    {
-        switch (m)
-        {
-            case VoiceMode::Poly:   return "poly";
-            case VoiceMode::Mono:   return "mono";
-            case VoiceMode::Legato: return "legato";
-        }
-        return "poly";
-    }
-    static VoiceMode parseMode (const juce::String& m) noexcept
-    {
-        if (m == "mono")   return VoiceMode::Mono;
-        if (m == "legato") return VoiceMode::Legato;
-        return VoiceMode::Poly;
-    }
     static const char* resStr (Resolution r) noexcept
     {
         switch (r)
@@ -445,12 +437,13 @@ private:
     }
     static juce::var govToVar (const GovState& g)
     {
+        juce::Array<juce::var> sections;
+        for (int i = 0; i < kScopeCount; ++i)
+            sections.add (g.sectionLease[i]);
         auto* o = new juce::DynamicObject();
-        o->setProperty ("solo_lease",   g.soloLease);
-        o->setProperty ("mode",         juce::String (modeStr (g.mode)));
-        o->setProperty ("voice_budget", g.voiceBudget);
-        o->setProperty ("panic",        g.panicLatch);
-        o->setProperty ("playing",      g.playing);
+        o->setProperty ("instance_lease", g.soloInstanceLease);
+        o->setProperty ("section_leases", sections);
+        o->setProperty ("generation",     g.generation);
         return juce::var (o);
     }
 
@@ -553,12 +546,21 @@ private:
             case Kind::NoteOn:      bridge.noteOn  (c.a, c.b, c.f); break;
             case Kind::NoteOff:     bridge.noteOff (c.a, c.b, c.f); break;
             case Kind::AllNotesOff: bridge.allNotesOff(); break;
-            case Kind::ResetInit:   bridge.resetInit();   break;
+            case Kind::ResetInit:
+                bridge.resetInit();
+                applyGoverned (GovCmd { GovOp::BumpGeneration, c.clientId, 0 }, c.clientId);   // whole patch changed
+                break;
             case Kind::LoadState:
-                applyingClientId.store (c.clientId);
-                if (bridge.loadState (c.payload) && c.done)
-                    c.done->loadOk = true;
-                applyingClientId.store (0);
+                {
+                    applyingClientId.store (c.clientId);
+                    const bool okLoad = bridge.loadState (c.payload);
+                    applyingClientId.store (0);
+                    if (okLoad)
+                    {
+                        if (c.done) c.done->loadOk = true;
+                        applyGoverned (GovCmd { GovOp::BumpGeneration, c.clientId, 0 }, c.clientId);   // whole patch changed
+                    }
+                }
                 break;
             case Kind::GetFullState:
                 if (c.done)
@@ -566,20 +568,14 @@ private:
                 break;
             case Kind::Govern:
                 {
-                    // The conflict tier, on the single applier thread: fold the command into the governed state and
-                    // report how it resolved. LWW still governs the continuous params (bridge.applyParam); this
-                    // governs only the small invariant-bearing coordination state.
-                    Resolution res;
-                    const GovState next = governed.apply (c.gov, res);
-                    const bool changed = ! (next == governed);
-                    governed = next;
+                    // The conflict tier, on the single applier thread. LWW still governs the continuous params
+                    // (bridge.applyParam); this governs only the small invariant-bearing coordination state.
+                    const Resolution res = applyGoverned (c.gov, c.clientId);
                     if (c.done)
                     {
                         c.done->govRes   = res;
-                        c.done->govState = next;
+                        c.done->govState = governed;
                     }
-                    if (changed)
-                        broadcastGovernedChanged (c.clientId, res);   // cross-controller visibility (C2 parity)
                 }
                 break;
             case Kind::GetGoverned:
@@ -590,6 +586,21 @@ private:
                 }
                 break;
         }
+    }
+
+    // Fold a governed command into the coordination state on the message thread and broadcast the change (C2
+    // parity). Returns how the conflict tier resolved it. Used by the Govern command, and internally to bump the
+    // patch generation on a whole-patch change and to release a departing controller's leases.
+    Resolution applyGoverned (const GovCmd& g, int by)
+    {
+        Resolution res;
+        const GovState next = governed.apply (g, res);
+        if (! (next == governed))
+        {
+            governed = next;
+            broadcastGovernedChanged (by, res);
+        }
+        return res;
     }
 
     // -------- JSON reply helpers ----------------------------------------------------------------

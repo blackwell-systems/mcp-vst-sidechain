@@ -61,39 +61,67 @@ func TestGovRepairIdempotent(t *testing.T) {
 	}
 }
 
-// TestGovLeaseIsExclusive is a targeted check on the REJECT policy: once a controller holds the solo lease,
-// another controller's acquire is rejected and the holder is unchanged; the holder can still release it.
-func TestGovLeaseIsExclusive(t *testing.T) {
+// TestGovInstanceLeaseIsExclusive is a targeted check on the REJECT policy: once a controller holds the whole
+// instance, another controller's acquire is rejected and the holder is unchanged; the holder can release it.
+func TestGovInstanceLeaseIsExclusive(t *testing.T) {
 	s := initialGovState()
 
-	s, r := s.apply(govCmd{kind: cmdAcquireSolo, by: 1})
-	if r != resApplied || s.soloLease != 1 {
-		t.Fatalf("controller 1 should take the lease: state=%+v res=%v", s, r)
+	s, r := s.apply(govCmd{kind: cmdAcquireInstance, by: 1})
+	if r != resApplied || s.instanceLease != 1 {
+		t.Fatalf("controller 1 should take the instance lease: state=%+v res=%v", s, r)
 	}
 
-	s2, r2 := s.apply(govCmd{kind: cmdAcquireSolo, by: 2})
-	if r2 != resRejected || s2.soloLease != 1 {
+	s2, r2 := s.apply(govCmd{kind: cmdAcquireInstance, by: 2})
+	if r2 != resRejected || s2.instanceLease != 1 {
 		t.Fatalf("controller 2's acquire should be rejected with the holder unchanged: state=%+v res=%v", s2, r2)
 	}
 
-	s3, r3 := s.apply(govCmd{kind: cmdReleaseSolo, by: 1})
-	if r3 != resApplied || s3.soloLease != 0 {
-		t.Fatalf("controller 1 should release the lease: state=%+v res=%v", s3, r3)
+	s3, r3 := s.apply(govCmd{kind: cmdReleaseInstance, by: 1})
+	if r3 != resApplied || s3.instanceLease != 0 {
+		t.Fatalf("controller 1 should release the instance lease: state=%+v res=%v", s3, r3)
 	}
 }
 
-// TestGovModeCompensates is a targeted check on the COMPENSATE policy: switching to a single-voice mode while the
-// budget is >1 is not rejected - it is compensated, landing legal with the budget clamped to 1.
-func TestGovModeCompensates(t *testing.T) {
+// TestGovSectionGuardedByInstance checks the hierarchy reject guard: a controller cannot take a section of an
+// instance another controller holds, but the instance holder can take its own sections.
+func TestGovSectionGuardedByInstance(t *testing.T) {
 	s := initialGovState()
+	s, _ = s.apply(govCmd{kind: cmdAcquireInstance, by: 1})
 
-	s, _ = s.apply(govCmd{kind: cmdSetBudget, n: 4})
-	if s.voiceBudget != 4 {
-		t.Fatalf("budget should be 4 in poly mode, got %+v", s)
+	s2, r := s.apply(govCmd{kind: cmdAcquireSection, by: 2, scope: 0})
+	if r != resRejected || s2.sectionLease[0] != 0 {
+		t.Fatalf("controller 2 should not take a section of controller 1's instance: state=%+v res=%v", s2, r)
 	}
 
-	s2, r := s.apply(govCmd{kind: cmdSetMode, mode: modeMono})
-	if r != resCompensated || s2.mode != modeMono || s2.voiceBudget != 1 || !s2.ok() {
-		t.Fatalf("switching to mono should compensate the budget to 1: state=%+v res=%v", s2, r)
+	s3, r3 := s.apply(govCmd{kind: cmdAcquireSection, by: 1, scope: 0})
+	if r3 != resApplied || s3.sectionLease[0] != 1 {
+		t.Fatalf("the instance holder should take its own section: state=%+v res=%v", s3, r3)
+	}
+}
+
+// TestGovAcquireInstanceCompensates is a targeted check on the COMPENSATE policy: with the instance free and two
+// controllers holding different sections, taking the whole instance is not rejected - it is compensated, revoking
+// the other controller's section while keeping the acquirer's own.
+func TestGovAcquireInstanceCompensates(t *testing.T) {
+	s := initialGovState()
+	s, _ = s.apply(govCmd{kind: cmdAcquireSection, by: 1, scope: 0})
+	s, _ = s.apply(govCmd{kind: cmdAcquireSection, by: 2, scope: 1})
+
+	s2, r := s.apply(govCmd{kind: cmdAcquireInstance, by: 1})
+	if r != resCompensated || s2.instanceLease != 1 || s2.sectionLease[1] != 0 || s2.sectionLease[0] != 1 || !s2.ok() {
+		t.Fatalf("taking the instance should compensate by revoking controller 2's section: state=%+v res=%v", s2, r)
+	}
+}
+
+// TestGovDisconnectFreesLeases checks the cleanup transition: a departing controller's leases (instance and
+// sections) are all released.
+func TestGovDisconnectFreesLeases(t *testing.T) {
+	s := initialGovState()
+	s, _ = s.apply(govCmd{kind: cmdAcquireInstance, by: 1})
+	s, _ = s.apply(govCmd{kind: cmdAcquireSection, by: 1, scope: 2})
+
+	s2, r := s.apply(govCmd{kind: cmdControllerGone, by: 1})
+	if r != resApplied || s2.instanceLease != 0 || s2.sectionLease[2] != 0 {
+		t.Fatalf("controller 1 leaving should free its leases: state=%+v res=%v", s2, r)
 	}
 }

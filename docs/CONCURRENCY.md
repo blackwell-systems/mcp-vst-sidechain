@@ -138,16 +138,31 @@ engine before the real conflicts appear tends to model the wrong invariants. The
    that its declarative ergonomics and reusable verified engine pay for the dependency. At that point the move is
    porting a proven model into gsm, not guessing at one.
 
-**Status.** Steps 2 and 3 are built. The model lives in `governed.go` (the `reduce`/`ok`/`repair` shape plus the
-conflict tier `apply`) with its exhaustive-enumeration proof in `governed_test.go`, and a faithful C++ port
-(`cpp/GovernedState.h`) is **wired into `ControlServer`'s message-thread drain**: `govern` / `get_governed` wire
-commands flow through the same MPSC queue as `set_param`, `GovState::apply` runs on the single applier alongside
-the LWW param path, and a governed change is broadcast as a `governed_changed` event (C2 parity). Covered by the
-gated `TestGovernedLive` (lease acquired / rejected / mode compensated, observed cross-controller). The governed
-schema (an exclusive-edit lease, a voice-mode gate, a panic/playback latch) is **illustrative**: it exercises both
-policies and is meant to be replaced by the real coordination state once multi-controller use surfaces the actual
-conflicts. gsm (step 4) remains the future engine for when that schema outgrows the hand-rolled model. The
-continuous params are untouched by any of this: they stay last-writer-wins.
+**Status.** Steps 2 and 3 are built and wired, over a real coordination schema. The model lives in `governed.go`
+(the `reduce`/`ok`/`repair` shape plus the conflict tier `apply`) with its exhaustive-enumeration proof in
+`governed_test.go`, and a faithful C++ port (`cpp/GovernedState.h`) is **wired into `ControlServer`'s
+message-thread drain**: `govern` / `get_governed` wire commands flow through the same MPSC queue as `set_param`,
+`GovState::apply` runs on the single applier alongside the LWW param path, and a governed change is broadcast as a
+`governed_changed` event (C2 parity).
+
+The governed state models the genuine multi-controller coordination concerns (not the plugin's musical state):
+
+- **Hierarchical edit leases.** A controller takes the whole-instance edit lease or a per-section lease (a section
+  is an edit region a deployment maps to a param group). The invariant is hierarchical: if one controller holds
+  the whole instance, no other may hold a section of it. Taking the instance therefore revokes others' section
+  leases (**compensate**); taking a section of an instance held by another is refused (**reject** guard); taking
+  an instance already held by another is refused (**reject** guard). This is how concurrent editors avoid fighting
+  over the same knobs.
+- **Patch generation.** A monotone counter bumped whenever the whole patch changes (a `load_state` / `reset_init`,
+  wired in the drain), so an agent can detect that the base it was editing moved under it (optimistic concurrency).
+- **Disconnect cleanup.** When a controller disconnects (or crashes), `ControlServer` raises a `ControllerGone`
+  command that releases every lease it held. This is the invariant that makes leases safe: a dead agent cannot
+  hold an edit lease forever.
+
+Covered by the gated `TestGovernedLive` (hierarchical acquire / reject / compensate + generation bump on
+`load_state`, observed cross-controller) and `TestGovernedDisconnectFreesLease` (a holder disconnects, its lease
+frees, another acquires). gsm (step 4) remains the future engine for when this schema outgrows the hand-rolled
+model. The continuous params are untouched by any of this: they stay last-writer-wins.
 
 The reason this works without reaching for CRDTs or consensus: there is ONE host, ONE applier thread, and one
 copy of the state (invariant 2). C3 is not a distributed-convergence problem; it is keeping a small discrete

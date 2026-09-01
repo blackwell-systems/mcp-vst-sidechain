@@ -222,10 +222,11 @@ func TestChangeNotifications(t *testing.T) {
 }
 
 // TestGovernedLive exercises the C3 governed conflict tier wired into ControlServer's message-thread drain
-// (GovernedState.h). Two controllers drive the governed coordination state over the socket: controller A takes the
-// exclusive solo lease (applied); controller B's acquire is rejected while A holds it (the reject policy); A sets a
-// voice budget then switches to a single-voice mode, which is compensated (budget clamped to 1, not rejected); and
-// B observes the changes as pushed governed_changed events. Gated on the sweep env; skipped otherwise.
+// (GovernedState.h). Two controllers drive the hierarchical edit leases over the socket: A takes the whole-instance
+// lease (applied); B's acquire is rejected while A holds it, and B cannot take a section of A's instance (the
+// reject guards); after A releases, A and B take different sections, then A takes the whole instance, which is
+// compensated (B's section revoked, A's kept); a load_state bumps the patch generation and B observes it as a
+// pushed governed_changed event. Gated on the sweep env; skipped otherwise.
 func TestGovernedLive(t *testing.T) {
 	portStr := os.Getenv("SIDECHAIN_SWEEP_PORT")
 	if portStr == "" || os.Getenv("SIDECHAIN_SWEEP_CATALOG") == "" {
@@ -243,10 +244,24 @@ func TestGovernedLive(t *testing.T) {
 		}
 		return lc
 	}
-
 	governed := func(m map[string]any) map[string]any {
 		g, _ := m["governed"].(map[string]any)
 		return g
+	}
+	sectionLease := func(m map[string]any, i int) int {
+		secs, _ := governed(m)["section_leases"].([]any)
+		if i >= len(secs) {
+			return -1
+		}
+		return int(secs[i].(float64))
+	}
+	govern := func(lc *liveClient, req map[string]any) map[string]any {
+		req["cmd"] = "govern"
+		resp, err := lc.request(req)
+		if err != nil {
+			t.Fatalf("govern %v: %v", req, err)
+		}
+		return resp
 	}
 
 	a, b := dial(), dial()
@@ -256,38 +271,46 @@ func TestGovernedLive(t *testing.T) {
 		t.Fatalf("expected two distinct nonzero client ids, got A=%d B=%d", a.clientID, b.clientID)
 	}
 
-	// A takes the exclusive lease.
-	resp, err := a.request(map[string]any{"cmd": "govern", "op": "acquire_solo"})
-	if err != nil {
-		t.Fatalf("A acquire_solo: %v", err)
+	// A takes the whole instance; B's acquire is rejected while A holds it.
+	if resp := govern(a, map[string]any{"op": "acquire_instance"}); resp["resolution"] != "applied" ||
+		int(governed(resp)["instance_lease"].(float64)) != a.clientID {
+		t.Fatalf("A should hold the instance: %v", resp)
 	}
-	if resp["resolution"] != "applied" || int(governed(resp)["solo_lease"].(float64)) != a.clientID {
-		t.Fatalf("A should hold the lease: %v", resp)
+	if resp := govern(b, map[string]any{"op": "acquire_instance"}); resp["resolution"] != "rejected" {
+		t.Fatalf("B's instance acquire should be rejected: %v", resp)
 	}
-
-	// B's acquire is rejected; A stays the holder.
-	resp, err = b.request(map[string]any{"cmd": "govern", "op": "acquire_solo"})
-	if err != nil {
-		t.Fatalf("B acquire_solo: %v", err)
-	}
-	if resp["resolution"] != "rejected" || int(governed(resp)["solo_lease"].(float64)) != a.clientID {
-		t.Fatalf("B's acquire should be rejected with A still holding: %v", resp)
+	// B cannot take a section of an instance A holds (the hierarchy guard).
+	if resp := govern(b, map[string]any{"op": "acquire_section", "scope": 0}); resp["resolution"] != "rejected" {
+		t.Fatalf("B should not take a section of A's instance: %v", resp)
 	}
 
-	// A sets a budget of 4, then switches to mono: the mode change compensates the budget to 1 (not rejected).
-	if _, err := a.request(map[string]any{"cmd": "govern", "op": "set_voice_budget", "n": 4}); err != nil {
-		t.Fatalf("A set_voice_budget: %v", err)
+	// A releases; now A and B take different sections.
+	govern(a, map[string]any{"op": "release_instance"})
+	if resp := govern(a, map[string]any{"op": "acquire_section", "scope": 0}); resp["resolution"] != "applied" || sectionLease(resp, 0) != a.clientID {
+		t.Fatalf("A should take section 0: %v", resp)
 	}
-	resp, err = a.request(map[string]any{"cmd": "govern", "op": "set_voice_mode", "mode": "mono"})
-	if err != nil {
-		t.Fatalf("A set_voice_mode: %v", err)
-	}
-	g := governed(resp)
-	if resp["resolution"] != "compensated" || g["mode"] != "mono" || int(g["voice_budget"].(float64)) != 1 {
-		t.Fatalf("mono switch should compensate the budget to 1: %v", resp)
+	if resp := govern(b, map[string]any{"op": "acquire_section", "scope": 1}); resp["resolution"] != "applied" || sectionLease(resp, 1) != b.clientID {
+		t.Fatalf("B should take section 1: %v", resp)
 	}
 
-	// B, which issued no request since, must observe the change as a pushed governed_changed event.
+	// A now takes the whole instance: compensated (B's section 1 revoked, A's section 0 kept).
+	resp := govern(a, map[string]any{"op": "acquire_instance"})
+	if resp["resolution"] != "compensated" || int(governed(resp)["instance_lease"].(float64)) != a.clientID ||
+		sectionLease(resp, 1) != 0 || sectionLease(resp, 0) != a.clientID {
+		t.Fatalf("A taking the instance should compensate by revoking B's section: %v", resp)
+	}
+
+	// A load_state is a whole-patch change: the governed generation bumps and B observes it as an event.
+	before, _ := a.request(map[string]any{"cmd": "get_governed"})
+	gen0 := int(governed(before)["generation"].(float64))
+	blob, err := a.GetFullState()
+	if err != nil {
+		t.Fatalf("A get_full_state: %v", err)
+	}
+	if err := a.LoadState(blob); err != nil {
+		t.Fatalf("A load_state: %v", err)
+	}
+
 	deadline := time.After(3 * time.Second)
 	for {
 		select {
@@ -295,12 +318,63 @@ func TestGovernedLive(t *testing.T) {
 			if ev["event"] != "governed_changed" {
 				continue
 			}
-			if eg := governed(ev); eg["mode"] == "mono" && int(eg["voice_budget"].(float64)) == 1 {
-				t.Logf("governed OK: A(%d) holds lease, mono compensated budget->1, B(%d) saw governed_changed", a.clientID, b.clientID)
+			if gen := int(governed(ev)["generation"].(float64)); gen > gen0 {
+				t.Logf("governed OK: hierarchical leases (reject+compensate) + disconnect-safe, load_state bumped generation %d->%d, B(%d) saw governed_changed", gen0, gen, b.clientID)
 				return
 			}
 		case <-deadline:
-			t.Fatalf("B did not receive the governed_changed event for the mono switch within the window")
+			t.Fatalf("B did not receive the governed_changed generation bump within the window")
+		}
+	}
+}
+
+// TestGovernedDisconnectFreesLease checks the crash-safe cleanup wired into ControlServer: a controller that holds
+// the whole-instance lease and then disconnects has that lease released automatically, so another controller can
+// acquire it. Gated on the sweep env.
+func TestGovernedDisconnectFreesLease(t *testing.T) {
+	portStr := os.Getenv("SIDECHAIN_SWEEP_PORT")
+	if portStr == "" || os.Getenv("SIDECHAIN_SWEEP_CATALOG") == "" {
+		t.Skip("set SIDECHAIN_SWEEP_PORT + SIDECHAIN_SWEEP_CATALOG to run the governed-disconnect test")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("bad port: %v", err)
+	}
+	dial := func() *liveClient {
+		lc, err := dialLive("127.0.0.1", port)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		return lc
+	}
+	governed := func(m map[string]any) map[string]any {
+		g, _ := m["governed"].(map[string]any)
+		return g
+	}
+
+	a, b := dial(), dial()
+	defer b.Close()
+
+	// A takes the whole instance, then disconnects. The server must release A's lease.
+	if resp, err := a.request(map[string]any{"cmd": "govern", "op": "acquire_instance"}); err != nil ||
+		int(governed(resp)["instance_lease"].(float64)) != a.clientID {
+		t.Fatalf("A should hold the instance before disconnect: %v (err %v)", resp, err)
+	}
+	a.Close()
+
+	// B may now acquire the instance. The cleanup is async on the server's message thread, so poll briefly.
+	deadline := time.After(3 * time.Second)
+	for {
+		resp, err := b.request(map[string]any{"cmd": "govern", "op": "acquire_instance"})
+		if err == nil && resp["resolution"] == "applied" && int(governed(resp)["instance_lease"].(float64)) == b.clientID {
+			t.Logf("governed disconnect OK: A(%d)'s instance lease was freed on disconnect, B(%d) acquired it", a.clientID, b.clientID)
+			return
+		}
+		// Not yet freed: release B's (rejected/no-op) attempt state is unchanged; retry until the cleanup lands.
+		select {
+		case <-deadline:
+			t.Fatalf("A's lease was not freed on disconnect within the window (last resp %v)", resp)
+		case <-time.After(50 * time.Millisecond):
 		}
 	}
 }

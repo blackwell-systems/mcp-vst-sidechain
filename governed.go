@@ -1,137 +1,139 @@
-// governed.go - C3 governed-state model (STUB; NOT yet wired into the live control path).
+// governed.go - the C3 governed coordination state and its conflict tier.
 //
-// This is the scaffolding described in docs/CONCURRENCY.md ("C3 sequencing"): the small, discrete,
-// invariant-bearing COORDINATION state a future conflict tier would govern, kept deliberately separate from the
-// plugin's continuous parameters. Those stay last-writer-wins: they carry no cross-parameter invariants and could
-// not be enumerated anyway. Every field here is an enum, a bool, or a bounded int, so the reachable state space is
-// finite and governed_test.go can verify it EXHAUSTIVELY - reproducing gsm's build-time guarantee ("no reachable
-// state violates an invariant") with an ordinary Go test, no external engine.
+// This is the small, discrete, invariant-bearing state that multiple controllers of ONE plugin instance must
+// agree on, kept deliberately separate from the plugin's continuous parameters (those stay last-writer-wins: they
+// carry no cross-parameter invariants and could not be enumerated). It models the REAL coordination concerns of
+// multi-agent control, not the plugin's musical state:
 //
-// The three pieces from the note, plus the conflict tier that uses them:
+//   - Hierarchical edit leases. A controller can take the whole-instance edit lease, or a per-section lease. The
+//     invariant is hierarchical: if one controller holds the whole instance, no OTHER controller may hold a
+//     section of it. Taking the instance therefore revokes others' section leases (the compensate path); trying
+//     to take a section of an instance held by another is refused (a reject guard). This is how concurrent editors
+//     avoid fighting over the same knobs.
+//   - Patch generation. A monotone counter bumped whenever the whole patch changes (a load_state / reset_init).
+//     An agent reads it to detect that the base it was editing moved under it (optimistic concurrency).
+//   - Disconnect cleanup. When a controller disconnects (or crashes), every lease it held is released. Without
+//     this a dead agent would hold an edit lease forever; it is the invariant that makes leases safe.
+//
+// Every field is a bounded int or a fixed-size array of them, so the reachable state space is finite and
+// governed_test.go verifies it EXHAUSTIVELY - reproducing gsm's build-time "no reachable state violates an
+// invariant" guarantee as an ordinary Go test. cpp/GovernedState.h is a faithful port wired into ControlServer's
+// message-thread drain; the two must stay in lockstep so this proof continues to cover the shipped code.
+//
+// The three pieces from docs/CONCURRENCY.md, plus the conflict tier that uses them:
 //   reduce(state, cmd) -> the raw next state (pure, total; the result MAY be illegal)
 //   ok(state)          -> the invariant predicate every reachable state must satisfy
-//   repair(state)      -> a deterministic, TOTAL map into the nearest legal state (the "compensation")
-//   apply(state, cmd)  -> the conflict tier, run on the single applier thread: commit the next state as
-//                         resApplied (already legal), resCompensated (repaired), or resRejected (a transition
-//                         guard refused it; state unchanged).
-//
-// The governed state modeled here is illustrative (an exclusive-edit lease, a voice-mode gate, a panic/playback
-// latch): enough to exercise both a reject policy and a compensate policy. It is not the final coordination
-// schema; it exists so the model and its verification are in place BEFORE the first real multi-controller
-// conflict, per the sequencing decision. Nothing here is referenced by the control server yet.
+//   repair(state)      -> a deterministic, TOTAL map into the nearest legal state (the compensation)
+//   apply(state, cmd)  -> the conflict tier, run on the single applier thread: resApplied (already legal),
+//                         resCompensated (repaired), or resRejected (a transition guard refused it; state unchanged).
 
 package sidechain
 
-// voiceMode is a small enum domain. A single-voice mode (mono/legato) constrains the voice budget (see ok).
-type voiceMode uint8
-
 const (
-	modePoly voiceMode = iota
-	modeMono
-	modeLegato
+	maxControllers = 2 // a fixed, small controller set so the lease fields are finite and enumerable
+	scopeCount     = 3 // number of section scopes (an edit region; a deployment maps these to plugin param groups)
+	minGeneration  = 0
+	maxGeneration  = 2 // patch generation saturates here so the space stays finite (monotonicity still holds)
 )
 
-const (
-	maxControllers = 2 // a fixed, small controller set so the lease field is finite and enumerable
-	minVoiceBudget = 1
-	maxVoiceBudget = 4
-)
-
-// govState is the governed coordination state. Enums / bools / bounded ints ONLY, so the space is finite.
+// govState is the governed coordination state. Bounded ints / fixed arrays ONLY, so the space is finite. A lease
+// field holds the controller id of the holder, or 0 for free.
 type govState struct {
-	soloLease   int       // controller id holding the exclusive-edit lease; 0 = none
-	mode        voiceMode // voice mode
-	voiceBudget int       // active-voice budget, minVoiceBudget..maxVoiceBudget
-	panicLatch  bool      // global panic latch
-	playing     bool      // transport is playing
+	instanceLease int             // controller holding the whole-instance edit lease; 0 = free
+	sectionLease  [scopeCount]int // controller holding each section's edit lease; 0 = free
+	generation    int             // patch generation, minGeneration..maxGeneration (bumped on a whole-patch change)
 }
 
-// initialGovState is the default legal starting point.
-func initialGovState() govState {
-	return govState{soloLease: 0, mode: modePoly, voiceBudget: 1, panicLatch: false, playing: false}
-}
+// initialGovState is the default legal starting point (nothing leased, generation zero).
+func initialGovState() govState { return govState{} }
 
-// ok is the invariant predicate: every reachable state must satisfy it. Note soloLease is NOT range-checked: it
-// holds an arbitrary controller id (0 = free), and its numeric value is not an invariant - lease exclusivity is a
-// transition guard in apply, not a state predicate. (allGovStates/allGovCommands bound the controller set only to
-// keep the enumeration finite; the real server assigns unbounded clientIds.)
+// ok is the invariant predicate: every reachable state must satisfy it. A lease holder id is NOT range-checked -
+// it is an arbitrary controller id whose magnitude is not an invariant; exclusivity is enforced by the guards and
+// the hierarchy check below, not by bounding the id (the real server assigns unbounded clientIds).
 func (s govState) ok() bool {
-	if s.voiceBudget < minVoiceBudget || s.voiceBudget > maxVoiceBudget {
+	if s.generation < minGeneration || s.generation > maxGeneration {
 		return false
 	}
-	if s.mode != modePoly && s.voiceBudget != 1 {
-		return false // a single-voice mode (mono/legato) must carry a budget of exactly one
-	}
-	if s.panicLatch && s.playing {
-		return false // the panic latch and active playback are mutually exclusive
+	for i := 0; i < scopeCount; i++ {
+		// Hierarchy: if the whole instance is held, no OTHER controller may hold a section of it.
+		if s.instanceLease != 0 && s.sectionLease[i] != 0 && s.sectionLease[i] != s.instanceLease {
+			return false
+		}
 	}
 	return true
 }
 
 // repair maps any state (including an illegal one) deterministically into the nearest legal state. It must be
-// TOTAL (ok(repair(s)) holds for every s) and idempotent; governed_test.go asserts both. This is the compensation
-// the conflict tier commits when a command would otherwise leave an invariant violated.
+// TOTAL (ok(repair(s)) for every s) and idempotent; governed_test.go asserts both. This is the compensation the
+// conflict tier commits: taking the whole instance revokes any section held by another controller.
 func (s govState) repair() govState {
-	if s.voiceBudget < minVoiceBudget {
-		s.voiceBudget = minVoiceBudget
+	if s.generation < minGeneration {
+		s.generation = minGeneration
 	}
-	if s.voiceBudget > maxVoiceBudget {
-		s.voiceBudget = maxVoiceBudget
+	if s.generation > maxGeneration {
+		s.generation = maxGeneration
 	}
-	if s.mode != modePoly {
-		s.voiceBudget = 1 // compensate: a single-voice mode clamps the budget
-	}
-	if s.panicLatch {
-		s.playing = false // compensate: panic dominates playback
+	if s.instanceLease != 0 {
+		for i := 0; i < scopeCount; i++ {
+			if s.sectionLease[i] != 0 && s.sectionLease[i] != s.instanceLease {
+				s.sectionLease[i] = 0
+			}
+		}
 	}
 	return s
 }
 
-// cmdKind enumerates the governed commands.
+// cmdKind enumerates the governed commands. AcquireInstance/ReleaseInstance/AcquireSection/ReleaseSection are the
+// controller-facing lease ops; BumpGeneration and ControllerGone are raised internally by the server (on a
+// whole-patch change and on a disconnect), never by a client.
 type cmdKind uint8
 
 const (
-	cmdAcquireSolo cmdKind = iota
-	cmdReleaseSolo
-	cmdSetMode
-	cmdSetBudget
-	cmdSetPanic
-	cmdSetPlaying
+	cmdAcquireInstance cmdKind = iota
+	cmdReleaseInstance
+	cmdAcquireSection
+	cmdReleaseSection
+	cmdBumpGeneration
+	cmdControllerGone
 )
-
-// compensates reports a command's conflict policy: true means an invariant-violating result is REPAIRED into a
-// legal state; false means the command is REJECTED when it cannot apply cleanly. Lease ops are guarded
-// transitions (reject); the value/mode/gate commands compensate.
-func (k cmdKind) compensates() bool {
-	return k != cmdAcquireSolo && k != cmdReleaseSolo
-}
 
 // govCmd is one governed command. Only the fields relevant to its kind are read.
 type govCmd struct {
-	kind cmdKind
-	by   int       // originating controller (lease ops)
-	mode voiceMode // cmdSetMode
-	n    int       // cmdSetBudget
-	on   bool      // cmdSetPanic / cmdSetPlaying
+	kind  cmdKind
+	by    int // originating / departing controller
+	scope int // cmdAcquireSection / cmdReleaseSection
 }
 
 // reduce computes the raw next state for a command (pure, total; the result may be illegal).
 func (s govState) reduce(c govCmd) govState {
 	switch c.kind {
-	case cmdAcquireSolo:
-		s.soloLease = c.by
-	case cmdReleaseSolo:
-		if s.soloLease == c.by {
-			s.soloLease = 0
+	case cmdAcquireInstance:
+		s.instanceLease = c.by
+	case cmdReleaseInstance:
+		if s.instanceLease == c.by {
+			s.instanceLease = 0
 		}
-	case cmdSetMode:
-		s.mode = c.mode
-	case cmdSetBudget:
-		s.voiceBudget = c.n
-	case cmdSetPanic:
-		s.panicLatch = c.on
-	case cmdSetPlaying:
-		s.playing = c.on
+	case cmdAcquireSection:
+		if c.scope >= 0 && c.scope < scopeCount {
+			s.sectionLease[c.scope] = c.by
+		}
+	case cmdReleaseSection:
+		if c.scope >= 0 && c.scope < scopeCount && s.sectionLease[c.scope] == c.by {
+			s.sectionLease[c.scope] = 0
+		}
+	case cmdBumpGeneration:
+		if s.generation < maxGeneration {
+			s.generation++
+		}
+	case cmdControllerGone:
+		if s.instanceLease == c.by {
+			s.instanceLease = 0
+		}
+		for i := 0; i < scopeCount; i++ {
+			if s.sectionLease[i] == c.by {
+				s.sectionLease[i] = 0
+			}
+		}
 	}
 	return s
 }
@@ -146,57 +148,71 @@ const (
 )
 
 // apply is the conflict tier, run on the single applier thread (docs/CONCURRENCY.md: "where a command applies
-// stays one"). It commits the next governed state and reports how it resolved the command. Exclusive-lease
-// acquisition is a guarded transition (rejected if another controller holds it); everything else either applies
-// cleanly or is compensated into a legal state. Because the single applier serializes every mutation, the
-// check-then-commit here is atomic - there is no TOCTOU race to defend against.
+// stays one"). It commits the next governed state and reports how it resolved the command. Because the single
+// applier serializes every mutation, the check-then-commit here is atomic - there is no TOCTOU race to defend.
 func (s govState) apply(c govCmd) (govState, resolution) {
-	if c.kind == cmdAcquireSolo && s.soloLease != 0 && s.soloLease != c.by {
-		return s, resRejected // the lease is held by another controller
+	switch c.kind {
+	case cmdAcquireInstance:
+		if s.instanceLease != 0 && s.instanceLease != c.by {
+			return s, resRejected // held by another controller
+		}
+	case cmdAcquireSection:
+		if c.scope < 0 || c.scope >= scopeCount {
+			return s, resRejected // no such section
+		}
+		if s.instanceLease != 0 && s.instanceLease != c.by {
+			return s, resRejected // cannot sub-lease an instance held by another
+		}
+		if s.sectionLease[c.scope] != 0 && s.sectionLease[c.scope] != c.by {
+			return s, resRejected // section held by another controller
+		}
 	}
 	n := s.reduce(c)
 	if n.ok() {
 		return n, resApplied
 	}
-	if c.kind.compensates() {
-		return n.repair(), resCompensated
-	}
-	return s, resRejected
+	// The only residual illegality the guards above do not catch is AcquireInstance while another controller holds
+	// a section: compensate by revoking those section leases (repair).
+	return n.repair(), resCompensated
 }
 
-// allGovCommands enumerates the full command alphabet, including some out-of-range budgets so repair's clamping is
+// allGovCommands enumerates the full command alphabet, including an out-of-range section so the reject guard is
 // exercised by the reachability walk in governed_test.go.
 func allGovCommands() []govCmd {
 	var cs []govCmd
 	for by := 1; by <= maxControllers; by++ {
-		cs = append(cs, govCmd{kind: cmdAcquireSolo, by: by})
-		cs = append(cs, govCmd{kind: cmdReleaseSolo, by: by})
+		cs = append(cs, govCmd{kind: cmdAcquireInstance, by: by})
+		cs = append(cs, govCmd{kind: cmdReleaseInstance, by: by})
+		for sc := 0; sc < scopeCount; sc++ {
+			cs = append(cs, govCmd{kind: cmdAcquireSection, by: by, scope: sc})
+			cs = append(cs, govCmd{kind: cmdReleaseSection, by: by, scope: sc})
+		}
+		cs = append(cs, govCmd{kind: cmdAcquireSection, by: by, scope: scopeCount}) // out of range: exercises the guard
+		cs = append(cs, govCmd{kind: cmdControllerGone, by: by})
 	}
-	for _, m := range []voiceMode{modePoly, modeMono, modeLegato} {
-		cs = append(cs, govCmd{kind: cmdSetMode, mode: m})
-	}
-	for n := 0; n <= maxVoiceBudget+1; n++ { // includes out-of-range 0 and maxVoiceBudget+1
-		cs = append(cs, govCmd{kind: cmdSetBudget, n: n})
-	}
-	for _, on := range []bool{false, true} {
-		cs = append(cs, govCmd{kind: cmdSetPanic, on: on})
-		cs = append(cs, govCmd{kind: cmdSetPlaying, on: on})
-	}
+	cs = append(cs, govCmd{kind: cmdBumpGeneration})
 	return cs
 }
 
-// allGovStates enumerates a widened product space (voice budget deliberately out of range at both ends) so a
+// allGovStates enumerates a widened product space (generation deliberately out of range at both ends) so a
 // repair-totality test can assert ok(repair(s)) for malformed states, not only reachable ones.
 func allGovStates() []govState {
 	var ss []govState
-	for solo := 0; solo <= maxControllers; solo++ {
-		for _, m := range []voiceMode{modePoly, modeMono, modeLegato} {
-			for b := minVoiceBudget - 1; b <= maxVoiceBudget+1; b++ {
-				for _, pn := range []bool{false, true} {
-					for _, pl := range []bool{false, true} {
-						ss = append(ss, govState{soloLease: solo, mode: m, voiceBudget: b, panicLatch: pn, playing: pl})
-					}
-				}
+	base := maxControllers + 1
+	combos := 1
+	for i := 0; i < scopeCount; i++ {
+		combos *= base
+	}
+	for inst := 0; inst <= maxControllers; inst++ {
+		for combo := 0; combo < combos; combo++ {
+			var sec [scopeCount]int
+			c := combo
+			for i := 0; i < scopeCount; i++ {
+				sec[i] = c % base
+				c /= base
+			}
+			for gen := minGeneration - 1; gen <= maxGeneration+1; gen++ {
+				ss = append(ss, govState{instanceLease: inst, sectionLease: sec, generation: gen})
 			}
 		}
 	}

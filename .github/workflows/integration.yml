@@ -175,7 +175,7 @@ jobs:
           for i in $(seq 1 30); do [ -s mc.json ] && break; sleep 1; done
           test -s mc.json || { echo "host did not write a catalog"; exit 1; }
           SIDECHAIN_SWEEP_PORT=52010 SIDECHAIN_SWEEP_CATALOG=mc.json \
-            go test -run 'TestMultiClientLive|TestChangeNotifications|TestGovernedLive' -v .
+            go test -run 'TestMultiClientLive|TestChangeNotifications|TestGovernedLive|TestGovernedDisconnectFreesLease' -v .
 
   # ---------------------------------------------------------------------------------------------------------------
   # Linux leg. Headless JUCE VST3 hosting under xvfb-run (a plugin touches X at construction even with no editor).
