@@ -72,6 +72,23 @@ All notable changes to this project are documented here. The format is based on
 - **Power-fit survey.** A gated `TestScanPowerFits` probes every param on a running host and flags any clean
   analytic power fit, used to hunt for a real plugin that exercises the power model. Finding recorded (none of
   the surveyed plugins expose a power-law param the real-unit set path can drive).
+- **Generic full-surface live suite.** Four gated, catalog-driven E2E tests that work against ANY hosted plugin
+  (no plugin-specific ids): `TestFullSurfaceSweep` sets every param to normalized {0, 0.5, 1} and reads each
+  back, proving the whole control surface is drivable without a crash; `TestStateRoundTrip` snapshots, mutates,
+  saves, loads, and asserts restoration, proving the opaque save/load path; `TestBatchSetParams` applies N rows
+  in one `set_params` and asserts applied N / skipped 0; `TestMidiSmoke` plays a held middle-C then panics.
+  Gated on `SIDECHAIN_SWEEP_PORT` + `SIDECHAIN_SWEEP_CATALOG` (MIDI additionally on `SIDECHAIN_SWEEP_MIDI=1`, so
+  it runs only for instruments). Validated locally against Surge XT (774 params) and TAL-NoiseMaker (89 params).
+
+### Changed
+
+- **Integration workflow drives multiple plugins on macOS + Linux.** The single-plugin drive is refactored into
+  a shared `drive_plugin` helper (`.github/scripts/drive_plugin.sh`) that starts the host, waits for the
+  catalog, and runs the generic gated suite. macOS keeps Surge XT VST3 as the hard-required leg (plus the
+  Surge-only capability tests) and adds a report-only Surge XT Effects VST3 leg (a NON-synth, run without MIDI).
+  A new report-only Linux job builds the host and drives Surge XT, Surge XT Effects, TAL-NoiseMaker, and Dexed
+  VST3 under `xvfb-run`. Everything new is `continue-on-error` until proven green on CI, mirroring the existing
+  AU/staticcheck report-only pattern.
 
 ### Docs
 

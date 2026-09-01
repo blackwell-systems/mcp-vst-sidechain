@@ -1,16 +1,24 @@
 name: Integration (headless plugin)
 
-# End-to-end smoke test of the part unit tests cannot reach: build the C++ host, load a real open-source VST3
-# (Surge XT, pinned), enumerate its parameter catalog, and drive the control socket through the Go client.
-# macOS only (most representative host platform; AU is macOS-only). Best-effort: it depends on an external
-# download and real plugin behavior, so a red run here is a signal to investigate, not necessarily a code bug.
+# End-to-end smoke test of the part unit tests cannot reach: build the C++ host, load real open-source plugins,
+# enumerate each parameter catalog, and drive the control socket through the Go client. Two jobs:
+#
+#   * smoke (macOS)   - the proven, representative host platform (AU is macOS-only). The Surge XT VST3 path is a
+#                       HARD assertion; everything newer/unproven is continue-on-error (report-only).
+#   * smoke-linux     - the same generic suite on ubuntu under xvfb (headless JUCE plugin hosting needs an X
+#                       server even though we never open an editor). Entirely report-only for now.
+#
+# The generic suite (drive_plugin in .github/scripts/drive_plugin.sh) is catalog-driven and plugin-agnostic: it
+# runs against ANY hosted plugin via the SIDECHAIN_SWEEP_* gate (TestFullSurfaceSweep/TestStateRoundTrip/
+# TestBatchSetParams, plus TestMidiSmoke for instruments). Best-effort overall: it depends on external downloads
+# and real plugin behavior, so a red NEW leg is a signal to investigate, not necessarily a code bug.
 
 on:
   push:
     branches: [main]
-    paths: ['cpp/**', '**.go', 'go.mod', 'go.sum', '.github/workflows/integration.yml']
+    paths: ['cpp/**', '**.go', 'go.mod', 'go.sum', '.github/workflows/integration.yml', '.github/scripts/drive_plugin.sh']
   pull_request:
-    paths: ['cpp/**', '**.go', 'go.mod', 'go.sum', '.github/workflows/integration.yml']
+    paths: ['cpp/**', '**.go', 'go.mod', 'go.sum', '.github/workflows/integration.yml', '.github/scripts/drive_plugin.sh']
   workflow_dispatch:
 
 permissions:
@@ -22,6 +30,7 @@ concurrency:
 
 env:
   SURGE_VERSION: "1.3.4"
+  DEXED_VERSION: "1.0.1"
 
 jobs:
   smoke:
@@ -50,7 +59,7 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/surge
-          key: surge-xt-${{ env.SURGE_VERSION }}
+          key: surge-xt-macos-${{ env.SURGE_VERSION }}
 
       - name: Download Surge XT (pinned, official release)
         if: steps.surge-cache.outputs.cache-hit != 'true'
@@ -58,37 +67,53 @@ jobs:
           mkdir -p ~/surge
           curl -sSL -o ~/surge/surge.zip \
             "https://github.com/surge-synthesizer/releases-xt/releases/download/${SURGE_VERSION}/surge-xt-macos-${SURGE_VERSION}-pluginsonly.zip"
-          unzip -qo ~/surge/surge.zip -d ~/surge "Surge XT.vst3/*"
+          # The zip carries both the synth and the effect; extract both (the effect proves NON-synth hosting).
+          unzip -qo ~/surge/surge.zip -d ~/surge "Surge XT.vst3/*" "Surge XT Effects.vst3/*"
 
-      - name: Load, enumerate, and drive
+      # Surge XT VST3 (synth): the proven, hard assertion. Drives the generic gated suite WITH the MIDI smoke.
+      - name: Drive Surge XT VST3 (synth) - REQUIRED
+        env:
+          SIDECHAIN_HOST_BIN: cpp/build/sidechain-host_artefacts/Release/sidechain-host
+        run: |
+          set -euo pipefail
+          source .github/scripts/drive_plugin.sh
+          drive_plugin "Surge XT" "$HOME/surge/Surge XT.vst3" 51990 1
+
+      # Surge-specific capability tests: the Phase-1 real-unit inference/inversion path (cutoff exp fit, discrete
+      # set-by-label, steep zero-based time curve driving the binary-search refinement). Resolves ids by label
+      # against Surge's catalog, so it is Surge-only. Hard assertion (this path is proven).
+      - name: Surge capability tests (infer/invert/discrete) - REQUIRED
         run: |
           set -euo pipefail
           HOST="cpp/build/sidechain-host_artefacts/Release/sidechain-host"
-          "$HOST" --plugin "$HOME/surge/Surge XT.vst3" --catalog cat.json --port 51999 &
+          "$HOST" --plugin "$HOME/surge/Surge XT.vst3" --catalog cap.json --port 51991 &
           HOST_PID=$!
           trap 'kill $HOST_PID 2>/dev/null || true' EXIT
-
-          # Wait for the host to enumerate the catalog and open the listener.
-          for i in $(seq 1 30); do [ -s cat.json ] && break; sleep 1; done
-          test -s cat.json || { echo "host did not write a catalog"; exit 1; }
-
-          COUNT=$(python3 -c "import json; print(json.load(open('cat.json'))['count'])")
-          echo "enumerated $COUNT params"
-          [ "$COUNT" -gt 100 ] || { echo "unexpectedly few params ($COUNT)"; exit 1; }
-
-          # Drive the live-control + Phase-1 path against the real plugin, reusing the gated tests. Resolve param
-          # ids by label: a cutoff (analytic exp fit), an oscillator type (discrete set-by-label), and an
-          # envelope attack (steep zero-based curve that drives the binary-search refinement fallback).
-          pid() { python3 -c "import json,sys; d=json.load(open('cat.json')); print(next(p['id'] for p in d['params'] if p['label']==sys.argv[1]))" "$1"; }
+          for i in $(seq 1 40); do [ -s cap.json ] && break; sleep 1; done
+          test -s cap.json || { echo "host did not write a catalog"; exit 1; }
+          pid() { python3 -c "import json,sys; d=json.load(open('cap.json')); print(next(p['id'] for p in d['params'] if p['label']==sys.argv[1]))" "$1"; }
           CUTOFF=$(pid 'A Filter 1 Cutoff')
           DISCRETE=$(pid 'A Osc 1 Type')
           TIME=$(pid 'A Amp EG Attack')
-          SIDECHAIN_LIVE_PORT=51999 \
-          SIDECHAIN_LIVE_CATALOG=cat.json \
+          SIDECHAIN_LIVE_PORT=51991 \
+          SIDECHAIN_LIVE_CATALOG=cap.json \
           SIDECHAIN_LIVE_PARAM="$CUTOFF" \
           SIDECHAIN_LIVE_DISCRETE="$DISCRETE" \
           SIDECHAIN_LIVE_TIME="$TIME" \
             go test -run 'TestWiredLive|TestInferLive|TestE2ESurgeExtras' -v .
+
+      # Surge XT EFFECTS VST3 (report-only): proves the SAME generic surface drives a NON-synth. Run WITHOUT the
+      # MIDI smoke (an effect has no MIDI in). continue-on-error keeps it non-blocking; promote to required (drop
+      # continue-on-error) once it has been green on CI for a few runs. Mirrors the AU/staticcheck report-only
+      # pattern already in the repo.
+      - name: Drive Surge XT Effects VST3 (effect, no MIDI) - report-only
+        continue-on-error: true
+        env:
+          SIDECHAIN_HOST_BIN: cpp/build/sidechain-host_artefacts/Release/sidechain-host
+        run: |
+          set -euo pipefail
+          source .github/scripts/drive_plugin.sh
+          drive_plugin "Surge XT Effects" "$HOME/surge/Surge XT Effects.vst3" 51992 0
 
       # AU (.component / AudioUnit) load+drive smoke. Report-only for now (continue-on-error): the whole point of
       # this run is to catch a headless-AU wrinkle without reding the green VST3 job above. It mirrors the
@@ -139,3 +164,99 @@ jobs:
           SIDECHAIN_AU_CATALOG=aucat.json \
           SIDECHAIN_AU_PARAM="$AU_PARAM" \
             go test -run 'TestAULive' -v .
+
+  # ---------------------------------------------------------------------------------------------------------------
+  # Linux leg. ENTIRELY report-only (continue-on-error) for now: headless JUCE plugin hosting on Linux is
+  # unproven in this repo, so nothing here may red the pipeline until it has been green on CI for a few runs.
+  # Each plugin drives the SAME generic gated suite under xvfb-run (a JUCE plugin instantiates its editor-less
+  # processor but still touches X at construction, so an X server must be present even though we never open a UI).
+  # Promote individual legs to required by moving them to a job without job-level continue-on-error once proven.
+  smoke-linux:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    env:
+      SIDECHAIN_HOST_BIN: cpp/build/sidechain-host_artefacts/sidechain-host
+      SIDECHAIN_XVFB: "1"
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Install Linux JUCE deps + xvfb
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev libcurl4-openssl-dev \
+            libfreetype-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev libwebkit2gtk-4.1-dev libglu1-mesa-dev \
+            xvfb
+
+      - name: Cache JUCE FetchContent
+        uses: actions/cache@v6
+        with:
+          path: cpp/build/_deps
+          key: juce-linux-${{ hashFiles('cpp/CMakeLists.txt') }}
+
+      - name: Build C++ host
+        run: |
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build cpp/build --target sidechain-host --config Release
+
+      # Download the LINUX VST3 builds of every plugin. All URLs verified with gh api / curl -sI before pinning.
+      - name: Cache plugin downloads
+        id: plug-cache
+        uses: actions/cache@v6
+        with:
+          path: ~/plugins
+          key: linux-plugins-surge${{ env.SURGE_VERSION }}-dexed${{ env.DEXED_VERSION }}-talNM-v1
+
+      - name: Download Linux plugins
+        if: steps.plug-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p ~/plugins && cd ~/plugins
+
+          # Surge XT (synth) + Surge XT Effects (effect), one tarball, both VST3 bundles.
+          curl -sSL -o surge.tar.gz \
+            "https://github.com/surge-synthesizer/releases-xt/releases/download/${SURGE_VERSION}/surge-xt-linux-${SURGE_VERSION}-pluginsonly.tar.gz"
+          tar xzf surge.tar.gz "./Surge XT.vst3" "./Surge XT Effects.vst3"
+
+          # TAL-NoiseMaker (synth). The zip nests the bundle under a TAL-NoiseMaker/ dir; flatten it out.
+          curl -sSL -o tal.zip "https://tal-software.com/downloads/plugins/TAL-NoiseMaker_64_linux.zip"
+          unzip -qo tal.zip
+          mv "TAL-NoiseMaker/TAL-NoiseMaker.vst3" .
+
+          # Dexed (FM synth). The macOS release ships only an AU, so Dexed is Linux-only here.
+          curl -sSL -o dexed.zip \
+            "https://github.com/asb2m10/dexed/releases/download/v${DEXED_VERSION}/Dexed-${DEXED_VERSION}-lnx.zip"
+          unzip -qo dexed.zip "Dexed.vst3/*"
+
+          ls -la ~/plugins
+
+      # One host build; loop the plugins. Each drive is its own step; job-level continue-on-error makes them all
+      # report-only, and per-step failures are isolated in the log. The host runs under xvfb-run -a (SIDECHAIN_XVFB).
+      - name: Drive Surge XT VST3 (synth) - report-only
+        run: |
+          set -euo pipefail
+          source .github/scripts/drive_plugin.sh
+          drive_plugin "Surge XT" "$HOME/plugins/Surge XT.vst3" 51990 1
+
+      - name: Drive TAL-NoiseMaker VST3 (synth) - report-only
+        run: |
+          set -euo pipefail
+          source .github/scripts/drive_plugin.sh
+          drive_plugin "TAL-NoiseMaker" "$HOME/plugins/TAL-NoiseMaker.vst3" 51991 1
+
+      - name: Drive Dexed VST3 (FM synth) - report-only
+        run: |
+          set -euo pipefail
+          source .github/scripts/drive_plugin.sh
+          drive_plugin "Dexed" "$HOME/plugins/Dexed.vst3" 51992 1
+
+      - name: Drive Surge XT Effects VST3 (effect, no MIDI) - report-only
+        run: |
+          set -euo pipefail
+          source .github/scripts/drive_plugin.sh
+          drive_plugin "Surge XT Effects" "$HOME/plugins/Surge XT Effects.vst3" 51993 0
