@@ -115,6 +115,36 @@ The invariants hold at every step; capability grows.
   applier precisely so this can drop in without touching C1/C2. (b) **Refinements:** echo-suppression tuning,
   optional per-parameter ownership/leases, richer events (state loaded, notes), backpressure policy.
 
+### C3 sequencing (why the conflict engine lands later, not now)
+
+C3 is deliberately unbuilt. The governed coordination state it protects (leases, held-note ownership, a
+scene/patch generation counter, mutually exclusive global gates) does not exist yet, and building a conflict
+engine before the real conflicts appear tends to model the wrong invariants. The order of operations:
+
+1. **Govern nothing until a real conflict forces it.** C2's last-writer-wins is correct for the continuous
+   params and stays that way. Ship multi-controller, watch what two controllers actually collide on.
+2. **When the first genuine invariant appears, model it in ~20 lines first:** a pure `reduce(state, cmd)`, an
+   `ok(state)` predicate, and a deterministic `repair(state)`, over a small discrete/bounded state (enums, bools,
+   bounded ints only). The conflict tier is then guarded transitions on the single applier: compute the next
+   state, and either **reject** (return a typed error to the originating controller, state unchanged) or
+   **compensate** (commit `repair(reduce(...))` so the write lands but drags dependent state with it). Pick per
+   field: reject where a controller must know it lost (lease acquisition), compensate where silent convergence is
+   fine (a mode gate). This needs no external engine.
+3. **Verify by exhaustive enumeration in a test.** Because the governed state is finite and small, a DFS over
+   (reachable states x command alphabet) that asserts `ok` after every `repair(reduce(...))` reproduces gsm's
+   build-time guarantee ("no reachable state violates an invariant") as an ordinary test, and catches a partial
+   `repair` immediately. Run it in CI.
+4. **Adopt gsm when that model outgrows hand-rolling,** i.e. when there are enough invariants and compensations
+   that its declarative ergonomics and reusable verified engine pay for the dependency. At that point the move is
+   porting a proven model into gsm, not guessing at one.
+
+The reason this works without reaching for CRDTs or consensus: there is ONE host, ONE applier thread, and one
+copy of the state (invariant 2). C3 is not a distributed-convergence problem; it is keeping a small discrete
+invariant-bearing state consistent under a serial applier where per-variable LWW is too coarse. If the scope ever
+became multi-host (replicated governed state, partitions), that reframe collapses and the honest tools become
+CRDTs (merge-friendly bits) and consensus/Raft (strict exclusivity). That is explicitly a non-goal (see below),
+and gsm does not target that case either.
+
 ## Testing (a first-class category)
 
 Concurrency gets its own test level, run under the race detector:
