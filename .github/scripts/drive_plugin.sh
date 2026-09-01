@@ -38,7 +38,15 @@ drive_plugin() {
     echo "$name enumerated zero params"; kill "$pid" 2>/dev/null || true; echo "::endgroup::"; return 1
   fi
 
-  local runexpr='TestFullSurfaceSweep|TestStateRoundTrip|TestBatchSetParams'
+  # State round-trip runs FIRST, against the freshly-loaded plugin. save_state/load_state is meant to round-trip
+  # a NATURAL patch; the full-surface sweep below deliberately drives every param to extremes (a no-crash stress
+  # test), which leaves some plugins in an unnatural/modal state their OWN save/load does not faithfully
+  # reproduce. Testing state on the clean load keeps this a test of the bridge (byte-exact) rather than of a
+  # plugin's tolerance for a maxed-out state. The sweep then churns freely since nothing after it reads state.
+  SIDECHAIN_SWEEP_PORT="$port" SIDECHAIN_SWEEP_CATALOG="$cat" \
+    go test -run 'TestStateRoundTrip' -v . || rc=$?
+
+  local runexpr='TestFullSurfaceSweep|TestBatchSetParams'
   local midienv=""
   if [ "$midi" = "1" ]; then runexpr="$runexpr|TestMidiSmoke"; midienv="1"; fi
   SIDECHAIN_SWEEP_PORT="$port" \
