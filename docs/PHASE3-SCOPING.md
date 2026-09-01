@@ -87,11 +87,33 @@ inference (annotated headless before probing).
 
 ## Storage
 
-- **One shared store file**, a map `fingerprint -> entry`, so multiple plugins accumulate in one place and it is
-  reusable across sessions.
-- **Location:** `--semantic <path>` flag / `SIDECHAIN_SEMANTIC` env, defaulting to `sidechain-semantic.json` in
-  the working directory. (Open decision below: shared file vs per-catalog sidecar.)
-- **Atomic writes:** write to a temp file and rename, so a crash mid-write cannot corrupt the store.
+A **directory of per-fingerprint files**, NOT one shared file. One file per plugin: `<dir>/<fingerprint>.json`.
+
+- **Location:** `--semantic-dir` flag / `SIDECHAIN_SEMANTIC_DIR` env, defaulting to a per-user cache directory
+  (`$XDG_CACHE_HOME/sidechain`, or the OS equivalent) so it persists and is reused regardless of working
+  directory.
+- **Atomic writes:** write a temp file in the directory and rename over the target (atomic on the same
+  filesystem), so a file is never torn or half-written, even on a crash mid-write.
+- Per-plugin files, keyed by the surface fingerprint, mean a surface change (a new fingerprint) is naturally a
+  new file, and unrelated plugins never share a file.
+
+### Concurrency
+
+Multiple `sidechain` processes may run at once (one per hosted plugin, or several agents). The per-fingerprint-
+file layout is what makes this safe.
+
+- **Within a process:** writes happen under the session mutex, serialized; a single server touches only its own
+  plugin's file.
+- **Across processes, different plugins:** they write different files and never contend. (This is the case the
+  earlier one-shared-file design would have raced on with a read-modify-write clobber, and the reason it was
+  rejected.)
+- **Across processes, the same plugin (rare):** handled by (a) the atomic temp+rename, so the file is never
+  corrupted, and (b) **merge-on-write**: before writing, re-read the file and merge (union of params, newest-wins
+  per field), so two simultaneous writers to the identical plugin at worst lose a same-param/same-field edit,
+  never wholesale-clobber the other's work.
+- An advisory per-file lock (`flock`) is a deliberate NON-goal up front (cross-platform lock behavior is fiddly);
+  add it only if real same-plugin contention is ever observed. There is no global lock because there is no global
+  file.
 
 ## Lifecycle
 
@@ -99,7 +121,8 @@ inference (annotated headless before probing).
   populate the in-memory `session.infer` cache and the annotations from it. The `s.infer` map becomes a view
   backed by the store.
 - **Write** after each `annotate_params`, and after each `describe_param` probe (so inferences persist and a
-  future session skips the sweep). Debounce is unnecessary at agent speed; write-through is simplest.
+  future session skips the sweep). Write-through is simplest at agent speed. Each write is read-merge-write on the
+  plugin's fingerprint file, then an atomic rename (see Concurrency).
 - **connect_live interaction:** today `connect_live` clears `s.infer` (a new instance may differ). With the store,
   reconnecting to the SAME fingerprint reloads persisted inferences instead of forcing a re-probe; a probe still
   refreshes on demand.
@@ -132,8 +155,9 @@ inference (annotated headless before probing).
 
 ## Open decisions (yours to confirm)
 
-1. **Store location convention:** one shared `sidechain-semantic.json` (recommended, accumulates all plugins) vs
-   a per-catalog sidecar `<catalog>.semantic.json`. Default: shared file via `--semantic`/`SIDECHAIN_SEMANTIC`.
+1. **Store directory location:** a per-user cache directory (recommended: `$XDG_CACHE_HOME/sidechain` or OS
+   equivalent, persists and is reused everywhere) vs a directory next to the catalog. Either way it is a
+   directory of per-fingerprint files, configurable via `--semantic-dir`/`SIDECHAIN_SEMANTIC_DIR`.
 2. **Ship `get_semantic_map` now or defer to Phase 4?** Recommended: ship it now; it is small and Phase 4 needs it.
 3. **Version in the fingerprint?** Default: no (surface-hash equivalence). Change only if you want every version
    bump to force re-annotation.
