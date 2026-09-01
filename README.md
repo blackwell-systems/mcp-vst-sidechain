@@ -11,8 +11,10 @@ Sidechain talks to plugins only through the standard VST3/AU API, the same way a
 closed-source commercial plugins without ever seeing their source. You bring your own licensed binaries;
 nothing is patched and nothing is redistributed.
 
-> Status: early. The Go MCP layer and the C++ control listener are working and tested; the child-plugin host
-> (the JUCE `AudioPluginFormatManager` wrapper) is an MVP.
+> Status: early but working. The Go MCP layer, the C++ control server, and the child-plugin host (the JUCE
+> `AudioPluginFormatManager` wrapper) are tested end to end: an integration matrix drives real VST3/AU plugins on
+> macOS and Linux, multiple agents can control one instance at once, and a semantic layer recovers real-unit
+> control from probe-only plugins. No release is tagged yet.
 
 ## Why
 
@@ -46,15 +48,18 @@ Two layers, two languages, chosen for what each does best:
   the official MCP go-sdk, ships as a single binary, and GCF-encodes large payloads via `gcf-go`.
 
 Audio never crosses the process boundary. Parameter control runs at agent speed (tens of ms), not audio rate,
-so the localhost IPC carries only control messages and has zero effect on the sound. Full detail:
-[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+so the localhost IPC carries only control messages and has zero effect on the sound.
+
+The control server accepts **many controllers at once**: several agents (or an agent alongside the plugin's own
+editor) can drive one instance concurrently, each with its own identity, and every change is pushed to the others
+as an event. Full detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/CONCURRENCY.md](docs/CONCURRENCY.md).
 
 ## Supported formats
 
 Sidechain hosts **VST3** (all platforms) and **AU** (macOS) instruments and effects through JUCE's standard
 `AudioPluginFormatManager`, the same hosting path a DAW uses. That is the whole format surface, by design: it
-keeps the project buildable from source with no proprietary SDK. In testing it loads a real 887-parameter VST3
-synth, enumerates the full surface, and drives it live over the control socket.
+keeps the project buildable from source with no proprietary SDK. In testing it loads a real 774-parameter VST3
+synth (Surge XT), enumerates the full surface, and drives it live over the control socket.
 
 **VST2 is not hosted.** The Steinberg VST2 SDK has been unlicensed since 2018 and cannot be redistributed, so
 adding it would break the "build from source, standard APIs only" guarantee. To drive a VST2-only instrument
@@ -62,8 +67,11 @@ adding it would break the "build from source, standard APIs only" guarantee. To 
 bridge itself never sees VST2. Wrapper fidelity varies, so treat that route as best-effort.
 
 A hosted plugin exposes its parameters as normalized 0..1 values plus the plugin's own value text
-(`hasRealRange: false`); real-unit ranges and skew live inside the plugin and surface only when Sidechain is
-embedded directly in a native JUCE plugin (`hasRealRange: true`). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+(`hasRealRange: false`); the real-unit range and skew live inside the plugin. Sidechain's semantic layer recovers
+them anyway: `describe_param` probes the value text across the range to infer the unit, real range, and curve, so
+an agent can then `set_param real=1000` (Hz) on a plugin whose catalog range is a bare 0..1. Real endpoints are
+reported directly (`hasRealRange: true`) only when Sidechain is embedded in a native JUCE plugin that owns the
+curve. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Tools
 
@@ -71,7 +79,8 @@ embedded directly in a native JUCE plugin (`hasRealRange: true`). See [docs/ARCH
 |---|---|
 | `list_params` | The plugin's automatable parameters (id/label/type/range/choices/default). GCF-encoded. |
 | `get_param` | One parameter's definition + current value (real units + normalized). |
-| `set_param` | Set one parameter by value (real units when the param exposes a real range, else normalized 0..1), normalized 0..1, or choice name. Validated + clamped. |
+| `describe_param` | Probe a live param's value text across its range and report the recovered semantics: unit (Hz/dB/ms/%/...), real range, curve shape, whether it is bipolar, or the labels when it is really a discrete control. How an agent learns what a hosted param actually is before driving it. |
+| `set_param` | Set one parameter by real units (`real=`, even on a hosted plugin whose catalog range is a bare 0..1: the value maps through the probed curve), normalized 0..1, or choice name. Validated + clamped. |
 | `set_params` | Set many params in one call, from a JSON array or a token-compact GCF table. |
 | `connect_live` / `disconnect_live` | Attach to / detach from a running host so the above drive the live instance. |
 | `play_note` / `all_notes_off` | Play a MIDI note (optionally auto-released) / panic. |
@@ -105,7 +114,7 @@ only.)
     --port 51703
 ```
 
-This loads the plugin, writes its parameter catalog to `plugin-catalog.json`, and starts the control listener
+This loads the plugin, writes its parameter catalog to `plugin-catalog.json`, and starts the control server
 on `127.0.0.1:51703`.
 
 ### 4. Run the MCP server and point an agent at it
