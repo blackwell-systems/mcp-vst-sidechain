@@ -140,15 +140,18 @@ private:
         std::string inbox;
         char buf[2048];
 
-        while (! threadShouldExit() && conn.isConnected())
+        while (! threadShouldExit())
         {
+            // Wait for readability first, THEN read. This distinguishes a graceful peer close from "no data
+            // yet": when the socket is ready but read returns 0, the peer has closed (EOF), so we must return
+            // and let run() accept the next client. The old code treated a 0-byte read as "keep waiting", so on
+            // EOF it spun without ever releasing the connection - which stalled the NEXT client's handshake.
+            const int ready = conn.waitUntilReady (true, 200);
+            if (ready < 0) break;    // socket error
+            if (ready == 0) continue; // timed out with nothing to read: re-check shutdown, wait again
+
             const int got = conn.read (buf, (int) sizeof (buf), false);
-            if (got < 0) break;            // error / disconnect
-            if (got == 0)                  // no data ready
-            {
-                if (conn.waitUntilReady (true, 200) < 0) break;
-                continue;
-            }
+            if (got <= 0) break;     // ready but 0 bytes => peer closed (EOF); negative => error
 
             inbox.append (buf, (size_t) got);
             for (auto nl = inbox.find ('\n'); nl != std::string::npos; nl = inbox.find ('\n'))

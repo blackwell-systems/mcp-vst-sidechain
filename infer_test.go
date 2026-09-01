@@ -10,6 +10,7 @@ import (
 	"math"
 	"os"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -220,8 +221,14 @@ func TestWiredLive(t *testing.T) {
 	s := newSession(cat)
 	ctx := context.Background()
 	p, _ := strconv.Atoi(port)
-	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: p}); err != nil {
+	// handleConnectLive reports a failed dial in its TEXT (err stays nil, by tool convention), so assert on the
+	// reply. Without this, a broken plugin/socket path silently no-ops and the test false-greens.
+	cres, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: p})
+	if err != nil {
 		t.Fatalf("connect_live: %v", err)
+	}
+	if !strings.Contains(textOf(cres), "Connected LIVE") {
+		t.Fatalf("connect_live did not connect: %s", textOf(cres))
 	}
 
 	dres, _, err := s.handleDescribeParam(ctx, nil, describeParamIn{ID: id})
@@ -229,16 +236,23 @@ func TestWiredLive(t *testing.T) {
 		t.Fatalf("describe_param: %v", err)
 	}
 	t.Logf("describe_param -> %s", textOf(dres))
+	if strings.Contains(textOf(dres), "not live") {
+		t.Fatalf("describe_param ran while not live: %s", textOf(dres))
+	}
 
+	// The CI target (a filter cutoff) is a numeric, unit-bearing param, so we REQUIRE the real-unit path to work
+	// here rather than skipping. This is the assertion that actually exercises describe -> infer -> set real.
 	pi := s.infer[id]
 	if !pi.Numeric || pi.Unit == "" {
-		t.Logf("param has no real unit; skipping real-set demo")
-		return
+		t.Fatalf("expected a numeric, unit-bearing param, got numeric=%v unit=%q", pi.Numeric, pi.Unit)
 	}
 	target := pi.RealMin + 0.30*(pi.RealMax-pi.RealMin)
 	sres, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: id, Real: &target})
 	if err != nil {
 		t.Fatalf("set_param real: %v", err)
+	}
+	if !strings.Contains(textOf(sres), "Set LIVE") {
+		t.Fatalf("set_param real did not drive the plugin: %s", textOf(sres))
 	}
 	t.Logf("set_param real=%.3f %s -> %s", target, pi.Unit, textOf(sres))
 }
