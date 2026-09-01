@@ -76,9 +76,16 @@ jobs:
           echo "enumerated $COUNT params"
           [ "$COUNT" -gt 100 ] || { echo "unexpectedly few params ($COUNT)"; exit 1; }
 
-          # Drive the live-control + Phase-1 inference path against the real plugin, reusing the gated tests.
-          CUTOFF=$(python3 -c "import json; d=json.load(open('cat.json')); print(next(p['id'] for p in d['params'] if p['label']=='A Filter 1 Cutoff'))")
+          # Drive the live-control + Phase-1 path against the real plugin, reusing the gated tests. Resolve param
+          # ids by label: a cutoff (analytic exp fit), an oscillator type (discrete set-by-label), and an
+          # envelope attack (steep zero-based curve that drives the binary-search refinement fallback).
+          pid() { python3 -c "import json,sys; d=json.load(open('cat.json')); print(next(p['id'] for p in d['params'] if p['label']==sys.argv[1]))" "$1"; }
+          CUTOFF=$(pid 'A Filter 1 Cutoff')
+          DISCRETE=$(pid 'A Osc 1 Type')
+          TIME=$(pid 'A Amp EG Attack')
           SIDECHAIN_LIVE_PORT=51999 \
           SIDECHAIN_LIVE_CATALOG=cat.json \
           SIDECHAIN_LIVE_PARAM="$CUTOFF" \
-            go test -run 'TestWiredLive|TestInferLive' -v .
+          SIDECHAIN_LIVE_DISCRETE="$DISCRETE" \
+          SIDECHAIN_LIVE_TIME="$TIME" \
+            go test -run 'TestWiredLive|TestInferLive|TestE2ESurgeExtras' -v .
