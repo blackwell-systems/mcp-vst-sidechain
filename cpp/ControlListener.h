@@ -30,7 +30,8 @@
 // interface). One client at a time. Chosen over UDP/OSC because MCP is request/response (the agent needs acks
 // + state read-back). Commands mirror the MCP tools 1:1:
 //   ping · get_param{param} · set_param{param,(value|normalized|choice)} · note_on{chan,note,vel} ·
-//   note_off{chan,note} · all_notes_off · reset_init · load_state{xml} · get_full_state · get_state.
+//   note_off{chan,note} · all_notes_off · reset_init · load_state{state} · get_full_state · get_state.
+//   (load_state/get_full_state carry `state`: base64 of the plugin's own opaque getStateInformation bytes.)
 // ================================================================================================
 
 namespace sidechain
@@ -205,11 +206,13 @@ private:
             return okReply (id, [] (juce::DynamicObject& o) { o.setProperty ("reset", true); });
         }
 
-        if (cmd == "load_state")   // push a WHOLE patch (the plugin's opaque state XML) into the live instance
+        if (cmd == "load_state")   // push a WHOLE patch (the plugin's opaque state blob) into the live instance
         {
-            pendingLoadXml = req.getProperty ("xml", juce::var()).toString().toStdString();
-            if (pendingLoadXml.empty())
-                return errorReply ("no_xml", id);
+            // `state` is base64 of the exact bytes the plugin's own getStateInformation produced. We do NOT
+            // assume any format (XML-wrapped or raw binary): the bridge round-trips opaque bytes.
+            pendingLoadState = req.getProperty ("state", juce::var()).toString().toStdString();
+            if (pendingLoadState.empty())
+                return errorReply ("no_state", id);
             lastLoadOk = false;
             appliedEvent.reset();
             enqueue ({ Kind::LoadState }, /*ack*/ true);
@@ -218,15 +221,18 @@ private:
                               : errorReply ("load_failed", id);
         }
 
-        if (cmd == "get_full_state")   // pull the WHOLE live patch as the plugin's opaque state XML
+        if (cmd == "get_full_state")   // pull the WHOLE live patch as the plugin's opaque state blob (base64)
         {
-            fetchedStateXml.clear();
+            fetchedState.clear();
+            fetchedStateOk = false;
             appliedEvent.reset();
             enqueue ({ Kind::GetFullState }, /*ack*/ true);
             appliedEvent.wait (2000);
-            if (fetchedStateXml.empty())
+            if (! fetchedStateOk)
                 return errorReply ("state_unavailable", id);
-            return okReply (id, [this] (juce::DynamicObject& o) { o.setProperty ("xml", juce::String (fetchedStateXml)); });
+            // An empty state (a plugin with no persistent state) is a valid opaque blob; only a failure to run
+            // getStateInformation is an error, which fetchedStateOk distinguishes.
+            return okReply (id, [this] (juce::DynamicObject& o) { o.setProperty ("state", juce::String (fetchedState)); });
         }
 
         if (cmd == "get_state")
@@ -395,23 +401,27 @@ private:
                 if (onResetInit) onResetInit();   // host-supplied, on the message thread
                 break;
             case Kind::LoadState:
-                // Parse the incoming state XML → the binary blob setStateInformation expects, then apply it via
-                // the NORMAL host state path. juce::AudioProcessor-only, so this header needs no processor type.
-                if (auto xml = juce::parseXML (juce::String (pendingLoadXml)))
+                // Base64-decode the opaque blob back to the EXACT bytes the plugin emitted, then apply it via the
+                // normal host path. No format assumption (works for XML-wrapped AND raw-binary state), and it is
+                // byte-exact - no lossy XML re-serialization. juce::AudioProcessor-only; no processor type needed.
                 {
-                    juce::MemoryBlock mb;
-                    juce::AudioProcessor::copyXmlToBinary (*xml, mb);
-                    processor.setStateInformation (mb.getData(), (int) mb.getSize());
-                    lastLoadOk = true;
+                    juce::MemoryOutputStream decoded;
+                    if (juce::Base64::convertFromBase64 (decoded, juce::String (pendingLoadState)) && decoded.getDataSize() > 0)
+                    {
+                        processor.setStateInformation (decoded.getData(), (int) decoded.getDataSize());
+                        lastLoadOk = true;
+                    }
                 }
                 break;
             case Kind::GetFullState:
-                // Snapshot the live patch the same way the host saves it, then hand back the XML text.
+                // Snapshot the live patch as the plugin's own opaque bytes and base64 them verbatim. fetchedStateOk
+                // is set even for an empty blob (a plugin with no state), so the reader can tell "no state" from
+                // "getStateInformation failed to run".
                 {
                     juce::MemoryBlock mb;
                     processor.getStateInformation (mb);
-                    if (auto xml = juce::AudioProcessor::getXmlFromBinary (mb.getData(), (int) mb.getSize()))
-                        fetchedStateXml = xml->toString().toStdString();
+                    fetchedState = juce::Base64::toBase64 (mb.getData(), mb.getSize()).toStdString();
+                    fetchedStateOk = true;
                 }
                 break;
         }
@@ -468,8 +478,9 @@ private:
     // Full-state payloads. Written by the socket thread BEFORE it blocks on appliedEvent, read/written by the
     // message-thread drain, read by the socket thread AFTER the wait - the wait/signal pair provides the
     // happens-before, and the protocol is serial (one client, one in-flight request), so no lock is needed.
-    std::string pendingLoadXml;   // load_state: the XML to apply
-    std::string fetchedStateXml;  // get_full_state: the snapshot to return
+    std::string pendingLoadState; // load_state: the base64 opaque blob to apply
+    std::string fetchedState;     // get_full_state: the base64 opaque snapshot to return
+    bool        fetchedStateOk = false; // get_full_state ran (distinguishes empty-but-valid state from failure)
     bool        lastLoadOk = false;
 
     std::atomic<Status> status { Status::Idle };

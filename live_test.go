@@ -149,10 +149,10 @@ func (fh *fakeHost) dispatch(req map[string]any) map[string]any {
 		norm := fh.params[id]
 		return map[string]any{"ok": true, "param": id, "normalized": norm, "value": norm, "text": renderFor(id, norm)}
 	case "get_full_state":
-		return map[string]any{"ok": true, "xml": fh.state}
+		return map[string]any{"ok": true, "state": fh.state}
 	case "load_state":
-		xml, _ := req["xml"].(string)
-		fh.state = xml
+		st, _ := req["state"].(string)
+		fh.state = st
 		return map[string]any{"ok": true, "loaded": true}
 	case "reset_init":
 		fh.resets++

@@ -158,17 +158,20 @@ func (lc *liveClient) ResetInit() error {
 	return err
 }
 
+// GetFullState / LoadState carry the plugin's whole patch as an OPAQUE base64 blob (base64 of the plugin's own
+// getStateInformation bytes). The Go layer never decodes it - it round-trips the string - so it makes no
+// assumption about the plugin's state format (XML-wrapped or raw binary both work).
 func (lc *liveClient) GetFullState() (string, error) {
 	resp, err := lc.request(map[string]any{"cmd": "get_full_state"})
 	if err != nil {
 		return "", err
 	}
-	xml, _ := resp["xml"].(string)
-	return xml, nil
+	state, _ := resp["state"].(string)
+	return state, nil
 }
 
-func (lc *liveClient) LoadState(xml string) error {
-	_, err := lc.request(map[string]any{"cmd": "load_state", "xml": xml})
+func (lc *liveClient) LoadState(state string) error {
+	_, err := lc.request(map[string]any{"cmd": "load_state", "state": state})
 	return err
 }
 

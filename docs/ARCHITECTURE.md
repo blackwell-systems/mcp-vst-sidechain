@@ -95,12 +95,14 @@ thin forwarder:
 | `note_on` / `note_off` | `{chan, note, vel}` | `{ok, note, on}` |
 | `all_notes_off` | - | `{ok}` |
 | `reset_init` | - | `{ok, reset}` |
-| `load_state` | `{xml}` | `{ok, loaded}` |
-| `get_full_state` | - | `{ok, xml}` |
+| `load_state` | `{state}` | `{ok, loaded}` |
+| `get_full_state` | - | `{ok, state}` |
 | `get_state` | - | `{ok, count, params}` |
 
-Full state (`load_state` / `get_full_state`) is treated as an **opaque** blob: the bridge round-trips the
-plugin's own `getStateInformation` / `setStateInformation`, with no knowledge of any plugin's schema.
+Full state (`load_state` / `get_full_state`) is treated as an **opaque** blob: `state` is base64 of the exact
+bytes the plugin's own `getStateInformation` produced, round-tripped verbatim to `setStateInformation` with no
+knowledge of any plugin's schema. Using the raw bytes (not an XML re-serialization) makes it byte-exact and
+works for plugins with either XML-wrapped or raw-binary state.
 
 ## GCF (token efficiency)
 

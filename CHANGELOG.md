@@ -62,6 +62,12 @@ All notable changes to this project are documented here. The format is based on
   one control socket. The note verbs previously released the session lock before their socket call.
 - **Plugin paths with spaces:** the host CLI now resolves paths like `.../Surge XT.vst3` correctly (JUCE wraps
   space-containing args in quotes when it reconstructs the command line; those quotes are now stripped).
+- **Opaque state is now format-agnostic and byte-exact.** `save_state`/`load_state` carry base64 of the exact
+  bytes the plugin's `getStateInformation` produced, instead of assuming XML-wrapped state (`getXmlFromBinary` /
+  `copyXmlToBinary`). A plugin with raw-binary state (common in commercial plugins) previously failed
+  `save_state` outright; and the XML re-serialization round-trip was lossy. The bridge now round-trips the raw
+  bytes verbatim, so state save/recall works for XML-wrapped and raw-binary plugins alike. Wire field renamed
+  `xml` -> `state`.
 
 ### Tests
 
