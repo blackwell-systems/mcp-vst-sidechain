@@ -1,0 +1,5 @@
+# Normalize line endings.
+* text=auto eol=lf
+
+# Keep GitHub's language stats representative of the two hand-written layers (Go + C++).
+*.md linguist-documentation

@@ -1,0 +1,50 @@
+name: C++ host (best-effort)
+
+# Configure and build the JUCE host. This fetches JUCE via FetchContent on a cold cache, so it is heavy: it
+# runs on demand and on pushes that touch the C++ sources, not on every commit. VST3 hosting builds on all
+# platforms; AU is macOS only. This gate is best-effort: JUCE upstream changes can break a cold configure.
+
+on:
+  push:
+    branches: [main]
+    paths: ['cpp/**', '.github/workflows/cpp.yml']
+  pull_request:
+    paths: ['cpp/**', '.github/workflows/cpp.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cpp-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux JUCE deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev libcurl4-openssl-dev \
+            libfreetype-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev libwebkit2gtk-4.1-dev libglu1-mesa-dev
+
+      - name: Cache JUCE FetchContent
+        uses: actions/cache@v4
+        with:
+          path: cpp/build/_deps
+          key: juce-${{ runner.os }}-${{ hashFiles('cpp/CMakeLists.txt') }}
+
+      - name: Configure
+        run: cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build cpp/build --target sidechain-host --config Release

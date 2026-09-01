@@ -1,0 +1,20 @@
+# Go
+/sidechain
+/cmd/sidechain/sidechain
+*.test
+*.out
+
+# C++ / CMake
+cpp/build/
+build/
+*.o
+*.a
+*.dylib
+
+# Emitted at runtime by the host (a plugin's enumerated catalog)
+plugin-catalog.json
+
+# Editor / OS
+.claude/
+.DS_Store
+INTERNAL-*.md

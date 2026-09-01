@@ -1,0 +1,31 @@
+name: Go
+
+# Build, vet, and test the Go MCP layer on every push and PR. This is the fast, always-green gate; the C++
+# host build is separate (heavy JUCE fetch) and best-effort.
+
+on:
+  push:
+    branches: [main]
+    paths: ['**.go', 'go.mod', 'go.sum', '.github/workflows/go.yml']
+  pull_request:
+    paths: ['**.go', 'go.mod', 'go.sum', '.github/workflows/go.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test -race ./...
