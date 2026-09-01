@@ -104,7 +104,17 @@ All notable changes to this project are documented here. The format is based on
 
 ### Tests
 
-- **AU load+drive smoke.** A gated `TestAULive` and a report-only integration step load an Apple built-in AU by
+- **C3 governed-state model stub + exhaustive-enumeration verification (`governed.go`, `governed_test.go`).** A
+  first, illustrative cut of the small discrete coordination state a future C3 conflict tier would govern (an
+  exclusive-edit lease, a voice-mode gate, a panic/playback latch), kept separate from the continuous plugin
+  params (which stay last-writer-wins). It is the `reduce`/`ok`/`repair` shape from `docs/CONCURRENCY.md` plus the
+  conflict tier `apply` (resolving each command as applied / compensated / rejected, with lease acquisition as a
+  guarded reject and the value/mode/gate commands compensating). Verified the way the sequencing note prescribes:
+  a DFS over (reachable states x command alphabet) asserts the invariant after every `apply` (reproducing gsm's
+  build-time "no reachable state violates an invariant" guarantee as an ordinary test), plus repair totality and
+  idempotence over a widened, deliberately malformed product space, plus targeted reject/compensate checks. Not
+  wired into the live control path: scaffolding so the model and its proof exist before the first real
+  multi-controller conflict. A gated `TestAULive` and a report-only integration step load an Apple built-in AU by
   identifier, enumerate its catalog, and drive it over the control socket (ping + get_param + set_param +
   read-back), closing the AU gap (everything prior exercised VST3 only). Report-only for now; promotable to a
   required CI step once confirmed green headlessly.
