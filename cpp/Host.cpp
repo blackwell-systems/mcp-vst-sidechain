@@ -1,4 +1,6 @@
 #include "Host.h"
+#include <functional>
+#include <unordered_map>
 
 namespace sidechain
 {
@@ -62,6 +64,26 @@ juce::String Host::enumerateCatalog() const
     // everything the bridge needs: a normalized value/default, a step count, and value<->text via the
     // plugin's own formatter. Real-unit endpoints come from getText(0/1). A stable string id comes from a
     // HostedAudioProcessorParameter when available, else the parameter index.
+    // Map each parameter to its group. VST3 "units" and AU parameter clumps surface as nested
+    // AudioProcessorParameterGroups in the plugin's parameter tree; the immediate parent's name gives an agent a
+    // handle to page a large surface (real instruments report hundreds of params). A plugin with a flat tree
+    // just leaves the group empty, which the Go side maps to "other" - no regression.
+    std::unordered_map<const juce::AudioProcessorParameter*, juce::String> groupOf;
+    {
+        std::function<void (const juce::AudioProcessorParameterGroup&)> walk =
+            [&] (const juce::AudioProcessorParameterGroup& g)
+            {
+                for (auto* node : g)
+                {
+                    if (auto* param = node->getParameter())
+                        groupOf[param] = g.getName();
+                    else if (auto* sub = node->getGroup())
+                        walk (*sub);
+                }
+            };
+        walk (plugin->getParameterTree());
+    }
+
     juce::Array<juce::var> params;
     const auto& all = plugin->getParameters();
     for (auto* p : all)
@@ -73,6 +95,11 @@ juce::String Host::enumerateCatalog() const
         if (auto* hp = dynamic_cast<juce::HostedAudioProcessorParameter*> (p))
             if (hp->getParameterID().isNotEmpty())
                 id = hp->getParameterID();
+
+        // A native RangedAudioParameter (our own plugin) owns a real<->normalized curve; a hosted VST3/AU param
+        // does not (base API only). Only continuous native params get REAL endpoints; discrete/choice/bool stay
+        // on the index representation below either way (skew is a continuous-value concern).
+        auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (p);
 
         auto* one = new juce::DynamicObject();
         one->setProperty ("id",    id);
@@ -100,22 +127,33 @@ juce::String Host::enumerateCatalog() const
             type = "int";
         }
 
-        // Endpoints. For a plain 0..1 float we report 0..1; for a discrete param we report the index range
-        // (0..steps-1). The Go side's normalize math is linear over [min,max], matching this.
+        // Endpoints. A continuous NATIVE param reports its REAL range/default through the plugin's own
+        // NormalisableRange (skew lives below the 0..1, so the Go side forwards real values and the plugin
+        // denormalises). A hosted continuous param reports 0..1 (no real scalar). A discrete param reports the
+        // index range (0..steps-1); the Go side's linear normalize matches an integer step range.
+        const bool useReal = (ranged != nullptr && type == "float");
         double lo = 0.0, hi = 1.0, step = 0.0, def = p->getDefaultValue();
-        if (type == "choice" || type == "int" || type == "bool")
+        if (useReal)
+        {
+            const auto& nr = ranged->getNormalisableRange();
+            lo = nr.start; hi = nr.end; step = nr.interval;
+            def = ranged->convertFrom0to1 (p->getDefaultValue());
+        }
+        else if (type == "choice" || type == "int" || type == "bool")
         {
             const double n = (steps > 1) ? (double) (steps - 1) : 1.0;
             lo = 0.0; hi = n; step = 1.0;
             def = juce::jlimit (0.0, n, p->getDefaultValue() * n);
         }
 
-        one->setProperty ("group",   juce::String());   // best-effort; most formats expose no category here
-        one->setProperty ("type",    type);
-        one->setProperty ("min",     lo);
-        one->setProperty ("max",     hi);
-        one->setProperty ("step",    step);
-        one->setProperty ("default", def);
+        const auto git = groupOf.find (p);
+        one->setProperty ("group",        git != groupOf.end() ? git->second : juce::String());
+        one->setProperty ("type",         type);
+        one->setProperty ("min",          lo);
+        one->setProperty ("max",          hi);
+        one->setProperty ("step",         step);
+        one->setProperty ("default",      def);
+        one->setProperty ("hasRealRange", useReal);
         if (! choices.isEmpty())
             one->setProperty ("choices", choices);
 

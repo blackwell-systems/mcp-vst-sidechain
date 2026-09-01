@@ -19,7 +19,10 @@ juce::String argValue (const juce::StringArray& args, const juce::String& flag, 
 {
     const int i = args.indexOf (flag);
     if (i >= 0 && i + 1 < args.size())
-        return args[i + 1];
+        // JUCE reconstructs the command line into one string and re-quotes any arg containing spaces, so a path
+        // like "/…/Surge XT.vst3" arrives as a single token WITH literal surrounding quotes. Strip them, or a
+        // plugin path with a space (very common) would fail to resolve.
+        return args[i + 1].unquoted();
     return def;
 }
 }

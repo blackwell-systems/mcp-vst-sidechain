@@ -14,6 +14,8 @@ import (
 	"fmt"
 	"net"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -25,9 +27,15 @@ const DefaultPort = 51703
 
 // LiveEndpoint is the transport the generic param tools drive when connected to a running instance. One impl
 // (*liveClient) speaks the ControlListener wire protocol; a host may provide its own.
+//
+// SetParam takes a value plus isReal: when isReal is true, v is a REAL-unit value (only for HasRealRange params)
+// and the endpoint forwards it as `value` so the plugin applies its own (possibly skewed) real->normalized
+// curve; when false, v is already normalized 0..1 and is forwarded as `normalized`. Keeping the two apart is
+// what preserves fidelity on skewed params: the Go layer never linearises a curve it does not own.
 type LiveEndpoint interface {
-	SetParam(id string, normalized float64) (value, applied float64, text string, err error)
+	SetParam(id string, v float64, isReal bool) (value, applied float64, text string, err error)
 	GetParam(id string) (value, normalized float64, text string, err error)
+	SampleText(id string, points []float64) ([]ValueSample, error) // Phase-1 probe: sweep value text, restore
 	PlayNote(note, chn int, vel float64) error
 	NoteOff(note, chn int) error
 	AllNotesOff() error
@@ -40,6 +48,7 @@ type LiveEndpoint interface {
 // liveClient is a thread-safe request/response wrapper over one control socket. Its own request path is
 // serialized by the caller (the session mutex), so the line-delimited protocol never interleaves.
 type liveClient struct {
+	mu    sync.Mutex // serializes the whole request/response round-trip so the line-delimited protocol never interleaves
 	conn  net.Conn
 	rd    *bufio.Reader
 	host  string
@@ -64,9 +73,15 @@ func dialLive(host string, port int) (*liveClient, error) {
 }
 
 // request sends one command and returns the decoded reply. Adds a per-request id for correlation and a
-// deadline so a wedged host can't hang a tool call forever.
+// deadline so a wedged host can't hang a tool call forever. The lc mutex serializes the full write-then-read so
+// two tool calls (e.g. a held play_note and a set_param) can never interleave bytes on the one socket.
 func (lc *liveClient) request(obj map[string]any) (map[string]any, error) {
-	if lc == nil || lc.conn == nil {
+	if lc == nil {
+		return nil, errors.New("not connected")
+	}
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	if lc.conn == nil {
 		return nil, errors.New("not connected")
 	}
 	lc.reqID++
@@ -95,8 +110,14 @@ func (lc *liveClient) request(obj map[string]any) (map[string]any, error) {
 
 // ---- LiveEndpoint impl ----
 
-func (lc *liveClient) SetParam(id string, normalized float64) (value, applied float64, text string, err error) {
-	resp, err := lc.request(map[string]any{"cmd": "set_param", "param": id, "normalized": normalized})
+func (lc *liveClient) SetParam(id string, v float64, isReal bool) (value, applied float64, text string, err error) {
+	req := map[string]any{"cmd": "set_param", "param": id}
+	if isReal {
+		req["value"] = v // real units; the listener converts via the plugin's own (skew-aware) range
+	} else {
+		req["normalized"] = v
+	}
+	resp, err := lc.request(req)
 	if err != nil {
 		return 0, 0, "", err
 	}
@@ -151,8 +172,43 @@ func (lc *liveClient) LoadState(xml string) error {
 	return err
 }
 
+// SampleText sweeps a param across the given normalized points, collecting the plugin's rendered value text at
+// each, then restores the param's original value. This is the Phase-1 probe primitive: the returned samples
+// feed inferParam to recover the param's real unit/range/curve. It perturbs the live param transiently (and via
+// the normal set path, so a DAW would see it); a production probe would snapshot/restore without notifying the
+// host. Points default to 0, .1, .25, .5, .75, .9, 1 when nil.
+func (lc *liveClient) SampleText(id string, points []float64) ([]ValueSample, error) {
+	if points == nil {
+		// 21 uniform points: dense enough for a good curve read and a close piecewise-linear seed; the exact
+		// hit comes from binary-search refinement on top of this. One-time cost per param (cached).
+		points = make([]float64, 0, 21)
+		for i := 0; i <= 20; i++ {
+			points = append(points, float64(i)/20.0)
+		}
+	}
+	_, orig, _, err := lc.GetParam(id)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ValueSample, 0, len(points))
+	for _, n := range points {
+		_, _, text, err := lc.SetParam(id, n, false)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, ValueSample{Norm: n, Text: text})
+	}
+	_, _, _, _ = lc.SetParam(id, orig, false) // best-effort restore
+	return out, nil
+}
+
 func (lc *liveClient) Close() {
-	if lc != nil && lc.conn != nil {
+	if lc == nil {
+		return
+	}
+	lc.mu.Lock()
+	defer lc.mu.Unlock()
+	if lc.conn != nil {
 		lc.conn.Close()
 		lc.conn = nil
 	}
@@ -180,6 +236,7 @@ func (s *session) handleConnectLive(ctx context.Context, _ *mcp.CallToolRequest,
 		s.live.Close()
 	}
 	s.live = lc
+	s.infer = map[string]ParamInference{} // new instance => any probed real-unit inferences are stale
 	s.mu.Unlock()
 	return textResult(fmt.Sprintf("Connected LIVE to %s:%d. set_param / get_param now drive the RUNNING instance; play_note plays it; all_notes_off panics it.", host, port)), nil, nil
 }
@@ -244,6 +301,63 @@ func (s *session) handleAllNotesOff(ctx context.Context, _ *mcp.CallToolRequest,
 	return textResult("All notes off (live panic)."), nil, nil
 }
 
+// ---- full-state verbs (opaque save / recall / reset of the whole patch) ----
+
+type loadStateIn struct {
+	State string `json:"state" jsonschema:"an opaque plugin-state blob as returned by save_state. Round-tripped verbatim through the plugin's own setStateInformation; the bridge never inspects it."`
+}
+
+// handleSaveState pulls the running plugin's ENTIRE patch as one opaque blob (the plugin's own state XML). Use
+// it to snapshot a patch you can restore later with load_state. Live only.
+func (s *session) handleSaveState(ctx context.Context, _ *mcp.CallToolRequest, _ emptyIn) (*mcp.CallToolResult, any, error) {
+	s.mu.Lock()
+	lc := s.live
+	s.mu.Unlock()
+	if lc == nil {
+		return textResult("save_state: not live. Call connect_live first."), nil, nil
+	}
+	xml, err := lc.GetFullState()
+	if err != nil {
+		return textResult("save_state failed: " + err.Error()), nil, nil
+	}
+	out := struct {
+		State string `json:"state"`
+	}{State: xml}
+	return &mcp.CallToolResult{Content: []mcp.Content{&mcp.TextContent{Text: fmt.Sprintf("Saved live state (%d bytes). Pass it back to load_state to recall this patch.", len(xml))}}}, out, nil
+}
+
+// handleLoadState pushes a WHOLE patch (a blob from save_state) into the running instance. Live only.
+func (s *session) handleLoadState(ctx context.Context, _ *mcp.CallToolRequest, in loadStateIn) (*mcp.CallToolResult, any, error) {
+	if strings.TrimSpace(in.State) == "" {
+		return textResult("load_state: provide state (a blob from save_state)."), nil, nil
+	}
+	s.mu.Lock()
+	lc := s.live
+	s.mu.Unlock()
+	if lc == nil {
+		return textResult("load_state: not live. Call connect_live first."), nil, nil
+	}
+	if err := lc.LoadState(in.State); err != nil {
+		return textResult("load_state failed: " + err.Error()), nil, nil
+	}
+	return textResult("Loaded state into the live instance (whole patch recalled)."), nil, nil
+}
+
+// handleResetInit recalls the host-supplied init/default patch on the running instance (a no-op ack if the host
+// wired no reset hook). Live only.
+func (s *session) handleResetInit(ctx context.Context, _ *mcp.CallToolRequest, _ emptyIn) (*mcp.CallToolResult, any, error) {
+	s.mu.Lock()
+	lc := s.live
+	s.mu.Unlock()
+	if lc == nil {
+		return textResult("reset_init: not live. Call connect_live first."), nil, nil
+	}
+	if err := lc.ResetInit(); err != nil {
+		return textResult("reset_init failed: " + err.Error()), nil, nil
+	}
+	return textResult("Reset the live instance to its init/default patch."), nil, nil
+}
+
 // registerLiveTools wires the live verbs. set_param/get_param forwarding is inside their handlers (they check
 // s.live), so only the live-specific verbs are registered here.
 func registerLiveTools(srv *mcp.Server, s *session) {
@@ -251,4 +365,7 @@ func registerLiveTools(srv *mcp.Server, s *session) {
 	mcp.AddTool(srv, &mcp.Tool{Name: "disconnect_live", Description: "Disconnect from the live instance."}, s.handleDisconnectLive)
 	mcp.AddTool(srv, &mcp.Tool{Name: "play_note", Description: "Play a MIDI note on the live instance (note, velocity, channel; optional holdMs to auto-release). Live only."}, s.handlePlayNote)
 	mcp.AddTool(srv, &mcp.Tool{Name: "all_notes_off", Description: "Release all notes on the live instance (panic). Live only."}, s.handleAllNotesOff)
+	mcp.AddTool(srv, &mcp.Tool{Name: "save_state", Description: "Snapshot the running plugin's ENTIRE patch as one opaque blob (the plugin's own state). Pass it back to load_state to recall the patch. Live only."}, s.handleSaveState)
+	mcp.AddTool(srv, &mcp.Tool{Name: "load_state", Description: "Recall a WHOLE patch on the running plugin from a blob returned by save_state. Live only."}, s.handleLoadState)
+	mcp.AddTool(srv, &mcp.Tool{Name: "reset_init", Description: "Reset the running plugin to its init/default patch (host-supplied). Live only."}, s.handleResetInit)
 }

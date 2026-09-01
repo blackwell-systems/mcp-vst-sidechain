@@ -12,6 +12,8 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
 	"net"
 	"strings"
 	"sync"
@@ -20,14 +22,35 @@ import (
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
+// fakeHz renders a normalized value as a linear 20..20000 Hz string, so the fake host has a param whose value
+// text carries a real unit (like a real plugin's getText) for the Phase-1 probe tests. The "expo" param id
+// renders a log-frequency 20..20000 Hz sweep instead, to exercise binary-search refinement (a linear seed is
+// far off on that curve).
+func fakeHz(norm float64) string     { return fmt.Sprintf("%.2f Hz", 20+norm*19980) }
+func fakeHzExpo(norm float64) string { return fmt.Sprintf("%.2f Hz", 20*math.Pow(1000, norm)) }
+
+func renderFor(id string, norm float64) string {
+	switch id {
+	case "expo":
+		return fakeHzExpo(norm)
+	case "cubic": // neither linear nor exp fits (real(0)=0 rules out exp) => forces binary-search refinement
+		return fmt.Sprintf("%.2f Hz", 1000*norm*norm*norm)
+	default:
+		return fakeHz(norm)
+	}
+}
+
 // fakeHost is a minimal stand-in for cpp/ControlListener: it accepts one client and answers the same commands
 // over the same line-delimited JSON protocol, backed by an in-memory normalized-value map.
 type fakeHost struct {
 	ln     net.Listener
 	mu     sync.Mutex
-	params map[string]float64 // id -> normalized
+	params map[string]float64 // id -> normalized (set_param with `normalized`)
+	reals  map[string]float64 // id -> real value (set_param with `value`; skew-aware forwards land here)
 	notes  []int              // notes turned on
 	panics int                // all_notes_off count
+	state  string             // last-saved / loaded opaque state
+	resets int                // reset_init count
 }
 
 func startFakeHost(t *testing.T) *fakeHost {
@@ -36,7 +59,7 @@ func startFakeHost(t *testing.T) *fakeHost {
 	if err != nil {
 		t.Fatalf("fake host listen: %v", err)
 	}
-	fh := &fakeHost{ln: ln, params: map[string]float64{}}
+	fh := &fakeHost{ln: ln, params: map[string]float64{}, reals: map[string]float64{}, state: "<STATE/>"}
 	go fh.serve()
 	return fh
 }
@@ -84,13 +107,26 @@ func (fh *fakeHost) dispatch(req map[string]any) map[string]any {
 		return map[string]any{"ok": true, "pong": true}
 	case "set_param":
 		id, _ := req["param"].(string)
+		if rv, ok := req["value"].(float64); ok { // real-unit forward (HasRealRange param)
+			fh.reals[id] = rv
+			return map[string]any{"ok": true, "param": id, "normalized": rv, "value": rv, "text": "ok"}
+		}
 		norm, _ := req["normalized"].(float64)
 		fh.params[id] = norm
-		return map[string]any{"ok": true, "param": id, "normalized": norm, "value": norm, "text": "ok"}
+		return map[string]any{"ok": true, "param": id, "normalized": norm, "value": norm, "text": renderFor(id, norm)}
 	case "get_param":
 		id, _ := req["param"].(string)
 		norm := fh.params[id]
-		return map[string]any{"ok": true, "param": id, "normalized": norm, "value": norm, "text": "ok"}
+		return map[string]any{"ok": true, "param": id, "normalized": norm, "value": norm, "text": renderFor(id, norm)}
+	case "get_full_state":
+		return map[string]any{"ok": true, "xml": fh.state}
+	case "load_state":
+		xml, _ := req["xml"].(string)
+		fh.state = xml
+		return map[string]any{"ok": true, "loaded": true}
+	case "reset_init":
+		fh.resets++
+		return map[string]any{"ok": true, "reset": true}
 	case "note_on":
 		n, _ := req["note"].(float64)
 		fh.notes = append(fh.notes, int(n))
@@ -201,6 +237,240 @@ func TestLiveForwarding(t *testing.T) {
 	}
 	if _, headless := s.params["cutoff"]; !headless {
 		t.Fatal("headless set_param after disconnect should mutate session params")
+	}
+}
+
+// TestLiveRealRangeForwarding proves a HasRealRange param forwards its REAL value (so the plugin applies its own
+// skew), while a plain hosted param still forwards a normalized 0..1. This is the fidelity fix: the Go layer
+// never linearises a curve it does not own.
+func TestLiveRealRangeForwarding(t *testing.T) {
+	fh := startFakeHost(t)
+	defer fh.stop()
+	cat := NewCatalog([]ParamDef{
+		{ID: "cutoff", Label: "Cutoff", Type: "float", Min: 20, Max: 20000, Default: 1000, Group: "filter", HasRealRange: true},
+		{ID: "mix", Label: "Mix", Type: "float", Min: 0, Max: 1, Default: 0.5, Group: "amp"}, // hosted: no real range
+	})
+	s := newSession(cat)
+	ctx := context.Background()
+	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: fh.port()}); err != nil {
+		t.Fatalf("connect_live: %v", err)
+	}
+
+	// Real-value set on the ranged param -> forwarded as a REAL value (not linear-normalized).
+	cutoff := 500.0
+	if _, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: "cutoff", Value: &cutoff}); err != nil {
+		t.Fatalf("set_param cutoff: %v", err)
+	}
+	fh.mu.Lock()
+	gotReal, sawReal := fh.reals["cutoff"]
+	_, sawNorm := fh.params["cutoff"]
+	fh.mu.Unlock()
+	if !sawReal || gotReal != 500 {
+		t.Fatalf("ranged param should forward real value 500, got real=%v ok=%v", gotReal, sawReal)
+	}
+	if sawNorm {
+		t.Fatal("ranged param must NOT forward a (linear) normalized value")
+	}
+
+	// A normalized set on the ranged param -> forwarded as normalized (it is already plugin-space 0..1).
+	half := 0.25
+	if _, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: "cutoff", Normalized: &half}); err != nil {
+		t.Fatalf("set_param cutoff normalized: %v", err)
+	}
+	fh.mu.Lock()
+	gotNorm := fh.params["cutoff"]
+	fh.mu.Unlock()
+	if gotNorm != 0.25 {
+		t.Fatalf("normalized set should forward 0.25 verbatim, got %v", gotNorm)
+	}
+
+	// Hosted param (no real range): a value set forwards as normalized.
+	mix := 0.8
+	if _, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: "mix", Value: &mix}); err != nil {
+		t.Fatalf("set_param mix: %v", err)
+	}
+	fh.mu.Lock()
+	_, mixReal := fh.reals["mix"]
+	mixNorm := fh.params["mix"]
+	fh.mu.Unlock()
+	if mixReal {
+		t.Fatal("hosted param must forward normalized, not a real value")
+	}
+	if mixNorm != 0.8 {
+		t.Fatalf("hosted param value 0.8 -> normalized 0.8, got %v", mixNorm)
+	}
+}
+
+// TestLiveStateVerbs exercises save_state / load_state / reset_init against the fake host.
+func TestLiveStateVerbs(t *testing.T) {
+	fh := startFakeHost(t)
+	defer fh.stop()
+	s := newLiveTestSession()
+	ctx := context.Background()
+	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: fh.port()}); err != nil {
+		t.Fatalf("connect_live: %v", err)
+	}
+
+	// save_state returns the host's opaque blob.
+	res, out, err := s.handleSaveState(ctx, nil, emptyIn{})
+	if err != nil {
+		t.Fatalf("save_state: %v", err)
+	}
+	if !strings.Contains(textOf(res), "Saved live state") {
+		t.Fatalf("save_state reply = %q", textOf(res))
+	}
+	saved, _ := out.(struct {
+		State string `json:"state"`
+	})
+	if saved.State != "<STATE/>" {
+		t.Fatalf("save_state blob = %q, want <STATE/>", saved.State)
+	}
+
+	// load_state pushes a new blob.
+	if _, _, err := s.handleLoadState(ctx, nil, loadStateIn{State: "<PATCH x=\"1\"/>"}); err != nil {
+		t.Fatalf("load_state: %v", err)
+	}
+	fh.mu.Lock()
+	gotState := fh.state
+	fh.mu.Unlock()
+	if gotState != "<PATCH x=\"1\"/>" {
+		t.Fatalf("host state = %q after load_state", gotState)
+	}
+
+	// reset_init reaches the host.
+	if _, _, err := s.handleResetInit(ctx, nil, emptyIn{}); err != nil {
+		t.Fatalf("reset_init: %v", err)
+	}
+	fh.mu.Lock()
+	resets := fh.resets
+	fh.mu.Unlock()
+	if resets != 1 {
+		t.Fatalf("reset_init count = %d, want 1", resets)
+	}
+
+	// Guard: state verbs require a live connection.
+	if _, _, err := s.handleDisconnectLive(ctx, nil, emptyIn{}); err != nil {
+		t.Fatalf("disconnect_live: %v", err)
+	}
+	if r, _, _ := s.handleSaveState(ctx, nil, emptyIn{}); !strings.Contains(textOf(r), "not live") {
+		t.Fatalf("save_state offline = %q, want not-live guard", textOf(r))
+	}
+}
+
+// TestDescribeAndSetReal exercises the wired Phase-1 path: describe_param probes the fake host's value text and
+// recovers the real unit/range/curve, then set_param real= maps a real target back to the right normalized
+// position. The fake renders a linear 20..20000 Hz surface (see fakeHz).
+func TestDescribeAndSetReal(t *testing.T) {
+	fh := startFakeHost(t)
+	defer fh.stop()
+	s := newLiveTestSession() // cutoff: min 20, max 20000, HasRealRange false (hosted-style)
+	ctx := context.Background()
+	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: fh.port()}); err != nil {
+		t.Fatalf("connect_live: %v", err)
+	}
+
+	// describe_param recovers unit + linear curve from the value-text sweep.
+	dres, dout, err := s.handleDescribeParam(ctx, nil, describeParamIn{ID: "cutoff"})
+	if err != nil {
+		t.Fatalf("describe_param: %v", err)
+	}
+	sum := strings.ToLower(textOf(dres))
+	if !strings.Contains(sum, "hz") || !strings.Contains(sum, "linear") {
+		t.Fatalf("describe summary = %q, want hz + linear", textOf(dres))
+	}
+	if d, ok := dout.(struct {
+		ID        string         `json:"id"`
+		Label     string         `json:"label"`
+		Inference ParamInference `json:"inference"`
+		Samples   []ValueSample  `json:"samples"`
+	}); !ok || d.Inference.Unit != "hz" || !approx(d.Inference.RealMax, 20000, 1) {
+		t.Fatalf("describe structured = %+v", dout)
+	}
+
+	// set_param real=1000 Hz -> normalized ~ (1000-20)/19980 = 0.04905.
+	target := 1000.0
+	sres, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: "cutoff", Real: &target})
+	if err != nil {
+		t.Fatalf("set_param real: %v", err)
+	}
+	if !strings.Contains(textOf(sres), "Hz") {
+		t.Fatalf("set real reply = %q, want a Hz readback", textOf(sres))
+	}
+	fh.mu.Lock()
+	gotNorm := fh.params["cutoff"]
+	fh.mu.Unlock()
+	if !approx(gotNorm, 0.04905, 0.005) {
+		t.Fatalf("set real landed at norm %.4f, want ~0.049", gotNorm)
+	}
+
+	// real is mutually exclusive with normalized.
+	n := 0.5
+	if r, _, _ := s.handleSetParam(ctx, nil, setParamIn{ID: "cutoff", Real: &target, Normalized: &n}); !strings.Contains(textOf(r), "mutually exclusive") {
+		t.Fatalf("real+normalized should be rejected, got %q", textOf(r))
+	}
+}
+
+// TestSetRealExponentialAnalytic: a perfect log-frequency curve gets an exp fit, so set_param real= inverts in
+// closed form (no search) and lands exact.
+func TestSetRealExponentialAnalytic(t *testing.T) {
+	fh := startFakeHost(t)
+	defer fh.stop()
+	s := newSession(NewCatalog([]ParamDef{{ID: "expo", Label: "Cutoff", Type: "float", Min: 0, Max: 1}}))
+	ctx := context.Background()
+	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: fh.port()}); err != nil {
+		t.Fatalf("connect_live: %v", err)
+	}
+	_, dout, err := s.handleDescribeParam(ctx, nil, describeParamIn{ID: "expo"})
+	if err != nil {
+		t.Fatalf("describe: %v", err)
+	}
+	d, _ := dout.(struct {
+		ID        string         `json:"id"`
+		Label     string         `json:"label"`
+		Inference ParamInference `json:"inference"`
+		Samples   []ValueSample  `json:"samples"`
+	})
+	if d.Inference.Fit == nil || d.Inference.Fit.Model != "exp" || !d.Inference.analyticReliable() {
+		t.Fatalf("expo should get a reliable exp fit, got %+v", d.Inference.Fit)
+	}
+
+	target := 1000.0
+	if _, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: "expo", Real: &target}); err != nil {
+		t.Fatalf("set real: %v", err)
+	}
+	fh.mu.Lock()
+	landedNorm := fh.params["expo"]
+	fh.mu.Unlock()
+	if landedHz := 20 * math.Pow(1000, landedNorm); math.Abs(landedHz-target) > 2 {
+		t.Fatalf("analytic exp landed at %.2f Hz (norm %.4f), want ~1000", landedHz, landedNorm)
+	}
+}
+
+// TestSetRealRefineFallback: a cubic curve fits neither model, so analyticReliable() is false and set_param
+// real= must fall back to binary-search refinement to converge.
+func TestSetRealRefineFallback(t *testing.T) {
+	fh := startFakeHost(t)
+	defer fh.stop()
+	s := newSession(NewCatalog([]ParamDef{{ID: "cubic", Label: "Weird", Type: "float", Min: 0, Max: 1}}))
+	ctx := context.Background()
+	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: fh.port()}); err != nil {
+		t.Fatalf("connect_live: %v", err)
+	}
+	if _, err := s.inference("cubic"); err != nil { // prime the cache so we can inspect the fit
+		t.Fatalf("probe cubic: %v", err)
+	}
+	if s.infer["cubic"].analyticReliable() {
+		t.Fatalf("cubic should NOT get a reliable fit, got %+v", s.infer["cubic"].Fit)
+	}
+	target := 500.0 // 1000*n^3 = 500 => n = 0.7937
+	if _, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: "cubic", Real: &target}); err != nil {
+		t.Fatalf("set real: %v", err)
+	}
+	fh.mu.Lock()
+	landedNorm := fh.params["cubic"]
+	fh.mu.Unlock()
+	if landedHz := 1000 * landedNorm * landedNorm * landedNorm; math.Abs(landedHz-target) > 5 {
+		t.Fatalf("refinement landed at %.2f Hz (norm %.4f), want ~500", landedHz, landedNorm)
 	}
 }
 

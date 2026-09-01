@@ -64,7 +64,12 @@ public:
             if (auto* hp = dynamic_cast<juce::HostedAudioProcessorParameter*> (p))
                 if (hp->getParameterID().isNotEmpty())
                     id = hp->getParameterID().toStdString();
-            byId[id] = ParamRef { i, p };
+            // A NATIVE param (our own plugin) is a RangedAudioParameter: its NormalisableRange owns the
+            // real<->normalized curve (including skew for freq/gain/time). A HOSTED VST3/AU param is not, so it
+            // has only the normalized 0..1 scalar. `useReal` (ranged AND continuous) is the flag that routes
+            // value<->norm through the plugin's own curve instead of a linear approximation.
+            auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (p);
+            byId[id] = ParamRef { i, p, ranged, ranged != nullptr && ! p->isDiscrete() };
         }
 
         status.store (Status::Listening);
@@ -91,7 +96,13 @@ public:
     std::function<void()> onResetInit;
 
 private:
-    struct ParamRef { int index = -1; juce::AudioProcessorParameter* rp = nullptr; };
+    struct ParamRef
+    {
+        int index = -1;
+        juce::AudioProcessorParameter* rp = nullptr;
+        juce::RangedAudioParameter*    ranged = nullptr;  // non-null iff the param exposes a NormalisableRange
+        bool                           useReal = false;   // ranged AND continuous: value<->norm uses the plugin's (skew-aware) curve
+    };
 
     enum class Kind : uint8_t { SetParam, NoteOn, NoteOff, AllNotesOff, ResetInit, LoadState, GetFullState };
     struct Command
@@ -237,7 +248,7 @@ private:
         return okReply (id, [&] (juce::DynamicObject& o)
         {
             o.setProperty ("param",      juce::String (pid));
-            o.setProperty ("value",      valueForCatalog (*rp, norm));
+            o.setProperty ("value",      valueForCatalog (it->second, norm));
             o.setProperty ("normalized", norm);
             o.setProperty ("text",       text);
         });
@@ -263,11 +274,16 @@ private:
         }
         else if (req.hasProperty ("value"))
         {
-            // For a base hosted parameter, `value` for a discrete param IS the index; for a float it is the
-            // normalized value (0..1). Prefer text round-trip when the plugin exposes one.
             const float v = (float) req.getProperty ("value", 0.0f);
-            norm = (steps > 1) ? juce::jlimit (0.0f, 1.0f, v / (float) (steps - 1))
-                               : juce::jlimit (0.0f, 1.0f, v);
+            if (it->second.useReal)
+                // A continuous NATIVE param: `value` is REAL units; convert through the plugin's own
+                // (possibly skewed) NormalisableRange, NOT a linear map, so 500 Hz on a log range lands right.
+                norm = juce::jlimit (0.0f, 1.0f, it->second.ranged->convertTo0to1 (v));
+            else
+                // A HOSTED param: `value` for a discrete param IS the index; for a continuous one it is already
+                // the normalized 0..1 (the base API exposes no separate real scalar).
+                norm = (steps > 1) ? juce::jlimit (0.0f, 1.0f, v / (float) (steps - 1))
+                                   : juce::jlimit (0.0f, 1.0f, v);
         }
         else
             return errorReply ("no_value", id);
@@ -283,7 +299,7 @@ private:
         {
             o.setProperty ("param",      juce::String (pid));
             o.setProperty ("normalized", applied);
-            o.setProperty ("value",      valueForCatalog (*rp, applied));
+            o.setProperty ("value",      valueForCatalog (it->second, applied));
             o.setProperty ("text",       rp->getText (applied, 256));
         });
     }
@@ -311,7 +327,7 @@ private:
             auto* rp = kv.second.rp;
             const float norm = rp->getValue();
             auto* one = new juce::DynamicObject();
-            one->setProperty ("value",      valueForCatalog (*rp, norm));
+            one->setProperty ("value",      valueForCatalog (kv.second, norm));
             one->setProperty ("normalized", norm);
             params->setProperty (juce::String (kv.first), juce::var (one));
         }
@@ -398,12 +414,15 @@ private:
         }
     }
 
-    // Map a normalized 0..1 value to the "value" the catalog uses: the discrete index (0..steps-1) for a
-    // stepped parameter, else the normalized value itself (a base hosted param has no separate real unit).
-    static double valueForCatalog (const juce::AudioProcessorParameter& p, float norm)
+    // Map a normalized 0..1 value to the "value" the catalog uses. For a continuous NATIVE (ranged) param this
+    // is the REAL value via the plugin's own (skew-aware) NormalisableRange; for a discrete param it is the
+    // index (0..steps-1); for a hosted continuous param it is the normalized value itself (no real scalar).
+    static double valueForCatalog (const ParamRef& ref, float norm)
     {
-        const int steps = p.getNumSteps();
-        if (steps > 1 && p.isDiscrete())
+        if (ref.useReal)
+            return (double) ref.ranged->convertFrom0to1 (norm);
+        const int steps = ref.rp->getNumSteps();
+        if (steps > 1 && ref.rp->isDiscrete())
             return std::round (norm * (double) (steps - 1));
         return (double) norm;
     }

@@ -48,16 +48,34 @@ Audio never crosses the process boundary. Parameter control runs at agent speed 
 so the localhost IPC carries only control messages and has zero effect on the sound. Full detail:
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+## Supported formats
+
+Sidechain hosts **VST3** (all platforms) and **AU** (macOS) instruments and effects through JUCE's standard
+`AudioPluginFormatManager`, the same hosting path a DAW uses. That is the whole format surface, by design: it
+keeps the project buildable from source with no proprietary SDK. In testing it loads a real 887-parameter VST3
+synth, enumerates the full surface, and drives it live over the control socket.
+
+**VST2 is not hosted.** The Steinberg VST2 SDK has been unlicensed since 2018 and cannot be redistributed, so
+adding it would break the "build from source, standard APIs only" guarantee. To drive a VST2-only instrument
+(e.g. Synth1), wrap it into a VST3 with an external adapter and point Sidechain at the resulting `.vst3`; the
+bridge itself never sees VST2. Wrapper fidelity varies, so treat that route as best-effort.
+
+A hosted plugin exposes its parameters as normalized 0..1 values plus the plugin's own value text
+(`hasRealRange: false`); real-unit ranges and skew live inside the plugin and surface only when Sidechain is
+embedded directly in a native JUCE plugin (`hasRealRange: true`). See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
+
 ## Tools
 
 | Tool | What it does |
 |---|---|
 | `list_params` | The plugin's automatable parameters (id/label/type/range/choices/default). GCF-encoded. |
 | `get_param` | One parameter's definition + current value (real units + normalized). |
-| `set_param` | Set one parameter by real value, normalized 0..1, or choice name. Validated + clamped. |
+| `set_param` | Set one parameter by value (real units when the param exposes a real range, else normalized 0..1), normalized 0..1, or choice name. Validated + clamped. |
 | `set_params` | Set many params in one call, from a JSON array or a token-compact GCF table. |
 | `connect_live` / `disconnect_live` | Attach to / detach from a running host so the above drive the live instance. |
 | `play_note` / `all_notes_off` | Play a MIDI note (optionally auto-released) / panic. |
+| `save_state` / `load_state` | Snapshot the whole patch as one opaque blob / recall it. Round-tripped through the plugin's own state, never inspected. |
+| `reset_init` | Reset the running plugin to its init/default patch. |
 
 ## Quickstart
 

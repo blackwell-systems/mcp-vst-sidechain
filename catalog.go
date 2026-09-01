@@ -15,19 +15,30 @@ import (
 	"strings"
 )
 
-// ParamDef is one automatable plugin parameter. Values are in REAL (denormalised) units, matching what the
-// plugin's own value-to-text formatter reports (e.g. cutoff = 1200 Hz). Group is best-effort metadata: a
-// well-behaved plugin exposes a group/category, otherwise it is left empty ("other").
+// ParamDef is one automatable plugin parameter. Whether Min/Max/Default/value are in REAL (denormalised) units
+// depends on HasRealRange:
+//
+//   - HasRealRange == true: the param is a native RangedAudioParameter (the host's own plugin, or any plugin
+//     that exposes a NormalisableRange). Min/Max/Default are REAL units (e.g. cutoff 20..20000 Hz) and the
+//     plugin owns the (possibly skewed) real<->normalized curve, so a real value round-trips exactly.
+//   - HasRealRange == false: the param is a hosted VST3/AU parameter reached through the base API, which
+//     exposes only a normalized 0..1 scalar (plus getText). Min/Max are 0..1 for a continuous param, or the
+//     0..(steps-1) index range for a discrete/choice/bool param; "value" is that normalized/index number, and
+//     the human units live only in the plugin's own text formatting.
+//
+// Group is best-effort metadata: a well-behaved plugin exposes a group/category, otherwise it is left empty
+// ("other").
 type ParamDef struct {
-	ID      string   `json:"id"`
-	Label   string   `json:"label"`
-	Group   string   `json:"group"` // best-effort category; may be "" / "other"
-	Type    string   `json:"type"`  // float/int/bool/choice
-	Min     float64  `json:"min"`
-	Max     float64  `json:"max"`
-	Step    float64  `json:"step"`
-	Default float64  `json:"default"`
-	Choices []string `json:"choices,omitempty"`
+	ID           string   `json:"id"`
+	Label        string   `json:"label"`
+	Group        string   `json:"group"` // best-effort category; may be "" / "other"
+	Type         string   `json:"type"`  // float/int/bool/choice
+	Min          float64  `json:"min"`
+	Max          float64  `json:"max"`
+	Step         float64  `json:"step"`
+	Default      float64  `json:"default"`
+	Choices      []string `json:"choices,omitempty"`
+	HasRealRange bool     `json:"hasRealRange,omitempty"` // Min/Max/Default are real units; the plugin owns the (skew-aware) curve
 }
 
 // ParamCatalog is the read side the generic tools depend on. One concrete impl (*Catalog) is provided; a host

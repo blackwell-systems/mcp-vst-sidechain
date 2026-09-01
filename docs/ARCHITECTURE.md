@@ -68,7 +68,7 @@ type ParamCatalog interface {
 }
 
 type LiveEndpoint interface {           // one impl = liveClient over the C++ listener socket
-    SetParam(id string, normalized float64) (value, applied float64, text string, err error)
+    SetParam(id string, v float64, isReal bool) (value, applied float64, text string, err error) // isReal => v is real units (hasRealRange param); else normalized 0..1
     GetParam(id string) (value, normalized float64, text string, err error)
     PlayNote(note, chn int, vel float64) error
     // ...NoteOff / AllNotesOff / ResetInit / GetFullState / LoadState / Close
