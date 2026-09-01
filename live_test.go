@@ -79,6 +79,7 @@ type fakeHost struct {
 	panics int                // all_notes_off count
 	state  string             // last-saved / loaded opaque state
 	resets int                // reset_init count
+	cmds   map[string]int     // per-command call counts (e.g. how many get_param probes the sweep issued)
 }
 
 func startFakeHost(t *testing.T) *fakeHost {
@@ -87,7 +88,7 @@ func startFakeHost(t *testing.T) *fakeHost {
 	if err != nil {
 		t.Fatalf("fake host listen: %v", err)
 	}
-	fh := &fakeHost{ln: ln, params: map[string]float64{}, reals: map[string]float64{}, state: "<STATE/>"}
+	fh := &fakeHost{ln: ln, params: map[string]float64{}, reals: map[string]float64{}, state: "<STATE/>", cmds: map[string]int{}}
 	go fh.serve()
 	return fh
 }
@@ -130,6 +131,7 @@ func (fh *fakeHost) dispatch(req map[string]any) map[string]any {
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
 	cmd, _ := req["cmd"].(string)
+	fh.cmds[cmd]++
 	switch cmd {
 	case "ping":
 		return map[string]any{"ok": true, "pong": true}
@@ -535,6 +537,47 @@ func TestSetRealRefineFallback(t *testing.T) {
 	fh.mu.Unlock()
 	if landedHz := fakeHzSigmoid(landedNorm); math.Abs(landedHz-target) > 5 {
 		t.Fatalf("refinement landed at %.2f Hz (norm %.4f), want ~500", landedHz, landedNorm)
+	}
+}
+
+// TestRealSetCachesInference proves the per-session probe cache: two real-unit sets on the SAME param probe the
+// plugin only ONCE. The value-text sweep (SampleText) opens with exactly one get_param (its "orig" read), so
+// counting get_param calls counts probes. A second set must reuse s.infer[id] and issue no further sweep.
+func TestRealSetCachesInference(t *testing.T) {
+	fh := startFakeHost(t)
+	defer fh.stop()
+	s := newLiveTestSession() // cutoff: linear 20..20000 Hz, so real= inverts analytically (no refine round-trips)
+	ctx := context.Background()
+	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: fh.port()}); err != nil {
+		t.Fatalf("connect_live: %v", err)
+	}
+
+	// First real set: probes once (one get_param opens the sweep).
+	first := 1000.0
+	if _, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: "cutoff", Real: &first}); err != nil {
+		t.Fatalf("first set real: %v", err)
+	}
+	fh.mu.Lock()
+	afterFirst := fh.cmds["get_param"]
+	fh.mu.Unlock()
+	if afterFirst != 1 {
+		t.Fatalf("first real set should probe exactly once (1 get_param), saw %d", afterFirst)
+	}
+
+	// Second real set on the SAME param: must reuse the cached inference, no new sweep.
+	second := 5000.0
+	if _, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: "cutoff", Real: &second}); err != nil {
+		t.Fatalf("second set real: %v", err)
+	}
+	// A batch set on the same param, too: still no re-probe.
+	if _, _, err := s.handleSetParams(ctx, nil, setParamsIn{Params: []setParamsRow{{ID: "cutoff", Real: ptrF(8000)}}}); err != nil {
+		t.Fatalf("batch set real: %v", err)
+	}
+	fh.mu.Lock()
+	afterSecond := fh.cmds["get_param"]
+	fh.mu.Unlock()
+	if afterSecond != 1 {
+		t.Fatalf("repeated real sets re-probed: get_param count went %d -> %d, want it to stay 1", afterFirst, afterSecond)
 	}
 }
 
