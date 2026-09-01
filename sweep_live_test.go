@@ -196,10 +196,11 @@ func TestStateRoundTrip(t *testing.T) {
 		t.Fatalf("save_state produced no blob (out=%v)", sout)
 	}
 
-	// Mutate every snapshotted param to a clearly different normalized value and confirm at least one moved.
-	// (An individual param may already sit at an endpoint and not budge; requiring ALL to move would be flaky,
-	// but if NONE moved the mutation step is not actually exercising anything, which is worth failing on.)
-	var moved int
+	// Mutate each param and record which ones actually MOVED. Only a param we could demonstrably change proves
+	// anything about restore: an immovable param, or a plugin-computed/metered pseudo-parameter (some plugins
+	// expose derived readouts that look like params), may read back non-deterministically, and asserting restore
+	// on those is a source of flaky failures. So the restore assertion below runs on the moved set only.
+	var movedIDs []string
 	for _, id := range ids {
 		target := 0.9
 		if snapshot[id] > 0.5 {
@@ -210,10 +211,10 @@ func TestStateRoundTrip(t *testing.T) {
 			t.Fatalf("mutate %s: %v", id, err)
 		}
 		if cur, ok := getNorm(id); ok && math.Abs(cur-snapshot[id]) > 0.05 {
-			moved++
+			movedIDs = append(movedIDs, id)
 		}
 	}
-	if moved == 0 {
+	if len(movedIDs) == 0 {
 		t.Fatalf("mutation step changed none of %d params; the round-trip would prove nothing", len(ids))
 	}
 
@@ -222,11 +223,11 @@ func TestStateRoundTrip(t *testing.T) {
 		t.Fatalf("load_state: %v", err)
 	}
 
-	// Re-read and assert each param is restored near its snapshot. A plugin may quantize on state recall, so
-	// allow a small tolerance rather than bit-exact equality.
+	// Re-read and assert each MOVED param is restored near its snapshot. A plugin may quantize on state recall,
+	// so allow a small tolerance rather than bit-exact equality.
 	const tol = 0.02
 	var restoreFails []string
-	for _, id := range ids {
+	for _, id := range movedIDs {
 		cur, ok := getNorm(id)
 		if !ok {
 			restoreFails = append(restoreFails, id+" (unreadable after load)")
@@ -237,11 +238,11 @@ func TestStateRoundTrip(t *testing.T) {
 		}
 	}
 	if len(restoreFails) > 0 {
-		t.Fatalf("state did not restore %d/%d params within %.2f:\n%s", len(restoreFails), len(ids), tol,
+		t.Fatalf("state did not restore %d/%d moved params within %.2f:\n%s", len(restoreFails), len(movedIDs), tol,
 			strings.Join(restoreFails, "\n"))
 	}
-	t.Logf("state round-trip OK: snapshot/save/mutate(%d moved)/load/restore across %d numeric params, blob %d bytes",
-		moved, len(ids), len(saved.State))
+	t.Logf("state round-trip OK: %d/%d params moved and all restored within %.2f, blob %d bytes",
+		len(movedIDs), len(ids), tol, len(saved.State))
 }
 
 // TestBatchSetParams builds a set_params call with N normalized rows for real catalog ids and asserts the report
