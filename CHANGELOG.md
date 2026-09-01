@@ -47,6 +47,14 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **Multi-controller host (concurrency C1).** The C++ `ControlListener` now serves MANY connections at once
+  instead of one client at a time. Each connection runs on its own handler thread and gets a `clientID` at the
+  ping handshake; commands flow through a mutex-guarded multi-producer queue drained by the single message thread
+  (still the only applier of every mutation, so the audio path and correctness are unchanged); and each request
+  carries its own completion object, replacing the single shared applied-event and scratch slots that assumed one
+  client. Multiple agents can now drive one plugin instance concurrently. Validated by the gated
+  `TestMultiClientLive` (distinct identities, concurrent independent control, a state read during a 300-set
+  hammer, clean per-connection disconnect). See `docs/CONCURRENCY.md`.
 - **`LiveEndpoint` interface:** `SetParam(id, v, isReal)` distinguishes a real-unit value from a normalized one;
   added `SampleText` (the value-text probe primitive).
 - **Denser default probe:** the value-text sweep uses 21 uniform points for a better curve read and seed.

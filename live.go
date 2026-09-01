@@ -48,12 +48,13 @@ type LiveEndpoint interface {
 // liveClient is a thread-safe request/response wrapper over one control socket. Its own request path is
 // serialized by the caller (the session mutex), so the line-delimited protocol never interleaves.
 type liveClient struct {
-	mu    sync.Mutex // serializes the whole request/response round-trip so the line-delimited protocol never interleaves
-	conn  net.Conn
-	rd    *bufio.Reader
-	host  string
-	port  int
-	reqID int
+	mu       sync.Mutex // serializes the whole request/response round-trip so the line-delimited protocol never interleaves
+	conn     net.Conn
+	rd       *bufio.Reader
+	host     string
+	port     int
+	reqID    int
+	clientID int // controller identity assigned by the host at the ping handshake (the host serves many clients)
 }
 
 // dialLive connects to the ControlListener and handshakes with a ping. Bound to the caller-supplied host
@@ -65,9 +66,13 @@ func dialLive(host string, port int) (*liveClient, error) {
 		return nil, err
 	}
 	lc := &liveClient{conn: conn, rd: bufio.NewReader(conn), host: host, port: port}
-	if _, err := lc.request(map[string]any{"cmd": "ping"}); err != nil {
+	pong, err := lc.request(map[string]any{"cmd": "ping"})
+	if err != nil {
 		conn.Close()
 		return nil, fmt.Errorf("handshake failed: %w", err)
+	}
+	if cid, ok := pong["client"].(float64); ok { // the host assigns each connection a distinct controller id
+		lc.clientID = int(cid)
 	}
 	return lc, nil
 }

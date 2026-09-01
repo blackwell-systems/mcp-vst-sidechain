@@ -87,11 +87,12 @@ Every change must preserve all of these:
 
 The invariants hold at every step; capability grows.
 
-- **C0 (today):** single controller. The message thread is already the single applier; the queue is SPSC. This
-  document defines the target so nothing regresses.
-- **C1: many connections.** Per-connection handlers, a client registry, the MPSC command queue, `clientID` in the
-  handshake. Multiple controllers can drive one instance; visibility is still poll-based (re-read to observe
-  others).
+- **C0:** single controller (the original design). Done.
+- **C1: many connections. DONE.** The host accepts many connections, each on its own handler thread; commands go
+  through a mutex-guarded MPSC queue drained by the single message thread; each request carries its own
+  Completion (replacing the one shared applied-event and single scratch slots that assumed one client); and each
+  connection gets a `clientID` at the ping handshake. Multiple controllers drive one instance concurrently;
+  visibility is still poll-based (re-read to observe others). Covered by the gated `TestMultiClientLive`.
 - **C2: change notifications.** Host listens for parameter changes and pushes `param_changed` events; the wire
   protocol becomes multiplexed async; the Go client gains its reader/dispatcher. Full cross-controller visibility.
 - **C3: refinements.** Echo suppression tuning, optional per-parameter ownership/leases, richer events (state
