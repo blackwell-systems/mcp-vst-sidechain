@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"sync"
 	"testing"
+	"time"
 )
 
 func TestMultiClientLive(t *testing.T) {
@@ -116,4 +117,106 @@ func TestMultiClientLive(t *testing.T) {
 		t.Fatalf("B failed after A disconnected: %v", err)
 	}
 	t.Logf("multi-controller OK: distinct ids, independent control, 300 concurrent sets, 20/20 state reads, clean disconnect")
+}
+
+// TestChangeNotifications is the C2 concurrency test level (docs/CONCURRENCY.md): a change by one controller
+// becomes visible to another as a pushed param_changed event. Controller A sets a param; controller B, which
+// issued no request, must receive an event on its Events() channel carrying the param, the new value/text, and
+// the originator's clientID (attribution). This exercises the multiplexed async protocol end to end: the host's
+// AudioProcessorParameter::Listener broadcast, the per-connection outbound queue, and B's reader/demux routing
+// the unsolicited message to Events() rather than a reply. Gated on the sweep env; skipped otherwise.
+func TestChangeNotifications(t *testing.T) {
+	portStr := os.Getenv("SIDECHAIN_SWEEP_PORT")
+	catPath := os.Getenv("SIDECHAIN_SWEEP_CATALOG")
+	if portStr == "" || catPath == "" {
+		t.Skip("set SIDECHAIN_SWEEP_PORT + SIDECHAIN_SWEEP_CATALOG to run the change-notification test")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("bad port: %v", err)
+	}
+	data, err := os.ReadFile(catPath)
+	if err != nil {
+		t.Fatalf("read catalog: %v", err)
+	}
+	cat, err := loadCatalogJSON(data)
+	if err != nil {
+		t.Fatalf("load catalog: %v", err)
+	}
+	var target string
+	for _, p := range cat.All() {
+		if p.Type == "float" {
+			target = p.ID
+			break
+		}
+	}
+	if target == "" {
+		t.Skip("need at least one float param for the change-notification test")
+	}
+
+	dial := func() *liveClient {
+		lc, err := dialLive("127.0.0.1", port)
+		if err != nil {
+			t.Fatalf("dial: %v", err)
+		}
+		return lc
+	}
+
+	// A drives, B watches. B issues no request; it must still learn of A's change.
+	a, b := dial(), dial()
+	defer a.Close()
+	defer b.Close()
+	if a.clientID == 0 || b.clientID == 0 || a.clientID == b.clientID {
+		t.Fatalf("expected two distinct nonzero client ids, got A=%d B=%d", a.clientID, b.clientID)
+	}
+
+	// Move the param to a fresh value (avoid a no-op set that emits no change). Read first, then pick a target
+	// that differs.
+	_, cur, _, _ := a.GetParam(target)
+	want := 0.65
+	if cur > 0.55 && cur < 0.75 {
+		want = 0.20
+	}
+
+	// Drain any events queued on B before we act (e.g. from an earlier test on a shared host).
+	for drained := true; drained; {
+		select {
+		case <-b.Events():
+		default:
+			drained = false
+		}
+	}
+
+	if _, _, _, err := a.SetParam(target, want, false); err != nil {
+		t.Fatalf("A set: %v", err)
+	}
+
+	// B must receive a param_changed event attributed to A, for the param A moved, within a short window.
+	deadline := time.After(3 * time.Second)
+	for {
+		select {
+		case ev := <-b.Events():
+			if ev["event"] != "param_changed" {
+				continue
+			}
+			if p, _ := ev["param"].(string); p != target {
+				continue // an unrelated param (e.g. a plugin that ganged a change); keep waiting for ours
+			}
+			by, _ := ev["by"].(float64)
+			if int(by) != a.clientID {
+				t.Fatalf("event attribution wrong: by=%d, want A=%d", int(by), a.clientID)
+			}
+			norm, _ := ev["normalized"].(float64)
+			if norm < want-0.05 || norm > want+0.05 {
+				t.Fatalf("event normalized=%.3f, want ~%.3f", norm, want)
+			}
+			if _, ok := ev["text"].(string); !ok {
+				t.Fatalf("event missing value text: %v", ev)
+			}
+			t.Logf("change-notification OK: B(%d) saw param_changed{param:%s, normalized:%.3f, by:%d}", b.clientID, target, norm, int(by))
+			return
+		case <-deadline:
+			t.Fatalf("B did not receive a param_changed event for %s within the window", target)
+		}
+	}
 }

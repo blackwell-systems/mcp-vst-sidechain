@@ -19,22 +19,26 @@
 // Point it at a processor (your own plugin, or a child plugin instance loaded via
 // juce::AudioPluginFormatManager - see Host.h) and external agents can drive it in real time over a
 // localhost socket: move any parameter, play notes, ask for a parameter's current value, and get/set the
-// opaque full-state blob. The Go MCP server (this repo) is a thin forwarder that speaks the wire protocol
-// below 1:1.
+// opaque full-state blob. The Go MCP server (this repo) is a thin forwarder that speaks the wire protocol below.
 //
 // THREAD MODEL (the load-bearing safety rules; see docs/CONCURRENCY.md):
 //   • The AUDIO thread is untouched: this class never blocks or allocates on it. Reads are parameter atomics.
-//   • MANY SOCKET threads (one per connected controller) parse JSON. For a READ they snapshot the parameter's
-//     atomic and reply directly (safe from any thread). For a MUTATION they push a Command carrying a per-request
-//     Completion into an MPSC queue and fire an AsyncUpdate, then wait (bounded) on their OWN Completion.
-//   • The MESSAGE THREAD is the SINGLE applier: it drains the queue (this : juce::AsyncUpdater) and applies each
-//     Command via setValueNotifyingHost / keyboardState / setStateInformation, then signals that command's
-//     Completion. Every mutation serializes here regardless of how many controllers enqueued.
-//   The queue lock lives on the control path (tens of ms), never the audio thread, so it is free to be a lock.
+//   • MANY SOCKET threads (one per connected controller) parse JSON. A READ snapshots the parameter atomic and
+//     replies directly. A MUTATION pushes a Command carrying a per-request Completion into an MPSC queue and
+//     fires an AsyncUpdate, then waits (bounded) on its OWN Completion. Each connection also has an OUTBOUND
+//     queue; its handler is the SINGLE writer to that socket (replies + broadcast events), so writes never race.
+//   • The MESSAGE THREAD is the SINGLE applier: it drains the command queue and applies each Command, then
+//     signals that command's Completion. Every mutation serializes here (this is the conflict tier: last-writer-
+//     wins by message-thread order; a governed-convergence engine (gsm) can slot in here at C3).
+//   • CHANGE EVENTS: this registers as an AudioProcessorParameter::Listener. When any parameter changes (by any
+//     controller, the plugin's own editor, or host automation) it BROADCASTS a `param_changed` event to every
+//     connection. The listener callback may fire on any thread, so it only broadcasts directly when on the
+//     message thread; otherwise it marks the param dirty and defers to the drain, keeping the audio path lock-free.
 //
-// TRANSPORT - localhost TCP, line-delimited JSON, request/response. Bound to 127.0.0.1 ONLY (never a routable
-// interface). MULTIPLE clients may connect at once; each gets a clientID at the ping handshake. Commands mirror
-// the MCP tools 1:1:
+// TRANSPORT - localhost TCP, line-delimited JSON. Bound to 127.0.0.1 ONLY. MANY clients may connect at once; each
+// gets a clientID at the ping handshake. Requests mirror the MCP tools 1:1; the server also PUSHES unsolicited
+// `param_changed` events, so the protocol is multiplexed async (a reply carries the request `id`; an event carries
+// an `event` field). Requests:
 //   ping · get_param{param} · set_param{param,(value|normalized|choice)} · note_on{chan,note,vel} ·
 //   note_off{chan,note} · all_notes_off · reset_init · load_state{state} · get_full_state · get_state.
 //   (load_state/get_full_state carry `state`: base64 of the plugin's own opaque getStateInformation bytes.)
@@ -44,7 +48,8 @@ namespace sidechain
 {
 
 class ControlListener : private juce::Thread,
-                        private juce::AsyncUpdater
+                        private juce::AsyncUpdater,
+                        private juce::AudioProcessorParameter::Listener
 {
 public:
     // Session status. Ordered idle < listening < connected (connected = at least one controller attached).
@@ -52,18 +57,15 @@ public:
 
     static constexpr int kDefaultPort = 51703;   // 127.0.0.1:51703 (the Go server's connect_live default)
 
-    // `proc` and `kbd` are JUCE base types, so this header has NO dependency on any concrete processor type
-    // (avoids a circular include and keeps it a drop-in for a hosted child plugin). The listener walks
-    // proc.getParameters() to resolve param ids.
+    // `proc` and `kbd` are JUCE base types, so this header has NO dependency on any concrete processor type.
     ControlListener (juce::AudioProcessor& proc, juce::MidiKeyboardState& kbd, int port = kDefaultPort)
         : juce::Thread ("sidechain-control"), processor (proc), keyboardState (kbd), listenPort (port)
     {
-        // Build the id → param map ONCE (at construction) on the BASE AudioProcessorParameter API. A HOSTED
-        // VST3/AU exposes parameters as juce::HostedAudioProcessorParameter (NOT RangedAudioParameter), so a
-        // RangedAudioParameter cast would drop every hosted param; the base API works for both our own params
-        // and hosted ones. The stable string id comes from a HostedAudioProcessorParameter when available,
-        // else the parameter index (matches Host::enumerateCatalog).
+        // Build the id → param map ONCE on the BASE AudioProcessorParameter API (a hosted VST3/AU exposes
+        // HostedAudioProcessorParameter, not RangedAudioParameter). Also build an index → ParamRef view for the
+        // change-event path, and register as a per-parameter listener so we hear ALL changes.
         const auto& params = processor.getParameters();
+        byIndex.assign ((size_t) params.size(), nullptr);
         for (int i = 0; i < params.size(); ++i)
         {
             auto* p = params[i];
@@ -71,13 +73,13 @@ public:
             if (auto* hp = dynamic_cast<juce::HostedAudioProcessorParameter*> (p))
                 if (hp->getParameterID().isNotEmpty())
                     id = hp->getParameterID().toStdString();
-            // A NATIVE param (our own plugin) is a RangedAudioParameter: its NormalisableRange owns the
-            // real<->normalized curve (including skew for freq/gain/time). A HOSTED VST3/AU param is not, so it
-            // has only the normalized 0..1 scalar. `useReal` (ranged AND continuous) is the flag that routes
-            // value<->norm through the plugin's own curve instead of a linear approximation.
             auto* ranged = dynamic_cast<juce::RangedAudioParameter*> (p);
-            byId[id] = ParamRef { i, p, ranged, ranged != nullptr && ! p->isDiscrete() };
+            byId[id] = ParamRef { i, p, ranged, ranged != nullptr && ! p->isDiscrete(), id };
+            byIndex[(size_t) i] = &byId[id];   // node-based map => pointer stays valid as more are inserted
         }
+        dirtyCount = params.size();
+        dirty = std::make_unique<std::atomic<bool>[]> ((size_t) juce::jmax (1, dirtyCount));
+        for (auto* p : params) p->addListener (this);
 
         status.store (Status::Listening);
         startThread (juce::Thread::Priority::normal);
@@ -85,17 +87,16 @@ public:
 
     ~ControlListener() override
     {
+        for (auto* p : processor.getParameters()) p->removeListener (this);   // stop callbacks first
         signalThreadShouldExit();
         listener.close();     // unblocks waitForNextConnection() so no new clients are accepted
         {
-            // Close every live connection to unblock its handler's blocked read.
             std::lock_guard<std::mutex> lk (clientsMutex);
-            for (auto& c : clients) c.socket->close();
+            for (auto& c : clients) c.socket->close();   // unblock each handler's blocked read
         }
         stopThread (2000);    // join the accept thread
         cancelPendingUpdate();
-        // The handler threads are detached; wait (bounded) for them to finish so none touches *this afterwards.
-        for (int i = 0; i < 300 && liveHandlers.load() > 0; ++i)
+        for (int i = 0; i < 300 && liveHandlers.load() > 0; ++i)   // wait (bounded) for detached handlers
             juce::Thread::sleep (10);
         status.store (Status::Idle);
     }
@@ -103,10 +104,8 @@ public:
     Status getStatus() const noexcept { return status.load(); }
     int     getPort()   const noexcept { return listenPort; }
 
-    // Optional message-thread action for the "reset_init" command (recall an init/default patch). A host may
-    // wire this to its own reset logic; it runs on the message-thread drain, so it is safe to touch parameter
-    // state and editor-owned data. Null ⇒ the command is a no-op ack. Kept as a callback so this header stays
-    // free of any concrete processor dependency.
+    // Optional message-thread action for "reset_init". Null ⇒ a no-op ack. Kept as a callback so this header
+    // stays free of any concrete processor dependency.
     std::function<void()> onResetInit;
 
 private:
@@ -115,36 +114,59 @@ private:
         int index = -1;
         juce::AudioProcessorParameter* rp = nullptr;
         juce::RangedAudioParameter*    ranged = nullptr;  // non-null iff the param exposes a NormalisableRange
-        bool                           useReal = false;   // ranged AND continuous: value<->norm uses the plugin's (skew-aware) curve
+        bool                           useReal = false;   // ranged AND continuous: value<->norm uses the plugin's curve
+        std::string                    id;                // the stable string id (for change events)
     };
 
-    // Per-request completion. Heap-allocated and shared between the requesting socket handler and the message
-    // thread, so a bounded timeout on the handler can never free it out from under a late apply. The handler only
-    // reads the result fields AFTER event.wait() returns true (the signal provides the happens-before).
+    // Per-request completion. Heap-allocated and shared between the requesting handler and the message thread, so
+    // a bounded timeout can never free it under a late apply. Result fields read only AFTER event.wait() is true.
     struct Completion
     {
         juce::WaitableEvent event;       // auto-reset; a single waiter (the requesting handler)
-        bool        loadOk  = false;     // LoadState: applied ok
-        bool        stateOk = false;     // GetFullState: getStateInformation ran
-        std::string state;               // GetFullState: base64 snapshot
+        bool        loadOk  = false;
+        bool        stateOk = false;
+        std::string state;
     };
 
     enum class Kind : uint8_t { SetParam, NoteOn, NoteOff, AllNotesOff, ResetInit, LoadState, GetFullState };
     struct Command
     {
         Kind  kind = Kind::SetParam;
-        int   a = 0;        // SetParam: param index · NoteOn/Off: channel
-        int   b = 0;        // NoteOn/Off: note number
-        float f = 0.0f;     // SetParam: normalized value · NoteOn: velocity (0..1)
+        int   a = 0;
+        int   b = 0;
+        float f = 0.0f;
         std::string                 payload;    // LoadState: the base64 opaque blob
-        std::shared_ptr<Completion> done;       // null => fire-and-forget (no ack wait)
-        int   clientId = 0;                      // originating controller (attribution; used by C2 change events)
+        std::shared_ptr<Completion> done;       // null => fire-and-forget
+        int   clientId = 0;                      // originating controller (attribution for change events)
     };
+
+    // Per-connection outbound queue. The connection's handler is the ONLY writer to its socket; the broadcaster
+    // and the handler push here, the handler drains and writes. Bounded: drop oldest (events are latest-value
+    // snapshots, so dropping a stale one is fine; a reply is pushed then flushed immediately, so it is not lost).
+    struct Outbound
+    {
+        std::mutex mu;
+        std::deque<std::string> q;
+        static constexpr size_t kMax = 512;
+        void push (std::string line)
+        {
+            std::lock_guard<std::mutex> lk (mu);
+            while (q.size() >= kMax) q.pop_front();
+            q.push_back (std::move (line));
+        }
+        std::deque<std::string> drain()
+        {
+            std::deque<std::string> out;
+            std::lock_guard<std::mutex> lk (mu);
+            out.swap (q);
+            return out;
+        }
+    };
+    struct Conn { juce::StreamingSocket* socket; int id; std::shared_ptr<Outbound> out; };
 
     // -------- socket accept loop (the juce::Thread) ---------------------------------------------
     void run() override
     {
-        // Bind 127.0.0.1 ONLY. createListener with an explicit local host never exposes a routable iface.
         if (! listener.createListener (listenPort, "127.0.0.1"))
         {
             status.store (Status::Idle);
@@ -156,23 +178,22 @@ private:
         {
             std::unique_ptr<juce::StreamingSocket> conn (listener.waitForNextConnection());
             if (conn == nullptr || threadShouldExit())
-                break;   // listener closed (shutdown) or fatal error
+                break;
 
             const int cid = ++nextClientId;
+            auto out = std::make_shared<Outbound>();
             {
                 std::lock_guard<std::mutex> lk (clientsMutex);
-                clients.push_back ({ conn.get(), cid });   // raw ptr for teardown; the handler owns the socket
+                clients.push_back ({ conn.get(), cid, out });
             }
             liveHandlers.fetch_add (1);
             status.store (Status::Connected);
 
-            // One handler thread per controller. Detached, so a controller that lingers does not hold up accept;
-            // the destructor waits on liveHandlers instead of joining.
             juce::StreamingSocket* raw = conn.release();
-            std::thread ([this, raw, cid]
+            std::thread ([this, raw, cid, out]
             {
                 std::unique_ptr<juce::StreamingSocket> owned (raw);
-                serveClient (*owned, cid);
+                serveClient (*owned, cid, *out);
                 removeClient (cid);
                 liveHandlers.fetch_sub (1);
             }).detach();
@@ -189,35 +210,42 @@ private:
             status.store (Status::Listening);
     }
 
-    void serveClient (juce::StreamingSocket& conn, int clientId)
+    bool flushOutbound (juce::StreamingSocket& conn, Outbound& out)
+    {
+        for (auto& line : out.drain())
+            if (conn.write (line.data(), (int) line.size()) < 0)
+                return false;
+        return true;
+    }
+
+    void serveClient (juce::StreamingSocket& conn, int clientId, Outbound& out)
     {
         std::string inbox;
         char buf[2048];
 
         while (! threadShouldExit())
         {
-            // Wait for readability first, THEN read, so a graceful peer close (ready + 0 bytes = EOF) is
-            // distinguished from "no data yet" and the handler returns instead of spinning.
-            const int ready = conn.waitUntilReady (true, 200);
-            if (ready < 0) break;    // socket error
-            if (ready == 0) continue; // timed out with nothing to read: re-check shutdown, wait again
+            if (! flushOutbound (conn, out)) return;   // push queued events (and any pending replies)
+
+            const int ready = conn.waitUntilReady (true, 50);
+            if (ready < 0) return;    // socket error
+            if (ready == 0) continue; // timed out: loop to drain events + re-read
 
             const int got = conn.read (buf, (int) sizeof (buf), false);
-            if (got <= 0) break;     // ready but 0 bytes => peer closed (EOF); negative => error
+            if (got <= 0) return;     // ready but 0 bytes => peer closed (EOF); negative => error
 
             inbox.append (buf, (size_t) got);
+            bool haveReply = false;
             for (auto nl = inbox.find ('\n'); nl != std::string::npos; nl = inbox.find ('\n'))
             {
                 const std::string line = inbox.substr (0, nl);
                 inbox.erase (0, nl + 1);
                 if (line.find_first_not_of (" \t\r") == std::string::npos)
                     continue;
-
-                const juce::String reply = handleLine (line, clientId);
-                const juce::String out   = reply + "\n";
-                if (conn.write (out.toRawUTF8(), (int) out.getNumBytesAsUTF8()) < 0)
-                    return;
+                out.push (handleLine (line, clientId).toStdString() + "\n");
+                haveReply = true;
             }
+            if (haveReply && ! flushOutbound (conn, out)) return;   // flush replies promptly
         }
     }
 
@@ -235,7 +263,7 @@ private:
             return okReply (id, [clientId] (juce::DynamicObject& o)
             {
                 o.setProperty ("pong",   true);
-                o.setProperty ("client", clientId);   // controller identity, assigned by the host
+                o.setProperty ("client", clientId);
             });
 
         if (cmd == "get_param")
@@ -250,11 +278,11 @@ private:
         if (cmd == "all_notes_off")
         {
             Command c; c.kind = Kind::AllNotesOff; c.clientId = clientId;
-            enqueue (std::move (c));   // fire-and-forget
+            enqueue (std::move (c));
             return okReply (id, [] (juce::DynamicObject&) {});
         }
 
-        if (cmd == "reset_init")   // recall an init/default patch (host-supplied), message-thread
+        if (cmd == "reset_init")
         {
             Command c; c.kind = Kind::ResetInit; c.clientId = clientId;
             if (submit (std::move (c), 500) == nullptr)
@@ -262,29 +290,25 @@ private:
             return okReply (id, [] (juce::DynamicObject& o) { o.setProperty ("reset", true); });
         }
 
-        if (cmd == "load_state")   // push a WHOLE patch (the plugin's opaque state blob) into the live instance
+        if (cmd == "load_state")
         {
-            // `state` is base64 of the exact bytes the plugin's own getStateInformation produced. No format
-            // assumption (XML-wrapped or raw binary): the bridge round-trips opaque bytes.
             std::string blob = req.getProperty ("state", juce::var()).toString().toStdString();
             if (blob.empty())
                 return errorReply ("no_state", id);
             Command c; c.kind = Kind::LoadState; c.payload = std::move (blob); c.clientId = clientId;
-            auto done = submit (std::move (c), 2000);   // a full-state restore can be heavier than a param set
+            auto done = submit (std::move (c), 2000);
             if (done == nullptr)
                 return errorReply ("timeout", id);
             return done->loadOk ? okReply (id, [] (juce::DynamicObject& o) { o.setProperty ("loaded", true); })
                                 : errorReply ("load_failed", id);
         }
 
-        if (cmd == "get_full_state")   // pull the WHOLE live patch as the plugin's opaque state blob (base64)
+        if (cmd == "get_full_state")
         {
             Command c; c.kind = Kind::GetFullState; c.clientId = clientId;
             auto done = submit (std::move (c), 2000);
             if (done == nullptr || ! done->stateOk)
                 return errorReply ("state_unavailable", id);
-            // An empty state (a plugin with no persistent state) is a valid opaque blob; stateOk distinguishes it
-            // from a failure to run getStateInformation.
             return okReply (id, [&] (juce::DynamicObject& o) { o.setProperty ("state", juce::String (done->state)); });
         }
 
@@ -303,9 +327,6 @@ private:
 
         auto* rp = it->second.rp;
         const float norm = rp->getValue();                 // atomic; safe from any thread (normalized 0..1)
-        // A hosted parameter has no separate real-unit scalar; its authoritative human form is the text the
-        // plugin renders. `value` mirrors the discrete index (steps) or the normalized float, matching the
-        // catalog ranges Host::enumerateCatalog reports; `text` is the plugin's own formatting.
         const juce::String text = rp->getText (norm, 256);
         return okReply (id, [&] (juce::DynamicObject& o)
         {
@@ -330,7 +351,6 @@ private:
             norm = juce::jlimit (0.0f, 1.0f, (float) req.getProperty ("normalized", 0.0f));
         else if (req.hasProperty ("choice"))
         {
-            // choice index → normalized. A discrete param maps index i to i/(steps-1).
             const int idx = (int) req.getProperty ("choice", 0);
             norm = (steps > 1) ? juce::jlimit (0.0f, 1.0f, (float) idx / (float) (steps - 1)) : 0.0f;
         }
@@ -338,25 +358,19 @@ private:
         {
             const float v = (float) req.getProperty ("value", 0.0f);
             if (it->second.useReal)
-                // A continuous NATIVE param: `value` is REAL units; convert through the plugin's own
-                // (possibly skewed) NormalisableRange, NOT a linear map, so 500 Hz on a log range lands right.
                 norm = juce::jlimit (0.0f, 1.0f, it->second.ranged->convertTo0to1 (v));
             else
-                // A HOSTED param: `value` for a discrete param IS the index; for a continuous one it is already
-                // the normalized 0..1 (the base API exposes no separate real scalar).
                 norm = (steps > 1) ? juce::jlimit (0.0f, 1.0f, v / (float) (steps - 1))
                                    : juce::jlimit (0.0f, 1.0f, v);
         }
         else
             return errorReply ("no_value", id);
 
-        // Queue for the message thread and wait (bounded) on this request's own completion, so the ack means
-        // "applied" - clean request/response semantics even with other controllers driving concurrently.
         Command c; c.kind = Kind::SetParam; c.a = it->second.index; c.f = norm; c.clientId = clientId;
         if (submit (std::move (c), 250) == nullptr)
             return errorReply ("timeout", id);
 
-        const float applied = rp->getValue();   // atomic; the completion guarantees the set has applied
+        const float applied = rp->getValue();
         return okReply (id, [&] (juce::DynamicObject& o)
         {
             o.setProperty ("param",      juce::String (pid));
@@ -372,7 +386,7 @@ private:
         const int   note = juce::jlimit (0, 127, (int)   req.getProperty ("note", 60));
         const float vel  = juce::jlimit (0.0f, 1.0f, (float) req.getProperty ("vel", 0.8));
         Command c; c.kind = on ? Kind::NoteOn : Kind::NoteOff; c.a = chan; c.b = note; c.f = vel; c.clientId = clientId;
-        enqueue (std::move (c));   // fire-and-forget (best-effort under load)
+        enqueue (std::move (c));
         return okReply (id, [&] (juce::DynamicObject& o)
         {
             o.setProperty ("note", note);
@@ -380,8 +394,6 @@ private:
         });
     }
 
-    // Session snapshot: every resolved param's current value (id → normalized/value). Reads only (atomic
-    // getValue), so it is safe from a socket handler thread.
     juce::String handleGetState (const juce::var& id)
     {
         auto* params = new juce::DynamicObject();
@@ -401,22 +413,52 @@ private:
         });
     }
 
-    // -------- MPSC command queue (many socket handlers produce, the message thread is the single consumer) ----
-    // A short lock here is fine: it is the control path (tens of ms), never the audio thread.
+    // -------- change events (this : juce::AudioProcessorParameter::Listener) --------------------
+    void parameterValueChanged (int index, float newValue) override
+    {
+        // Fires for ANY change (our command, the plugin's editor, host automation) and "may be called from any
+        // thread". Never lock on a non-message thread (could be the audio thread): broadcast now only if on the
+        // message thread (with attribution); otherwise mark dirty and defer to the drain.
+        if (juce::MessageManager::existsAndIsCurrentThread())
+            broadcastParamChanged (index, newValue, applyingClientId.load());
+        else if (index >= 0 && index < dirtyCount)
+        {
+            dirty[(size_t) index].store (true, std::memory_order_release);
+            triggerAsyncUpdate();
+        }
+    }
+    void parameterGestureChanged (int, bool) override {}
+
+    void broadcastParamChanged (int index, float norm, int by)
+    {
+        if (index < 0 || index >= (int) byIndex.size() || byIndex[(size_t) index] == nullptr)
+            return;
+        const ParamRef& r = *byIndex[(size_t) index];
+        auto* o = new juce::DynamicObject();
+        o->setProperty ("event",      "param_changed");
+        o->setProperty ("param",      juce::String (r.id));
+        o->setProperty ("normalized", norm);
+        o->setProperty ("value",      valueForCatalog (r, norm));
+        o->setProperty ("text",       r.rp->getText (norm, 256));
+        o->setProperty ("by",         by);   // originating clientID when known (message-thread path), else 0
+        const std::string line = juce::JSON::toString (juce::var (o), true).toStdString() + "\n";
+        std::lock_guard<std::mutex> lk (clientsMutex);
+        for (auto& c : clients) c.out->push (line);
+    }
+
+    // -------- MPSC command queue (many socket handlers produce, the message thread applies) -----
     bool enqueue (Command&& c)
     {
         {
             std::lock_guard<std::mutex> lk (queueMutex);
             if (queue.size() >= kMaxQueue)
-                return false;   // backpressure: reject rather than grow unbounded (a wedged controller cannot pile up)
+                return false;
             queue.push_back (std::move (c));
         }
         triggerAsyncUpdate();
         return true;
     }
 
-    // Enqueue a command carrying a fresh Completion and wait (bounded) for the message thread to apply+signal it.
-    // Returns the Completion (safe to read) on success, or nullptr if the queue was full or the wait timed out.
     std::shared_ptr<Completion> submit (Command&& c, int timeoutMs)
     {
         auto done = std::make_shared<Completion>();
@@ -437,8 +479,13 @@ private:
         {
             applyCommand (c);
             if (c.done)
-                c.done->event.signal();   // wakes the requesting handler; provides happens-before for done->*
+                c.done->event.signal();
         }
+        // Broadcast parameter changes that fired OFF the message thread (deferred to keep the audio path
+        // lock-free). Attribution is unavailable off-thread, so by = 0 (external / plugin / host automation).
+        for (int i = 0; i < dirtyCount; ++i)
+            if (dirty[(size_t) i].exchange (false, std::memory_order_acq_rel))
+                broadcastParamChanged (i, byIndex[(size_t) i]->rp->getValue(), 0);
     }
 
     void applyCommand (Command& c)
@@ -447,7 +494,11 @@ private:
         {
             case Kind::SetParam:
                 if (auto* p = processor.getParameters()[c.a])
-                    p->setValueNotifyingHost (c.f);     // same path as a GUI knob / host automation
+                {
+                    applyingClientId.store (c.clientId);   // attribute the resulting change event to this controller
+                    p->setValueNotifyingHost (c.f);
+                    applyingClientId.store (0);
+                }
                 break;
             case Kind::NoteOn:      keyboardState.noteOn  (c.a, c.b, c.f); break;
             case Kind::NoteOff:     keyboardState.noteOff (c.a, c.b, c.f); break;
@@ -455,22 +506,21 @@ private:
                 for (int ch = 1; ch <= 16; ++ch) keyboardState.allNotesOff (ch);
                 break;
             case Kind::ResetInit:
-                if (onResetInit) onResetInit();   // host-supplied, on the message thread
+                if (onResetInit) onResetInit();
                 break;
             case Kind::LoadState:
-                // Base64-decode the opaque blob back to the EXACT bytes the plugin emitted, then apply it via the
-                // normal host path. No format assumption (works for XML-wrapped AND raw-binary state); byte-exact.
                 {
                     juce::MemoryOutputStream decoded;
                     if (juce::Base64::convertFromBase64 (decoded, juce::String (c.payload)) && decoded.getDataSize() > 0)
                     {
+                        applyingClientId.store (c.clientId);
                         processor.setStateInformation (decoded.getData(), (int) decoded.getDataSize());
+                        applyingClientId.store (0);
                         if (c.done) c.done->loadOk = true;
                     }
                 }
                 break;
             case Kind::GetFullState:
-                // Snapshot the live patch as the plugin's own opaque bytes and base64 them verbatim.
                 {
                     juce::MemoryBlock mb;
                     processor.getStateInformation (mb);
@@ -484,9 +534,6 @@ private:
         }
     }
 
-    // Map a normalized 0..1 value to the "value" the catalog uses. For a continuous NATIVE (ranged) param this
-    // is the REAL value via the plugin's own (skew-aware) NormalisableRange; for a discrete param it is the
-    // index (0..steps-1); for a hosted continuous param it is the normalized value itself (no real scalar).
     static double valueForCatalog (const ParamRef& ref, float norm)
     {
         if (ref.useReal)
@@ -505,7 +552,7 @@ private:
         o->setProperty ("ok", true);
         if (! id.isVoid()) o->setProperty ("id", id);
         fill (*o);
-        return juce::JSON::toString (juce::var (o), true);   // compact, one line
+        return juce::JSON::toString (juce::var (o), true);
     }
 
     static juce::String errorReply (const juce::String& err, const juce::var& id)
@@ -524,15 +571,16 @@ private:
     juce::StreamingSocket listener;
 
     std::unordered_map<std::string, ParamRef> byId;
+    std::vector<const ParamRef*>              byIndex;   // parameter index -> ParamRef (for change events)
 
-    // MPSC command queue: many socket handlers produce, the message thread is the single consumer/applier.
+    std::unique_ptr<std::atomic<bool>[]> dirty;          // per-param "changed off the message thread" flag
+    int                                  dirtyCount = 0;
+    std::atomic<int>                     applyingClientId { 0 };  // set around an apply so a synchronous change event is attributed
+
     std::mutex                queueMutex;
     std::deque<Command>       queue;
     static constexpr size_t   kMaxQueue = 4096;
 
-    // Connected controllers. Handlers own their sockets; the registry keeps a raw pointer so the destructor can
-    // close each socket to unblock a blocked read. liveHandlers lets the destructor wait for detached handlers.
-    struct Conn { juce::StreamingSocket* socket; int id; };
     std::mutex                clientsMutex;
     std::vector<Conn>         clients;
     std::atomic<int>          liveHandlers { 0 };

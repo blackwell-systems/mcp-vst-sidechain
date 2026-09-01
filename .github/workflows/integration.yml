@@ -161,10 +161,10 @@ jobs:
           SIDECHAIN_AU_PARAM="$AU_PARAM" \
             go test -run 'TestAULive' -v .
 
-      # Multi-controller concurrency (C1, docs/CONCURRENCY.md): several controllers drive ONE host at once.
-      # Report-only for now (new); promote to required after a few green runs. Drives Surge, which has plenty of
-      # float params for the two-controller independent-control check.
-      - name: Multi-controller concurrency (C1) - report-only
+      # Concurrency (docs/CONCURRENCY.md): several controllers drive ONE host at once. C1 = independent concurrent
+      # control; C2 = one controller's change is pushed to another as a param_changed event. Both run against one
+      # Surge host (plenty of float params). Report-only for now (new); promote to required after a few green runs.
+      - name: Concurrency C1 + C2 (multi-controller, change events) - report-only
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -175,7 +175,7 @@ jobs:
           for i in $(seq 1 30); do [ -s mc.json ] && break; sleep 1; done
           test -s mc.json || { echo "host did not write a catalog"; exit 1; }
           SIDECHAIN_SWEEP_PORT=52010 SIDECHAIN_SWEEP_CATALOG=mc.json \
-            go test -run 'TestMultiClientLive' -v .
+            go test -run 'TestMultiClientLive|TestChangeNotifications' -v .
 
   # ---------------------------------------------------------------------------------------------------------------
   # Linux leg. Headless JUCE VST3 hosting under xvfb-run (a plugin touches X at construction even with no editor).

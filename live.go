@@ -45,30 +45,47 @@ type LiveEndpoint interface {
 	Close()
 }
 
-// liveClient is a thread-safe request/response wrapper over one control socket. Its own request path is
-// serialized by the caller (the session mutex), so the line-delimited protocol never interleaves.
+// liveClient speaks the (now multiplexed async) control protocol over one socket. The host serves many clients
+// and PUSHES unsolicited param_changed events, so replies can no longer be read one-per-request: a background
+// reader demultiplexes the socket, routing replies to their waiting caller by request id and events to a
+// subscriber channel. Writes are serialized by writeMu; concurrent callers each wait on their own reply channel.
 type liveClient struct {
-	mu       sync.Mutex // serializes the whole request/response round-trip so the line-delimited protocol never interleaves
 	conn     net.Conn
-	rd       *bufio.Reader
 	host     string
 	port     int
-	reqID    int
-	clientID int // controller identity assigned by the host at the ping handshake (the host serves many clients)
+	clientID int // controller identity assigned by the host at the ping handshake
+
+	writeMu sync.Mutex // serialize socket writes so two requests never interleave bytes
+
+	pendMu  sync.Mutex
+	nextID  int
+	pending map[int]chan map[string]any // request id -> reply channel (the reader delivers here)
+
+	events    chan map[string]any // param_changed events (buffered; dropped if nobody drains)
+	closed    chan struct{}
+	closeOnce sync.Once
 }
 
-// dialLive connects to the ControlListener and handshakes with a ping. Bound to the caller-supplied host
-// (default 127.0.0.1); the listener only ever binds loopback, so a remote host simply fails to dial.
+// dialLive connects to the ControlListener, starts the reader, and handshakes with a ping. Bound to the
+// caller-supplied host (default 127.0.0.1); the listener only ever binds loopback, so a remote host fails to dial.
 func dialLive(host string, port int) (*liveClient, error) {
 	addr := net.JoinHostPort(host, strconv.Itoa(port))
 	conn, err := net.DialTimeout("tcp", addr, 2*time.Second)
 	if err != nil {
 		return nil, err
 	}
-	lc := &liveClient{conn: conn, rd: bufio.NewReader(conn), host: host, port: port}
+	lc := &liveClient{
+		conn:    conn,
+		host:    host,
+		port:    port,
+		pending: map[int]chan map[string]any{},
+		events:  make(chan map[string]any, 64),
+		closed:  make(chan struct{}),
+	}
+	go lc.readLoop(bufio.NewReader(conn))
 	pong, err := lc.request(map[string]any{"cmd": "ping"})
 	if err != nil {
-		conn.Close()
+		lc.Close()
 		return nil, fmt.Errorf("handshake failed: %w", err)
 	}
 	if cid, ok := pong["client"].(float64); ok { // the host assigns each connection a distinct controller id
@@ -77,41 +94,88 @@ func dialLive(host string, port int) (*liveClient, error) {
 	return lc, nil
 }
 
-// request sends one command and returns the decoded reply. Adds a per-request id for correlation and a
-// deadline so a wedged host can't hang a tool call forever. The lc mutex serializes the full write-then-read so
-// two tool calls (e.g. a held play_note and a set_param) can never interleave bytes on the one socket.
+// readLoop reads every line and demultiplexes: a message with an "event" field is a server-pushed notification
+// (delivered to the events channel, dropped if full); anything else is a reply, routed to its caller by "id".
+func (lc *liveClient) readLoop(rd *bufio.Reader) {
+	for {
+		line, err := rd.ReadBytes('\n')
+		if err != nil {
+			lc.Close() // unblocks any waiting callers via lc.closed
+			return
+		}
+		var m map[string]any
+		if json.Unmarshal(line, &m) != nil {
+			continue
+		}
+		if _, isEvent := m["event"]; isEvent {
+			select {
+			case lc.events <- m:
+			default: // no subscriber / full: drop (events are latest-value snapshots)
+			}
+			continue
+		}
+		idf, _ := m["id"].(float64)
+		lc.pendMu.Lock()
+		ch := lc.pending[int(idf)]
+		delete(lc.pending, int(idf))
+		lc.pendMu.Unlock()
+		if ch != nil {
+			ch <- m
+		}
+	}
+}
+
+// request sends one command and returns the decoded reply, correlated by id via the reader. A per-request
+// timeout keeps a wedged host from hanging a tool call forever.
 func (lc *liveClient) request(obj map[string]any) (map[string]any, error) {
-	if lc == nil {
+	if lc == nil || lc.conn == nil {
 		return nil, errors.New("not connected")
 	}
-	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	if lc.conn == nil {
-		return nil, errors.New("not connected")
-	}
-	lc.reqID++
-	obj["id"] = lc.reqID
+	lc.pendMu.Lock()
+	lc.nextID++
+	id := lc.nextID
+	ch := make(chan map[string]any, 1)
+	lc.pending[id] = ch
+	lc.pendMu.Unlock()
+	obj["id"] = id
+
 	b, err := json.Marshal(obj)
 	if err != nil {
+		lc.cancel(id)
 		return nil, err
 	}
-	lc.conn.SetDeadline(time.Now().Add(5 * time.Second))
-	if _, err := lc.conn.Write(append(b, '\n')); err != nil {
-		return nil, err
+	lc.writeMu.Lock()
+	_, werr := lc.conn.Write(append(b, '\n'))
+	lc.writeMu.Unlock()
+	if werr != nil {
+		lc.cancel(id)
+		return nil, werr
 	}
-	line, err := lc.rd.ReadBytes('\n')
-	if err != nil {
-		return nil, err
+
+	select {
+	case resp := <-ch:
+		if ok, _ := resp["ok"].(bool); !ok {
+			return resp, fmt.Errorf("host: %v", resp["error"])
+		}
+		return resp, nil
+	case <-time.After(5 * time.Second):
+		lc.cancel(id)
+		return nil, errors.New("request timed out")
+	case <-lc.closed:
+		lc.cancel(id)
+		return nil, errors.New("connection closed")
 	}
-	var resp map[string]any
-	if err := json.Unmarshal(line, &resp); err != nil {
-		return nil, fmt.Errorf("bad reply: %w", err)
-	}
-	if ok, _ := resp["ok"].(bool); !ok {
-		return resp, fmt.Errorf("host: %v", resp["error"])
-	}
-	return resp, nil
 }
+
+func (lc *liveClient) cancel(id int) {
+	lc.pendMu.Lock()
+	delete(lc.pending, id)
+	lc.pendMu.Unlock()
+}
+
+// Events returns the channel of server-pushed param_changed notifications (buffered; drop-if-full). A controller
+// can ignore events whose "by" equals its own clientID (its own echo).
+func (lc *liveClient) Events() <-chan map[string]any { return lc.events }
 
 // ---- LiveEndpoint impl ----
 
@@ -214,12 +278,12 @@ func (lc *liveClient) Close() {
 	if lc == nil {
 		return
 	}
-	lc.mu.Lock()
-	defer lc.mu.Unlock()
-	if lc.conn != nil {
-		lc.conn.Close()
-		lc.conn = nil
-	}
+	lc.closeOnce.Do(func() {
+		close(lc.closed) // wakes any waiting requests
+		if lc.conn != nil {
+			lc.conn.Close() // unblocks the reader goroutine's ReadBytes
+		}
+	})
 }
 
 // ---- live tools ----

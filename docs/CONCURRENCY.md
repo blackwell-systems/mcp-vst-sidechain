@@ -93,10 +93,27 @@ The invariants hold at every step; capability grows.
   Completion (replacing the one shared applied-event and single scratch slots that assumed one client); and each
   connection gets a `clientID` at the ping handshake. Multiple controllers drive one instance concurrently;
   visibility is still poll-based (re-read to observe others). Covered by the gated `TestMultiClientLive`.
-- **C2: change notifications.** Host listens for parameter changes and pushes `param_changed` events; the wire
-  protocol becomes multiplexed async; the Go client gains its reader/dispatcher. Full cross-controller visibility.
-- **C3: refinements.** Echo suppression tuning, optional per-parameter ownership/leases, richer events (state
-  loaded, notes), backpressure policy.
+- **C2: change notifications. DONE.** The host registers as an `AudioProcessorParameter::Listener` and pushes a
+  `{ event: "param_changed", param, normalized, value, text, by }` to every connected controller when a param
+  moves, whatever the source (another controller, the plugin's own editor, host automation). The change is
+  broadcast on the message thread when it originates there (attributed to the applying controller via `by`), and
+  deferred through an atomic dirty flag + `triggerAsyncUpdate` when it arrives off-thread, so the audio path
+  never takes the broadcast (invariant 1 preserved). The wire protocol is now multiplexed async: a reply carries
+  the request `id` (the id, formerly decorative, is now load-bearing), an event carries none. The Go `liveClient`
+  gained a background reader that demultiplexes replies (routed to the waiting caller by `id`) from events
+  (routed to `Events()`), with per-connection single-writer outbound queues on the host so a slow reader cannot
+  stall the applier (invariant 7). Covered by the gated `TestChangeNotifications` (A sets, B receives the event,
+  attributed to A). Conflict policy stays **last-writer-wins in message-thread drain order** (see below).
+- **C3: governed convergence + refinements.** Two strands. (a) **Conflict engine.** LWW is correct for
+  independent continuous params but says nothing about *coordination* state that carries invariants (a
+  mono/poly/legato mode gate, an active-voice budget, a routing enum whose combinations are constrained). That
+  small, discrete, bounded slice wants convergence-with-invariants rather than raw last-writer-wins: the planned
+  engine is [gsm](https://github.com/blackwell-systems/gsm) (Governed State Machines: compensation-based
+  convergence over discrete/bounded state, verified by exhaustive enumeration at build time, an alternative to
+  CRDT/consensus). gsm governs only that invariant-bearing coordination state, NOT the hundreds of continuous
+  params (it cannot model float), which remain LWW. The conflict tier is pluggable behind the message-thread
+  applier precisely so this can drop in without touching C1/C2. (b) **Refinements:** echo-suppression tuning,
+  optional per-parameter ownership/leases, richer events (state loaded, notes), backpressure policy.
 
 ## Testing (a first-class category)
 

@@ -55,6 +55,20 @@ All notable changes to this project are documented here. The format is based on
   client. Multiple agents can now drive one plugin instance concurrently. Validated by the gated
   `TestMultiClientLive` (distinct identities, concurrent independent control, a state read during a 300-set
   hammer, clean per-connection disconnect). See `docs/CONCURRENCY.md`.
+- **Change-notification events + multiplexed async protocol (concurrency C2).** The host now registers as an
+  `AudioProcessorParameter::Listener` and pushes a `param_changed` event (`{param, normalized, value, text, by}`)
+  to every connected controller whenever a param moves, whatever the source: another controller, the plugin's own
+  editor, or host automation. So a change by one controller becomes visible to the others without polling. The
+  broadcast runs on the message thread when the change originates there (attributed to the applying controller via
+  `by`) and is deferred through an atomic dirty flag + `triggerAsyncUpdate` when it arrives off-thread, so the
+  audio path never carries it. The wire protocol becomes multiplexed async: replies correlate to requests by `id`
+  (now load-bearing), server-pushed events arrive unsolicited, and each connection has a single-writer outbound
+  queue so a slow reader cannot stall the applier. The Go `liveClient` gained a background reader that
+  demultiplexes replies (by `id`) from events (exposed on `Events()`), replacing the old one-reply-per-request
+  read. Conflict policy remains last-writer-wins in message-thread order; `gsm` is noted as the C3
+  governed-convergence engine for the small invariant-bearing coordination state. Validated by the gated
+  `TestChangeNotifications` (controller A sets a param, controller B receives the attributed event). See
+  `docs/CONCURRENCY.md`.
 - **`LiveEndpoint` interface:** `SetParam(id, v, isReal)` distinguishes a real-unit value from a normalized one;
   added `SampleText` (the value-text probe primitive).
 - **Denser default probe:** the value-text sweep uses 21 uniform points for a better curve read and seed.
