@@ -1,7 +1,8 @@
 name: Go
 
-# Build, vet, and test the Go MCP layer on every push and PR. This is the fast, always-green gate; the C++
-# host build is separate (heavy JUCE fetch) and best-effort.
+# Build, vet, format-check, and test the Go MCP layer on every push and PR. This is the fast, always-green
+# gate; the C++ host build (cpp.yml) and the plugin integration smoke test (integration.yml) are separate and
+# heavier.
 
 on:
   push:
@@ -14,6 +15,10 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: go-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   build-test:
     runs-on: ubuntu-latest
@@ -23,9 +28,47 @@ jobs:
         with:
           go-version: 'stable'
           cache: true
+
+      - name: Format check
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "These files are not gofmt-clean (run 'gofmt -w .'):"
+            echo "$unformatted"
+            exit 1
+          fi
+
+      - name: Tidy check
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum || { echo "go.mod/go.sum not tidy; run 'go mod tidy'"; exit 1; }
+
       - name: Build
         run: go build ./...
+
       - name: Vet
         run: go vet ./...
-      - name: Test
-        run: go test -race ./...
+
+      - name: Test (race + coverage)
+        run: go test -race -coverprofile=cover.out ./...
+
+      - name: Coverage summary
+        run: |
+          echo '### Go coverage' >> "$GITHUB_STEP_SUMMARY"
+          go tool cover -func=cover.out | tail -1 >> "$GITHUB_STEP_SUMMARY"
+
+  # Report-only for now: staticcheck and govulncheck run but do not fail the workflow. Promote to a required
+  # gate once we have confirmed a clean baseline (remove continue-on-error).
+  lint:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...

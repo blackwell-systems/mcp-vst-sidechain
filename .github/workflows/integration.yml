@@ -1,0 +1,84 @@
+name: Integration (headless plugin)
+
+# End-to-end smoke test of the part unit tests cannot reach: build the C++ host, load a real open-source VST3
+# (Surge XT, pinned), enumerate its parameter catalog, and drive the control socket through the Go client.
+# macOS only (most representative host platform; AU is macOS-only). Best-effort: it depends on an external
+# download and real plugin behavior, so a red run here is a signal to investigate, not necessarily a code bug.
+
+on:
+  push:
+    branches: [main]
+    paths: ['cpp/**', '**.go', 'go.mod', 'go.sum', '.github/workflows/integration.yml']
+  pull_request:
+    paths: ['cpp/**', '**.go', 'go.mod', 'go.sum', '.github/workflows/integration.yml']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SURGE_VERSION: "1.3.4"
+
+jobs:
+  smoke:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: 'stable'
+          cache: true
+
+      - name: Cache JUCE FetchContent
+        uses: actions/cache@v4
+        with:
+          path: cpp/build/_deps
+          key: juce-macos-${{ hashFiles('cpp/CMakeLists.txt') }}
+
+      - name: Build C++ host
+        run: |
+          cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+          cmake --build cpp/build --target sidechain-host --config Release
+
+      - name: Cache Surge XT
+        id: surge-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/surge
+          key: surge-xt-${{ env.SURGE_VERSION }}
+
+      - name: Download Surge XT (pinned, official release)
+        if: steps.surge-cache.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p ~/surge
+          curl -sSL -o ~/surge/surge.zip \
+            "https://github.com/surge-synthesizer/releases-xt/releases/download/${SURGE_VERSION}/surge-xt-macos-${SURGE_VERSION}-pluginsonly.zip"
+          unzip -qo ~/surge/surge.zip -d ~/surge "Surge XT.vst3/*"
+
+      - name: Load, enumerate, and drive
+        run: |
+          set -euo pipefail
+          HOST="cpp/build/sidechain-host_artefacts/Release/sidechain-host"
+          "$HOST" --plugin "$HOME/surge/Surge XT.vst3" --catalog cat.json --port 51999 &
+          HOST_PID=$!
+          trap 'kill $HOST_PID 2>/dev/null || true' EXIT
+
+          # Wait for the host to enumerate the catalog and open the listener.
+          for i in $(seq 1 30); do [ -s cat.json ] && break; sleep 1; done
+          test -s cat.json || { echo "host did not write a catalog"; exit 1; }
+
+          COUNT=$(python3 -c "import json; print(json.load(open('cat.json'))['count'])")
+          echo "enumerated $COUNT params"
+          [ "$COUNT" -gt 100 ] || { echo "unexpectedly few params ($COUNT)"; exit 1; }
+
+          # Drive the live-control + Phase-1 inference path against the real plugin, reusing the gated tests.
+          CUTOFF=$(python3 -c "import json; d=json.load(open('cat.json')); print(next(p['id'] for p in d['params'] if p['label']=='A Filter 1 Cutoff'))")
+          SIDECHAIN_LIVE_PORT=51999 \
+          SIDECHAIN_LIVE_CATALOG=cat.json \
+          SIDECHAIN_LIVE_PARAM="$CUTOFF" \
+            go test -run 'TestWiredLive|TestInferLive' -v .
