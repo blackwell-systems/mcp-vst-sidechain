@@ -285,6 +285,52 @@ jobs:
           SIDECHAIN_LIVE_PORT=52021 SIDECHAIN_LIVE_CATALOG=brite.json SIDECHAIN_LIVE_PARAM="$CUTOFF" \
             go test -run 'TestRenderBrighter|TestTuneBrighterLive' -v .
 
+      # Modulation-aware measurement (Tier 2.5) + LFO tuning: the temporal analysis payoff on a REAL LFO. Route
+      # TAL's Lfo 1 to the filter cutoff (Amount high, Destination = the cutoff option, Waveform = sine) so the
+      # spectral centroid visibly modulates, then: TestRenderTemporalLive asserts the modulation block reports a
+      # clean periodic LFO on the centroid (regular, LFO-band rate); TestTuneModulationRateLive tunes the LFO RATE
+      # param toward a target rate (measure=modulation.centroid.rate_hz, temporal auto-enabled) and asserts it
+      # converged. This proves modulation is both measurable and tunable end to end. REQUIRED. Ids resolved by label.
+      - name: Modulation (LFO) measurement + tune loop (TAL Lfo 1) - REQUIRED
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          xvfb-run -a "$SIDECHAIN_HOST_BIN" --plugin "$HOME/plugins/TAL-NoiseMaker.vst3" --catalog mod.json --port 52022 >host-mod.log 2>&1 &
+          HP=$!
+          trap 'kill $HP 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do [ -s mod.json ] && break; sleep 1; done
+          test -s mod.json || { echo "host did not write a catalog"; cat host-mod.log; exit 1; }
+          # Route Lfo 1 -> filter cutoff and resolve the LFO rate id. Destination 0.30 selects the cutoff on
+          # TAL-NoiseMaker (it renders as the bipolar value "-0.40"); verified against the shipped plugin.
+          python3 - mod.json 52022 rate.txt <<'PY'
+          import json, socket, time, sys
+          d = json.load(open(sys.argv[1])); port = int(sys.argv[2])
+          pid = lambda lbl: next(p['id'] for p in d['params'] if p['label'] == lbl)
+          amount, dest, wave, rate = pid('Lfo 1 Amount'), pid('Lfo 1 Destination'), pid('Lfo 1 Waveform'), pid('Lfo 1 Rate')
+          s = None
+          for _ in range(30):
+              try:
+                  s = socket.create_connection(("127.0.0.1", port), 2); break
+              except OSError:
+                  time.sleep(0.5)
+          if s is None:
+              raise SystemExit("could not connect to host")
+          f = s.makefile("rwb")
+          def req(o):
+              f.write((json.dumps(o) + "\n").encode()); f.flush()
+              while True:
+                  m = json.loads(f.readline())
+                  if "event" not in m:
+                      return m
+          for p, v in [(amount, 0.95), (dest, 0.30), (wave, 0.0), (rate, 0.45)]:
+              req({"cmd": "set_param", "param": p, "normalized": v})
+          open(sys.argv[3], "w").write(str(rate))
+          PY
+          RATE=$(cat rate.txt)
+          echo "TAL Lfo 1 routed to filter; LFO rate param id = $RATE"
+          SIDECHAIN_LIVE_PORT=52022 SIDECHAIN_LIVE_CATALOG=mod.json SIDECHAIN_LIVE_PARAM="$RATE" SIDECHAIN_LIVE_LFO_TARGET=4 \
+            go test -run 'TestRenderTemporalLive|TestTuneModulationRateLive' -v .
+
       # Flat-plugin section leases (C3): TAL exposes NO parameter-tree groups, so the host derives leasable sections
       # from shared label prefixes (computeSections, a port of sections.go). This exercises that fallback end to
       # end: assert the derivation is non-empty (regression-to-empty fails here), then drive group-bound leases on

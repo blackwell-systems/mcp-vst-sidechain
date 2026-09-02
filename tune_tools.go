@@ -290,16 +290,20 @@ func (s *session) handleTuneParam(ctx context.Context, _ *mcp.CallToolRequest, i
 	return textResult(summary), out, nil
 }
 
-// formatMeasure renders a measure value with a unit hint for the human summary line (Hz for the centroid, dB for
-// levels and bands, a bare number for crest).
+// formatMeasure renders a measure value with a unit hint for the human summary line: Hz for the centroid and for
+// any modulation rate (a couple of decimals, since LFO rates are small), Hz for the centroid modulation depth, dB
+// for levels/bands and the rms modulation depth, a bare number for crest.
 func formatMeasure(measure string, v float64) string {
-	switch strings.ToLower(strings.TrimSpace(measure)) {
-	case "centroid_hz", "centroidhz", "centroid":
-		return fmt.Sprintf("%.0f Hz", v)
-	case "crest":
+	key := strings.ToLower(strings.TrimSpace(measure))
+	switch {
+	case strings.Contains(key, "rate_hz") || strings.Contains(key, "ratehz"):
+		return fmt.Sprintf("%.2f Hz", v) // LFO / modulation rate
+	case key == "centroid_hz" || key == "centroidhz" || key == "centroid" || key == "modulation.centroid.depth":
+		return fmt.Sprintf("%.0f Hz", v) // spectral centroid, or centroid modulation depth (Hz excursion)
+	case key == "crest":
 		return fmt.Sprintf("%.1f", v)
 	default:
-		return fmt.Sprintf("%.1f dB", v)
+		return fmt.Sprintf("%.1f dB", v) // peak/rms/bands, or rms modulation depth (dB excursion)
 	}
 }
 

@@ -8,6 +8,23 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Tier 2.5: modulation-aware (temporal) measurement, so the agent can hear LFOs.** The static Tier-2 measurement
+  collapses the whole render to one number per metric and is blind to anything time-varying. `render_and_measure`
+  now accepts `temporal: true` (and optional `frameMs`, default 25) and, when set, returns a `modulation` block:
+  `{frameMs, centroid:{rateHz, depth, regular, confidence}, rms:{...}, dominant}`. The host re-analyzes the SAME
+  offline render in short frames over the SUSTAIN window (skipping the attack transient and, for an instrument, the
+  post-note-off release tail, both of which otherwise swamp the LFO), builds per-frame centroid and rms envelopes,
+  and estimates each one's dominant periodicity (LFO rate) via a smoothed-envelope autocorrelation. A filter LFO
+  shows on `centroid`, a tremolo on `rms`; `dominant` names the stronger; the decision signal is `dominant` +
+  `regular` (the raw `rateHz` is best-effort). `tune_param` reads nested modulation measures
+  (`modulation.centroid.rate_hz` / `.depth`, `modulation.rms.*`) and auto-enables `temporal`, so "set the LFO to
+  6 Hz" is the same closed loop as "make it brighter." The pure envelope estimator (`analyzeEnvelope`) lives in the
+  JUCE-free `cpp/RenderAnalysis.h` and is unit-tested on synthetic envelopes. Proven end to end against
+  TAL-NoiseMaker (Lfo 1 -> filter cutoff): `TestRenderTemporalLive` reads a clean 3.6 Hz centroid LFO, and
+  `TestTuneModulationRateLive` tunes the LFO rate param 3.6 Hz -> 4.0 Hz, both REQUIRED in CI. Two refinements
+  (sustain windowing, envelope smoothing) were found by real-host validation and are documented in
+  `docs/RENDER-SCOPING.md` Tier 2.5.
+
 - **Phase 4 (increment 1): `tune_param`, the autonomous make-it-brighter loop.** With the semantic map (Phase 3)
   and ears (render + analysis), the agent can now close the loop: `tune_param` drives ONE parameter toward a goal
   (`maximize`/`minimize`/`target`) on ONE measurement (`centroid_hz`/`peak_db`/`rms_db`/`crest`/band) by rendering

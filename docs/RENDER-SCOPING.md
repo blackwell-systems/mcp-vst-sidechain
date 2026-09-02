@@ -1,8 +1,9 @@
 # Render + analysis scoping: giving the agent ears
 
-Status: IMPLEMENTED (Tier 1 render + Tier 2 static analysis). Tier 2.5 (modulation-aware / temporal measurement) and
-Tier 3 (plugin chain) are designed and deferred. Offline-renders a hosted plugin and returns objective measurements,
-so an agent can EVALUATE its own edits ("did it get brighter?") instead of tweaking blind. Peer docs:
+Status: IMPLEMENTED (Tier 1 render + Tier 2 static analysis + Tier 2.5 modulation-aware / temporal measurement).
+Tier 3 (plugin chain) is designed and deferred. Offline-renders a hosted plugin and returns objective measurements,
+so an agent can EVALUATE its own edits ("did it get brighter?", "is it wobbling at the right rate?") instead of
+tweaking blind. Peer docs:
 [ARCHITECTURE.md](ARCHITECTURE.md) (the system), [POSITIONING.md](POSITIONING.md) (why this is on our side of the
 wall a DAW server cannot reach), [PHASE3-SCOPING.md](PHASE3-SCOPING.md) (the store this measures against).
 
@@ -87,7 +88,7 @@ This covers the common intents: brighter (centroid / high band up), louder (rms/
 dead (silent), too hot (clipped). Centroid and bands use `juce::dsp::FFT`; peak/RMS/crest/silence/clip are trivial
 and live in the JUCE-free `cpp/RenderAnalysis.h` (unit-tested standalone).
 
-### Tier 2.5 (design, deferred): modulation-aware (temporal) measurement
+### Tier 2.5 (IMPLEMENTED): modulation-aware (temporal) measurement
 
 **The problem.** Tier 2 collapses the whole render to one number per metric. That is exactly right for a static
 patch, and exactly WRONG for anything time-varying: an LFO, a slow filter sweep, tremolo, auto-pan, a moving
@@ -156,6 +157,27 @@ synthetic envelopes (a 2 Hz sine envelope -> `rate_hz ~ 2`, `regular`; a ramp ->
 `!regular`). Non-goals: full modulation-matrix discovery, per-sample automation capture, and pitch tracking (a
 later `f0_hz[t]` addition for vibrato).
 
+**As-built refinements (found in real-host validation, do not regress).** Two corrections were needed once this ran
+against an actual LFO (TAL-NoiseMaker's Lfo 1 -> filter cutoff), and both matter:
+
+- **Analyze the SUSTAIN window, not the whole render.** The note's own amplitude envelope (the attack transient and,
+  for an instrument, the release decay to silence after note-off) is a huge one-shot excursion that otherwise swamps
+  the LFO: the first attempt reported centroid depth ~2600 Hz and rms depth ~120 dB with `regular=false` on a
+  routed LFO. The bridge now frames only `[attackGuard, noteOff]` for an instrument (a ~200 ms attack guard;
+  release excluded) and `[attackGuard, end]` for a pure effect (sustained excitation), falling back to the whole
+  buffer when there is too little sustain to window. After this, the same patch reads centroid depth ~1200 Hz,
+  `regular=true`, `dominant=centroid`.
+- **Smooth the envelope before autocorrelation.** Per-frame centroid jitter autocorrelated at very short lags and
+  reported a spurious near-frame-rate "LFO" (~13 Hz, `regular`) on UNMODULATED patches. A light 3-tap moving average
+  on the envelope (a real LFO sits far below the frame rate) removes the jitter; unmodulated patches now correctly
+  report `dominant=none`, `regular=false`. Depth is measured on the smoothed envelope so frame noise cannot inflate
+  it.
+
+The decision signal for a consumer is `dominant` + the per-signal `regular` flag (not the raw `rate_hz`, which is a
+best-effort estimate even when there is no real periodicity). Validated end to end: `TestRenderTemporalLive`
+(a routed LFO reads `regular` at an LFO-band rate) and `TestTuneModulationRateLive` (tune the LFO rate param toward
+a target rate: 3.6 Hz -> 4.0 Hz), both REQUIRED in CI against TAL.
+
 ### Tier 3 (deferred): a linear plugin chain
 
 Load N instances and process them in series (output of A -> input of B), measuring the final output: synth ->
@@ -214,8 +236,10 @@ auditions it, or it becomes a starting asset. Off by default.
 4. [done] Gated E2E: `TestRenderBrighter` (TAL cutoff raises centroid) + `TestRenderSmoke` wired into
    `drive_plugin.sh`.
 5. [done] Docs: folded into ARCHITECTURE (tool table + wire protocol + render section); this doc marked implemented.
-6. [deferred] Tier 2.5: modulation-aware measurement (per-frame series -> `modulation` block) so LFO rate/depth are
-   measurable and tunable; the primitive that makes time-varying intents legible to the loop.
+6. [done] Tier 2.5: modulation-aware measurement (per-frame series -> `modulation` block) so LFO rate/depth are
+   measurable and tunable; the primitive that makes time-varying intents legible to the loop. Includes the
+   sustain-window and envelope-smoothing refinements above; proven by `TestRenderTemporalLive` +
+   `TestTuneModulationRateLive` against TAL.
 7. [deferred] Tier 3: multi-instance linear chain + per-node param addressing.
 
 ## Decisions (as shipped)

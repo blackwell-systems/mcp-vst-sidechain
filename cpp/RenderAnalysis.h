@@ -127,14 +127,29 @@ inline EnvStats analyzeEnvelope (const float* env, std::size_t n, double fsEnv)
     if (env == nullptr || n < 4 || fsEnv <= 0.0)
         return result;
 
-    // Find the min/max to compute depth before any detrending.
-    float envMin = env[0], envMax = env[0];
+    // Light smoothing (3-tap centered moving average) BEFORE any statistics. Per-frame metrics (especially the
+    // FFT centroid) jitter frame-to-frame; that jitter autocorrelates at very short lags and otherwise masquerades
+    // as a fast, near-frame-rate "LFO" (a false positive at ~fsEnv/3). A real LFO sits far below the frame rate, so
+    // a mild low-pass preserves it while removing the near-Nyquist noise. Depth is measured on the smoothed signal
+    // too, so frame noise cannot inflate the reported modulation depth.
+    std::vector<float> sm (n);
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        double acc = (double) env[i];
+        int    cnt = 1;
+        if (i > 0)     { acc += (double) env[i - 1]; ++cnt; }
+        if (i + 1 < n) { acc += (double) env[i + 1]; ++cnt; }
+        sm[i] = (float) (acc / (double) cnt);
+    }
+
+    // Find the min/max to compute depth before any detrending (on the smoothed envelope).
+    float envMin = sm[0], envMax = sm[0];
     double sum = 0.0;
     for (std::size_t i = 0; i < n; ++i)
     {
-        if (env[i] < envMin) envMin = env[i];
-        if (env[i] > envMax) envMax = env[i];
-        sum += (double) env[i];
+        if (sm[i] < envMin) envMin = sm[i];
+        if (sm[i] > envMax) envMax = sm[i];
+        sum += (double) sm[i];
     }
     result.depth = (double) (envMax - envMin);
 
@@ -147,7 +162,7 @@ inline EnvStats analyzeEnvelope (const float* env, std::size_t n, double fsEnv)
     // Detrend: subtract the mean so a DC offset does not dominate the autocorrelation.
     std::vector<double> x (n);
     for (std::size_t i = 0; i < n; ++i)
-        x[i] = (double) env[i] - mean;
+        x[i] = (double) sm[i] - mean;
 
     // Lag-0 energy (the denominator for normalized autocorrelation).
     double lag0 = 0.0;

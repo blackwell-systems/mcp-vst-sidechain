@@ -251,7 +251,7 @@ bytes on the one socket. Commands mirror the MCP tools closely, so the Go server
 | `get_state` | - | `{ok, count, params}` |
 | `govern` | `{op, group?}` | `{ok, resolution, governed}` |
 | `get_governed` | - | `{ok, governed, sections}` |
-| `render` | `{note?, velocity?, channel?, gate_ms?, duration_ms?, input_kind?, input_freq?, input_level?}` (all optional) | `{ok, measurement}` |
+| `render` | `{note?, velocity?, channel?, gate_ms?, duration_ms?, input_kind?, input_freq?, input_level?, temporal?, frame_ms?}` (all optional) | `{ok, measurement}` (measurement gains a `modulation` block when `temporal`) |
 
 The server also PUSHES unsolicited events (no reply id): `{event: "param_changed", param, normalized, value, text, by}` on any parameter change, and `{event: "governed_changed", governed, resolution, by}` on a lease/generation change. `ping` additionally returns the connection's `client` id.
 
@@ -287,6 +287,17 @@ pure peak/rms/crest/silent/clipped core lives in the JUCE-free `cpp/RenderAnalys
 `centroid_hz` + three-band split are computed in the JUCE bridge. This is the feedback signal for Phase 4: an
 agent sets a param, renders, and reads back an objective measurement ("brighter" = the spectral centroid rose).
 
+**Tier 2.5 (modulation-aware / temporal).** A request may add `temporal: true` (and optional `frame_ms`, default
+25); the reply then carries a `modulation` block: `{frame_ms, centroid:{rate_hz, depth, regular, confidence},
+rms:{...}, dominant}`. The bridge re-analyzes the SAME render in short frames over the SUSTAIN window only (skip the
+attack guard; for an instrument stop at note-off so the release tail is excluded), builds the per-frame centroid and
+rms envelopes, and estimates each one's dominant periodicity (LFO rate) via a smoothed-envelope autocorrelation
+(`analyzeEnvelope` in `RenderAnalysis.h`, pure and unit-tested). This makes time-varying patches legible: a filter
+LFO shows on `centroid`, a tremolo on `rms`, `dominant` names the stronger. The decision signal is `dominant` +
+`regular`; `rate_hz` is best-effort. `tune_param` reads nested modulation measures (`modulation.centroid.rate_hz`
+etc.) and auto-enables `temporal`, so "tune the LFO to 6 Hz" is the same loop as "make it brighter." See
+`docs/RENDER-SCOPING.md` Tier 2.5.
+
 ## The MCP tool surface
 
 All tools are registered on one `*mcp.Server`. The read tools reflect the live instance when connected and the
@@ -310,7 +321,7 @@ headless session otherwise.
 | `get_leases` | The current instance/section lease holders, the leasable sections, the patch generation, and your controller id. Live only. |
 | `poll_events` | Drain the server-pushed `param_changed` / `governed_changed` events since the last poll (deduped to latest-per-param, other controllers only by default). Live only. |
 | `render_and_measure` | Offline-render the current patch (a MIDI note for anything that accepts MIDI, else a synthesized `inputKind` signal for a pure effect) and return an objective `measurement` (peak/RMS/crest dB, spectral centroid, three-band split, silent/clipped) plus a one-line human summary. The Phase-4 feedback signal: set a param, render, read back whether it got brighter/louder. Live only. |
-| `tune_param` | Drive ONE param toward a goal (`maximize`/`minimize`/`target`) on ONE `measure` (centroid_hz/peak_db/rms_db/crest/band), rendering + measuring at each step (a bounded coarse-seed + golden-section search). The agent picks the param/measure/direction from the semantic map; the tool converges it and returns the value it settled on plus the search trace. The autonomous make-it-brighter loop (Phase 4). Live only. |
+| `tune_param` | Drive ONE param toward a goal (`maximize`/`minimize`/`target`) on ONE `measure` (centroid_hz/peak_db/rms_db/crest/band, or a nested modulation measure like `modulation.centroid.rate_hz`/`.depth`), rendering + measuring at each step (a bounded coarse-seed + golden-section search; temporal auto-enabled for modulation measures). The agent picks the param/measure/direction from the semantic map; the tool converges it and returns the value it settled on plus the search trace. The autonomous make-it-brighter (and set-the-LFO-rate) loop (Phase 4). Live only. |
 
 ### The four ways to set one value
 
@@ -496,6 +507,11 @@ algorithm (`cpp/tests/section_derivation_test.cpp`) and the pure render-analysis
     `tune_param` against the fake host (whose centroid responds to the param) and assert maximize/minimize/target
     converge and the set/restore landing is correct. `TestTuneBrighterLive` (gated on `SIDECHAIN_LIVE_*`, TAL
     cutoff) is the AUTONOMOUS make-it-brighter loop: `maximize centroid_hz` starts dark and lands the cutoff bright.
+  - **Modulation-aware measurement (Tier 2.5, `render_analysis_test.cpp` for the pure envelope core;
+    `modulation_live_test.go` gated).** The C++ unit test asserts `analyzeEnvelope` on synthetic envelopes (2 Hz
+    sine -> rate ~2 + regular, ramp -> not periodic, noise -> irregular). `TestRenderTemporalLive` and
+    `TestTuneModulationRateLive` (gated, run against TAL with Lfo 1 routed to the cutoff by the CI step) prove a
+    real LFO is measured (`regular` at an LFO-band rate) and tunable (`tune_param` on the LFO rate -> a target rate).
   - **Power-fit survey (`scan_test.go`, gated on `SIDECHAIN_SCAN_*`).** Probes every param on a running host and
     flags any clean analytic power fit; a survey aid, not a CI assertion.
 - **The CI matrix.**

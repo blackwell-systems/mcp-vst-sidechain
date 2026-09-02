@@ -58,12 +58,11 @@ func renderSummary(m Measurement) string {
 			} else {
 				sig = mod.Rms
 			}
-			base += fmt.Sprintf("; LFO ~%.1f Hz on %s (depth %.0f)", sig.RateHz, mod.Dominant, sig.Depth)
+			depthUnit := "Hz"
 			if mod.Dominant == "rms" {
-				base += " dB"
-			} else {
-				base += " Hz"
+				depthUnit = "dB"
 			}
+			base += fmt.Sprintf("; LFO ~%.1f Hz on %s (depth %.0f %s)", sig.RateHz, mod.Dominant, sig.Depth, depthUnit)
 		} else {
 			base += "; no modulation detected"
 		}

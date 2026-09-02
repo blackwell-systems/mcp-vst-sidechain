@@ -289,7 +289,24 @@ public:
         // a single frame. This builds two envelope time series (centroidHz[], rmsDb[]) that then feed the
         // pure analyzeEnvelope estimator (RenderAnalysis.h) to detect LFO rate/depth/regularity.
         if (spec.temporal)
-            analyzeModulation (mono, sampleRate, spec, out);
+        {
+            // Analyze the SUSTAIN region only, not the whole render. The note's own amplitude envelope (the attack
+            // transient, and for an instrument the release decay to silence after note-off) is a large one-shot
+            // excursion that otherwise swamps the LFO and reports as huge depth with no periodicity. Skip a short
+            // attack guard at the start, and for an instrument stop at note-off (gateSample) so the release tail is
+            // excluded; for an effect the excitation is sustained the whole render, so analyze to the end.
+            const int modFrameMs  = juce::jlimit (5, 100, spec.frameMs > 0 ? spec.frameMs : 25);
+            const int modFrameLen = juce::jmax (1, (int) std::llround ((double) modFrameMs * sampleRate / 1000.0));
+            const int guard  = (int) std::llround (0.20 * sampleRate);            // 200 ms attack guard
+            int aStart = juce::jmin (guard, totalSamples / 4);
+            int aEnd   = isInstrument ? juce::jmin (gateSample, totalSamples) : totalSamples;
+            if (aEnd - aStart < 8 * modFrameLen)                                  // too little sustain to trust a window
+            {
+                aStart = 0;                                                       // fall back to the whole buffer
+                aEnd   = totalSamples;
+            }
+            analyzeModulation (mono, sampleRate, spec, aStart, aEnd, out);
+        }
 
         return out;
     }
@@ -437,7 +454,7 @@ private:
     // (Hz via a single windowed FFT). Build two envelope series; run analyzeEnvelope on each to estimate LFO
     // rate/depth. Pick the dominant signal by a normalized strength score; fill measurement.modulation.
     static void analyzeModulation (const std::vector<float>& mono, double sampleRate,
-                                   const RenderSpec& spec, Measurement& out)
+                                   const RenderSpec& spec, int windowStart, int windowEnd, Measurement& out)
     {
         // Clamp frameMs to the [5, 100] range (per the wire contract); then compute frame length in samples.
         const int frameMs  = juce::jlimit (5, 100, spec.frameMs > 0 ? spec.frameMs : 25);
@@ -446,8 +463,12 @@ private:
         // The envelope sample rate: one measurement per frame.
         const double fsEnv = sampleRate / (double) frameLen;
 
-        const int totalSamples = (int) mono.size();
-        const int numFrames    = totalSamples / frameLen;   // integer; the last partial frame is dropped
+        // Frame only the analysis WINDOW (the sustain region the caller selected), not the whole buffer.
+        const int total       = (int) mono.size();
+        const int winStart    = juce::jlimit (0, total, windowStart);
+        const int winEnd       = juce::jlimit (winStart, total, windowEnd);
+        const int windowLen    = winEnd - winStart;
+        const int numFrames    = windowLen / frameLen;   // integer; the last partial frame is dropped
 
         // Always fill the block as present=true (with potentially low confidence) so the caller can see the
         // frame parameters; we just cannot reliably estimate a rate if we have fewer than 4 frames.
@@ -478,7 +499,7 @@ private:
 
         for (int f = 0; f < numFrames; ++f)
         {
-            const int start = f * frameLen;
+            const int start = winStart + f * frameLen;
 
             // RMS of this frame (dBFS).
             double sumSq = 0.0;
