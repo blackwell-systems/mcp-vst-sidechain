@@ -53,7 +53,51 @@ type LiveEndpoint interface {
 	GetGoverned() (gov GovernedState, sections []string, err error)
 	DrainEvents() []map[string]any
 
+	// Render drives an OFFLINE render of the hosted plugin (a note through an instrument, or a test signal
+	// through an effect; the host auto-detects) and returns the objective measurement of the output. It closes
+	// the perception loop: the agent can EVALUATE an edit ("did it get brighter?") instead of tweaking blind.
+	Render(spec RenderSpec) (Measurement, error)
+
 	Close()
+}
+
+// RenderSpec is the render request the render_and_measure tool forwards over the wire. Every field is optional;
+// the host auto-detects instrument vs effect and applies its own defaults for anything left zero. Note/Velocity/
+// Channel/GateMs drive an instrument; InputKind/InputFreq/InputLevel synthesize the excitation for an effect;
+// DurationMs bounds the total render (gate + tail).
+type RenderSpec struct {
+	Note       int     // MIDI note number for an instrument (0..127); 0 leaves the host default
+	Velocity   float64 // note velocity 0..1
+	Channel    int     // MIDI channel 1..16
+	GateMs     int     // note-on..note-off gate in ms (instrument)
+	DurationMs int     // total render length in ms (gate + tail)
+	InputKind  string  // effect excitation: sine | noise | impulse | silence
+	InputFreq  float64 // sine frequency in Hz (effect, InputKind=sine)
+	InputLevel float64 // input signal level 0..1 (effect)
+}
+
+// Bands is the coarse 3-band energy split of the rendered output (dBFS): <200 Hz / 200 Hz..2 kHz / >2 kHz.
+type Bands struct {
+	LowDb  float64 `json:"lowDb"`
+	MidDb  float64 `json:"midDb"`
+	HighDb float64 `json:"highDb"`
+}
+
+// Measurement is the objective analysis of a rendered buffer (Tier 2 of docs/RENDER-SCOPING.md): level, dynamics,
+// brightness, silence, clip. Channels are mono-summed for the headline numbers. This is what an agent reasons over
+// to decide whether an edit moved the sound the intended way (centroid/highDb up = brighter, rms/peak up = louder,
+// crest up = punchier, silent = dead patch, clipped = too hot).
+type Measurement struct {
+	DurationSec float64 `json:"durationSec"`
+	SampleRate  float64 `json:"sampleRate"`
+	Channels    int     `json:"channels"`
+	PeakDb      float64 `json:"peakDb"`     // max sample, dBFS
+	RmsDb       float64 `json:"rmsDb"`      // RMS level, dBFS
+	Crest       float64 `json:"crest"`      // peak/RMS ratio, dB (transient-ness)
+	CentroidHz  float64 `json:"centroidHz"` // spectral centroid = "brightness"
+	Bands       Bands   `json:"bands"`
+	Silent      bool    `json:"silent"`  // below a small threshold (dead patch / no output)
+	Clipped     bool    `json:"clipped"` // peak >= 0 dBFS
 }
 
 // GovernedState is the C3 coordination state as seen over the wire: who holds the whole-instance edit lease, who
@@ -333,6 +377,67 @@ func (lc *liveClient) GetFullState() (string, error) {
 func (lc *liveClient) LoadState(state string) error {
 	_, err := lc.request(map[string]any{"cmd": "load_state", "state": state})
 	return err
+}
+
+// Render sends a `render` command carrying the spec and decodes the returned measurement. Only non-zero spec
+// fields are put on the wire, so the host applies its own defaults for anything the caller left unset (matching
+// the "all optional" wire contract). A failure reply surfaces as an error via request().
+func (lc *liveClient) Render(spec RenderSpec) (Measurement, error) {
+	req := map[string]any{"cmd": "render"}
+	if spec.Note != 0 {
+		req["note"] = spec.Note
+	}
+	if spec.Velocity != 0 {
+		req["velocity"] = spec.Velocity
+	}
+	if spec.Channel != 0 {
+		req["channel"] = spec.Channel
+	}
+	if spec.GateMs != 0 {
+		req["gate_ms"] = spec.GateMs
+	}
+	if spec.DurationMs != 0 {
+		req["duration_ms"] = spec.DurationMs
+	}
+	if spec.InputKind != "" {
+		req["input_kind"] = spec.InputKind
+	}
+	if spec.InputFreq != 0 {
+		req["input_freq"] = spec.InputFreq
+	}
+	if spec.InputLevel != 0 {
+		req["input_level"] = spec.InputLevel
+	}
+	resp, err := lc.request(req)
+	if err != nil {
+		return Measurement{}, err
+	}
+	m, ok := resp["measurement"].(map[string]any)
+	if !ok {
+		return Measurement{}, errors.New("render: host reply carried no measurement")
+	}
+	return parseMeasurement(m), nil
+}
+
+// parseMeasurement decodes the wire `measurement` object (JSON numbers arrive as float64) into a Measurement.
+func parseMeasurement(m map[string]any) Measurement {
+	num := func(k string) float64 { f, _ := m[k].(float64); return f }
+	meas := Measurement{
+		DurationSec: num("duration_sec"),
+		SampleRate:  num("sample_rate"),
+		Channels:    int(num("channels")),
+		PeakDb:      num("peak_db"),
+		RmsDb:       num("rms_db"),
+		Crest:       num("crest"),
+		CentroidHz:  num("centroid_hz"),
+	}
+	meas.Silent, _ = m["silent"].(bool)
+	meas.Clipped, _ = m["clipped"].(bool)
+	if b, ok := m["bands"].(map[string]any); ok {
+		bnum := func(k string) float64 { f, _ := b[k].(float64); return f }
+		meas.Bands = Bands{LowDb: bnum("low_db"), MidDb: bnum("mid_db"), HighDb: bnum("high_db")}
+	}
+	return meas
 }
 
 // SampleText sweeps a param across the given normalized points, collecting the plugin's rendered value text at

@@ -71,15 +71,16 @@ func renderFor(id string, norm float64) string {
 // fakeHost is a minimal stand-in for cpp/ControlServer: it accepts one client and answers the same commands
 // over the same line-delimited JSON protocol, backed by an in-memory normalized-value map.
 type fakeHost struct {
-	ln     net.Listener
-	mu     sync.Mutex
-	params map[string]float64 // id -> normalized (set_param with `normalized`)
-	reals  map[string]float64 // id -> real value (set_param with `value`; skew-aware forwards land here)
-	notes  []int              // notes turned on
-	panics int                // all_notes_off count
-	state  string             // last-saved / loaded opaque state
-	resets int                // reset_init count
-	cmds   map[string]int     // per-command call counts (e.g. how many get_param probes the sweep issued)
+	ln      net.Listener
+	mu      sync.Mutex
+	params  map[string]float64 // id -> normalized (set_param with `normalized`)
+	reals   map[string]float64 // id -> real value (set_param with `value`; skew-aware forwards land here)
+	notes   []int              // notes turned on
+	panics  int                // all_notes_off count
+	renders int                // render count
+	state   string             // last-saved / loaded opaque state
+	resets  int                // reset_init count
+	cmds    map[string]int     // per-command call counts (e.g. how many get_param probes the sweep issued)
 
 	// C2/C3: identity + a minimal in-memory governed model (enough to exercise the governed MCP tools; the full
 	// conflict tier is proven in governed_test.go and the gated live tests).
@@ -247,6 +248,16 @@ func (fh *fakeHost) dispatch(req map[string]any, client int) map[string]any {
 	case "all_notes_off":
 		fh.panics++
 		return map[string]any{"ok": true}
+	case "render":
+		// Canned deterministic measurement so the render_and_measure tool is testable in-memory (the fake has no
+		// DSP; audio correctness lives only in the gated real-host tests). Mirrors the wire contract shape.
+		fh.renders++
+		return map[string]any{"ok": true, "measurement": map[string]any{
+			"duration_sec": 2.0, "sample_rate": 48000.0, "channels": 2,
+			"peak_db": -6.2, "rms_db": -18.4, "crest": 12.2, "centroid_hz": 1840.0,
+			"bands":  map[string]any{"low_db": -20.1, "mid_db": -16.8, "high_db": -28.0},
+			"silent": false, "clipped": false,
+		}}
 	}
 	return map[string]any{"ok": false, "error": "unknown_cmd"}
 }

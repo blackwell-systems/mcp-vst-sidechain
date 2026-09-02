@@ -100,7 +100,7 @@ jobs:
           SIDECHAIN_LIVE_PARAM="$CUTOFF" \
           SIDECHAIN_LIVE_DISCRETE="$DISCRETE" \
           SIDECHAIN_LIVE_TIME="$TIME" \
-            go test -run 'TestWiredLive|TestInferLive|TestE2ESurgeExtras' -v .
+            go test -run 'TestWiredLive|TestInferLive|TestE2ESurgeExtras|TestRenderBrighter' -v .
 
       # Surge XT EFFECTS VST3 (REQUIRED on macOS): proves the SAME generic surface drives a NON-synth. Run WITHOUT
       # the MIDI smoke (an effect has no MIDI in). Promoted after the state round-trip moved to the fresh-load

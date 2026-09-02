@@ -113,6 +113,7 @@ func NewServer(name, version string, cat ParamCatalog) (*mcp.Server, *session) {
 	registerParamToolsOn(srv, s, func() LiveEndpoint { return s.live })
 	registerLiveTools(srv, s)
 	registerGovernedTools(srv, s)
+	registerRenderTools(srv, s)
 	registerSemanticTools(srv, s)
 	return srv, s
 }
