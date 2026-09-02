@@ -179,6 +179,9 @@ listener). To expose anything else over the same protocol, implement another `Pl
   construction (see the semantic layer, sectioning). `ParamDef.Group` and the wire shape are never mutated by the
   view.
 - **GCF.** The big read tool (`list_params`) encodes its model-facing payload as GCF (see below).
+- **Render + analysis (`render_tools.go`).** Registers `render_and_measure`; the `LiveEndpoint.Render` client
+  method carries the `RenderSpec` over the wire and decodes the snake_case `Measurement` reply. The Phase-4
+  feedback signal (see the render section under the wire protocol).
 
 ### The seam interfaces
 
@@ -245,6 +248,7 @@ bytes on the one socket. Commands mirror the MCP tools closely, so the Go server
 | `get_state` | - | `{ok, count, params}` |
 | `govern` | `{op, group?}` | `{ok, resolution, governed}` |
 | `get_governed` | - | `{ok, governed, sections}` |
+| `render` | `{note?, velocity?, channel?, gate_ms?, duration_ms?, input_kind?, input_freq?, input_level?}` (all optional) | `{ok, measurement}` |
 
 The server also PUSHES unsolicited events (no reply id): `{event: "param_changed", param, normalized, value, text, by}` on any parameter change, and `{event: "governed_changed", governed, resolution, by}` on a lease/generation change. `ping` additionally returns the connection's `client` id.
 
@@ -264,6 +268,21 @@ knowledge of any plugin's schema. This was recently changed from an XML re-seria
 wire field was renamed `xml` -> `state` at the same time. On `get_full_state`, an empty blob (a plugin with no
 persistent state) is a valid result: a separate `fetchedStateOk` flag distinguishes "no state" from
 "getStateInformation failed to run."
+
+### Render + analysis
+
+`render` runs an OFFLINE render on the applier thread (no audio device, no realtime): the bridge resets the
+processor's DSP state (via `reset()`, NOT a `releaseResources()`/`prepareToPlay()` cycle: that cycle rebuilds the
+plugin's DSP from its patch/default state and drops the parameter values pushed in via `set_param`, so every
+render would come out as the default patch regardless of edits), drives it with a MIDI note (any plugin that
+accepts MIDI, input left silent) or a synthesized input signal (a pure effect, `input_kind` = sine/noise/impulse/
+silence), loops `processBlock` over `duration_ms` summing the output to mono, and analyzes it. Because it runs on
+the single applier it serializes with `set_param`, so a measured patch is exactly the current edited state, and it
+introduces no new concurrency hazard. The reply's `measurement` is `{duration_sec, sample_rate, channels, peak_db,
+rms_db, crest, centroid_hz, bands:{low_db, mid_db, high_db}, silent, clipped}` (all snake_case on the wire); the
+pure peak/rms/crest/silent/clipped core lives in the JUCE-free `cpp/RenderAnalysis.h`, and the FFT-derived
+`centroid_hz` + three-band split are computed in the JUCE bridge. This is the feedback signal for Phase 4: an
+agent sets a param, renders, and reads back an objective measurement ("brighter" = the spectral centroid rose).
 
 ## The MCP tool surface
 
@@ -287,6 +306,7 @@ headless session otherwise.
 | `acquire_lease` / `release_lease` | Claim / release an exclusive edit lease on a param-group section (`section=`) or the whole instance (the C3 governed layer): applied / compensated / rejected. Live only. |
 | `get_leases` | The current instance/section lease holders, the leasable sections, the patch generation, and your controller id. Live only. |
 | `poll_events` | Drain the server-pushed `param_changed` / `governed_changed` events since the last poll (deduped to latest-per-param, other controllers only by default). Live only. |
+| `render_and_measure` | Offline-render the current patch (a MIDI note for anything that accepts MIDI, else a synthesized `inputKind` signal for a pure effect) and return an objective `measurement` (peak/RMS/crest dB, spectral centroid, three-band split, silent/clipped) plus a one-line human summary. The Phase-4 feedback signal: set a param, render, read back whether it got brighter/louder. Live only. |
 
 ### The four ways to set one value
 
@@ -402,11 +422,24 @@ load_state{state} --> liveClient LoadState -> {cmd:load_state, state}
    C++ enqueue LoadState -> message thread base64-decode -> setStateInformation(exact bytes) -> {ok, loaded}
 ```
 
+### A `render_and_measure` "make it brighter" loop
+
+```
+set_param{cutoff, normalized:0.9} --> applied on the message thread (param now reflects the edit)
+render_and_measure{note:60, gate_ms:800, duration_ms:1500}
+   --> liveClient Render -> {cmd:render, ...}
+   C++ enqueue Render -> message thread: reset() DSP state -> note_on -> processBlock loop -> sum to mono
+                         -> RenderAnalysis (peak/rms/crest) + FFT (centroid + 3 bands) -> {ok, measurement}
+   Go decodes the snake_case measurement, returns {measurement, summary} (e.g. "centroid 2.02 kHz")
+   agent compares the centroid before/after: higher == brighter (objective, no listening required)
+```
+
 ## Testing and CI architecture
 
 The Go layer is tested at several levels; the C++ host is exercised through the real-plugin integration jobs plus
-one small C++ unit target for the pure section-derivation algorithm (`cpp/tests/section_derivation_test.cpp`, no
-JUCE, run by the `cpp.yml` `unit` job).
+two small C++ unit targets that need no JUCE, both run by the `cpp.yml` `unit` job: the pure section-derivation
+algorithm (`cpp/tests/section_derivation_test.cpp`) and the pure render-analysis core
+(`cpp/tests/render_analysis_test.cpp`: peak/RMS/crest/silent/clipped from a known buffer).
 
 - **Unit tests (always green, no plugin).** Catalog math, sectioning, inference, GCF, the concurrency conflict
   tier (`governed_test.go`, an exhaustive enumeration of the governed state), the semantic store (`semantic_test.go`:
@@ -448,6 +481,11 @@ JUCE, run by the `cpp.yml` `unit` job).
     control), `TestChangeNotifications` (a set by one controller is pushed to another), `TestGovernedLive` +
     `TestGovernedToolsLive` (hierarchical edit leases via the wire and via the MCP tools), and
     `TestGovernedDisconnectFreesLease` (crash-safe lease cleanup). See [CONCURRENCY.md](CONCURRENCY.md).
+  - **Render + analysis (`render_live_test.go`).** `TestRenderSmoke` (gated on the sweep env, run per plugin by
+    `drive_plugin.sh`) renders a note and asserts a non-degenerate measurement came back; values are plugin-specific
+    and deliberately not asserted. `TestRenderBrighter` (gated on `SIDECHAIN_LIVE_*`, run against TAL-NoiseMaker's
+    Filter Cutoff, whose init patch has an active lowpass) is the canonical make-it-brighter proof: render low
+    cutoff, render high cutoff, assert the spectral centroid rose (~10x in practice).
   - **Power-fit survey (`scan_test.go`, gated on `SIDECHAIN_SCAN_*`).** Probes every param on a running host and
     flags any clean analytic power fit; a survey aid, not a CI assertion.
 - **The CI matrix.**
@@ -455,7 +493,7 @@ JUCE, run by the `cpp.yml` `unit` job).
   | Workflow | Runs on | Gate | What |
   |---|---|---|---|
   | `go.yml` | ubuntu | required | gofmt, `go mod tidy`, build, vet, `go test -race -coverprofile`; a required pinned `staticcheck`; a report-only `govulncheck` (stdlib-CVE noise, so it would red on toolchain drift). |
-  | `cpp.yml` (`unit`) | ubuntu | required | Compile + run the JUCE-free section-derivation unit test with `-Wall -Wextra -Werror`. Fast, deterministic. |
+  | `cpp.yml` (`unit`) | ubuntu | required | Compile + run the JUCE-free section-derivation and render-analysis unit tests with `-Wall -Wextra -Werror`. Fast, deterministic. |
   | `cpp.yml` (`build`) | ubuntu + macOS-14 + windows | best-effort | Configure + build the JUCE host (VST3 everywhere, AU on macOS), `fail-fast:false`. Our two TUs compile with `-Werror` / `/WX` (scoped so JUCE's own module sources are exempt), so a warning in our code fails the build. clang-tidy is report-only by design (runner linter-version drift). |
   | `integration.yml` (`smoke`) | macOS-14 | required + report | Build the host; required legs: Surge XT (synth, generic suite + capability), Surge XT Effects VST3, an Apple-AU load+drive, and the C1+C2+C3 concurrency leg. Report-only: none currently. |
   | `integration.yml` (`smoke-linux`) | ubuntu | required + report | Build once, then drive Surge XT / TAL-NoiseMaker / Dexed (required) and Surge XT Effects (report-only: its state round-trip does not restore headless on Linux) under `xvfb-run`, plus a required flat-plugin section-lease leg (TAL derived sections). |

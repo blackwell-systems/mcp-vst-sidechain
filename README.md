@@ -96,6 +96,7 @@ curve. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `acquire_lease` / `release_lease` | Claim (or release) an exclusive edit lease on a param-group section, or the whole instance, so multiple agents driving one plugin don't fight over the same knobs. Returns applied/compensated/rejected. |
 | `get_leases` | Show the current edit leases, the leasable sections, the patch generation, and your own controller id. |
 | `poll_events` | What changed on the plugin since your last poll: parameter and lease changes made by other controllers. |
+| `render_and_measure` | Offline-render the current patch (a MIDI note for anything that accepts MIDI, else a synthesized test signal for an effect) and get back objective measurements: peak/RMS/crest, spectral centroid, a three-band split, silent/clipped, plus a one-line summary. Lets an agent EVALUATE its own edit ("did it get brighter?") instead of tweaking blind. |
 
 ## Quickstart
 

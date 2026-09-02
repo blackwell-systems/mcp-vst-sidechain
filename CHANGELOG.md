@@ -8,6 +8,19 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Render + analysis: the agent can now HEAR its edits (`render_and_measure`).** The host offline-renders the
+  hosted plugin (no audio device, no realtime) and measures the output, closing the perception loop: "make it
+  brighter" becomes verifiable (the spectral centroid rose) instead of a blind guess. Anything that accepts MIDI
+  is note-driven (a held note over `gateMs`, input left silent); a pure effect is fed a synthesized `inputKind`
+  signal (sine/noise/impulse/silence). The render runs on the single applier thread (like `get_full_state`), so it
+  serializes with `set_param` and measures exactly the current edited patch, introducing no new concurrency hazard.
+  The measurement is `{durationSec, sampleRate, channels, peakDb, rmsDb, crest, centroidHz, bands{lowDb,midDb,
+  highDb}, silent, clipped}` (snake_case on the wire); the pure peak/RMS/crest/silent/clipped core lives in the
+  JUCE-free `cpp/RenderAnalysis.h` (unit-tested standalone), the FFT centroid + three-band split in the JUCE
+  bridge. New `render` wire verb; new `Render` command on the ControlServer drain + `PluginBridge::renderAndMeasure`.
+  This is the feedback signal Phase 4 (intent -> params) needs. Proven end to end by `TestRenderBrighter` (TAL
+  Filter Cutoff low->high raises the centroid ~10x) and `TestRenderSmoke` (per plugin). See `docs/RENDER-SCOPING.md`.
+
 - **Phase 3: the persistent semantic store.** Everything the bridge and the agent learn about a plugin's
   parameters now persists per plugin, so a probe (`describe_param`'s value-text sweep) is paid once EVER and
   agent-authored semantics survive restarts. The catalog now carries plugin identity (`Host::enumerateCatalog`

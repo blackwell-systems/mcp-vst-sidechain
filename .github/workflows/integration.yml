@@ -100,7 +100,7 @@ jobs:
           SIDECHAIN_LIVE_PARAM="$CUTOFF" \
           SIDECHAIN_LIVE_DISCRETE="$DISCRETE" \
           SIDECHAIN_LIVE_TIME="$TIME" \
-            go test -run 'TestWiredLive|TestInferLive|TestE2ESurgeExtras|TestRenderBrighter' -v .
+            go test -run 'TestWiredLive|TestInferLive|TestE2ESurgeExtras' -v .
 
       # Surge XT EFFECTS VST3 (REQUIRED on macOS): proves the SAME generic surface drives a NON-synth. Run WITHOUT
       # the MIDI smoke (an effect has no MIDI in). Promoted after the state round-trip moved to the fresh-load
@@ -265,6 +265,24 @@ jobs:
           set -euo pipefail
           source .github/scripts/drive_plugin.sh
           drive_plugin "TAL-NoiseMaker" "$HOME/plugins/TAL-NoiseMaker.vst3" 51991 1
+
+      # Make-it-brighter (render + analysis payoff): the canonical closed loop on a REAL plugin. TAL-NoiseMaker's
+      # init patch has an active lowpass (unlike Surge XT's, whose filter is Off in its init patch, so its cutoff is
+      # inaudible without patch setup), so opening its Filter Cutoff sweeps the spectral centroid ~10x. Set cutoff
+      # low, render a held note, measure the centroid; set it high, render again; assert the centroid rose. This is
+      # the objective proof that the agent can HEAR a parameter change. REQUIRED. The cutoff id is resolved by label.
+      - name: Make-it-brighter render loop (TAL Filter Cutoff) - REQUIRED
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          xvfb-run -a "$SIDECHAIN_HOST_BIN" --plugin "$HOME/plugins/TAL-NoiseMaker.vst3" --catalog brite.json --port 52021 >host-brite.log 2>&1 &
+          HP=$!
+          trap 'kill $HP 2>/dev/null || true' EXIT
+          for i in $(seq 1 30); do [ -s brite.json ] && break; sleep 1; done
+          test -s brite.json || { echo "host did not write a catalog"; cat host-brite.log; exit 1; }
+          CUTOFF=$(python3 -c "import json; d=json.load(open('brite.json')); print(next(p['id'] for p in d['params'] if p['label']=='Filter Cutoff'))")
+          SIDECHAIN_LIVE_PORT=52021 SIDECHAIN_LIVE_CATALOG=brite.json SIDECHAIN_LIVE_PARAM="$CUTOFF" \
+            go test -run 'TestRenderBrighter' -v .
 
       # Flat-plugin section leases (C3): TAL exposes NO parameter-tree groups, so the host derives leasable sections
       # from shared label prefixes (computeSections, a port of sections.go). This exercises that fallback end to

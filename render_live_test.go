@@ -6,9 +6,11 @@
 // note and asserts a measurement came back and is not an error. It does NOT assert specific dB/centroid values -
 // those are plugin-specific; the point is that the render path is drivable end to end against any hosted plugin.
 //
-// TestRenderBrighter (the payoff, SIDECHAIN_LIVE_* Surge-capability gate): the canonical make-it-brighter proof.
-// Set the filter cutoff LOW, render a held note, record the spectral centroid; set the cutoff HIGH, render again;
-// assert the centroid INCREASED. This is the objective, end-to-end demonstration that "brighter" is measurable.
+// TestRenderBrighter (the payoff, SIDECHAIN_LIVE_* gate): the canonical make-it-brighter proof. Set the filter
+// cutoff LOW, render a held note, record the spectral centroid; set the cutoff HIGH, render again; assert the
+// centroid INCREASED. This is the objective, end-to-end demonstration that "brighter" is measurable. Point
+// SIDECHAIN_LIVE_PARAM at a param that actually opens the spectrum: CI uses TAL-NoiseMaker's Filter Cutoff, whose
+// init patch has an ACTIVE lowpass (Surge XT's init-patch filter is Off, so its cutoff is inaudible unmodified).
 
 package sidechain
 
