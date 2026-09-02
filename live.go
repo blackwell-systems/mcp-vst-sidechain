@@ -64,7 +64,8 @@ type LiveEndpoint interface {
 // RenderSpec is the render request the render_and_measure tool forwards over the wire. Every field is optional;
 // the host auto-detects instrument vs effect and applies its own defaults for anything left zero. Note/Velocity/
 // Channel/GateMs drive an instrument; InputKind/InputFreq/InputLevel synthesize the excitation for an effect;
-// DurationMs bounds the total render (gate + tail).
+// DurationMs bounds the total render (gate + tail). Temporal opts in to the Tier 2.5 modulation block (rate/depth
+// per signal); FrameMs sets the analysis frame size (default 25 ms when zero).
 type RenderSpec struct {
 	Note       int     // MIDI note number for an instrument (0..127); 0 leaves the host default
 	Velocity   float64 // note velocity 0..1
@@ -74,6 +75,8 @@ type RenderSpec struct {
 	InputKind  string  // effect excitation: sine | noise | impulse | silence
 	InputFreq  float64 // sine frequency in Hz (effect, InputKind=sine)
 	InputLevel float64 // input signal level 0..1 (effect)
+	Temporal   bool    // opt in to the modulation block (Tier 2.5); false = no temporal analysis
+	FrameMs    int     // analysis frame size in ms (Temporal only); 0 leaves the host default (25 ms)
 }
 
 // Bands is the coarse 3-band energy split of the rendered output (dBFS): <200 Hz / 200 Hz..2 kHz / >2 kHz.
@@ -83,21 +86,41 @@ type Bands struct {
 	HighDb float64 `json:"highDb"`
 }
 
+// ModSignal describes the modulation characteristics of one signal (centroid or RMS) derived from a per-frame
+// temporal analysis (Tier 2.5). The wire carries snake_case keys; MCP output uses camelCase.
+type ModSignal struct {
+	RateHz     float64 `json:"rateHz"`     // dominant periodicity of the frame envelope (LFO rate in Hz)
+	Depth      float64 `json:"depth"`      // excursion over the render: Hz for centroid, dB for rms
+	Regular    bool    `json:"regular"`    // true if the modulation is periodic (a clean LFO), false for irregular
+	Confidence float64 `json:"confidence"` // reliability of the estimate, 0..1
+}
+
+// Modulation is the Tier 2.5 temporal analysis block returned when the render was requested with Temporal=true.
+// Centroid captures filter LFO / spectral sweeps; Rms captures tremolo / volume LFOs; Dominant names the stronger.
+type Modulation struct {
+	FrameMs  int       `json:"frameMs"`  // frame size used for the analysis in ms
+	Centroid ModSignal `json:"centroid"` // modulation on the spectral centroid (brightness)
+	Rms      ModSignal `json:"rms"`      // modulation on the RMS level (tremolo)
+	Dominant string    `json:"dominant"` // "centroid" | "rms" | "none"
+}
+
 // Measurement is the objective analysis of a rendered buffer (Tier 2 of docs/RENDER-SCOPING.md): level, dynamics,
 // brightness, silence, clip. Channels are mono-summed for the headline numbers. This is what an agent reasons over
 // to decide whether an edit moved the sound the intended way (centroid/highDb up = brighter, rms/peak up = louder,
-// crest up = punchier, silent = dead patch, clipped = too hot).
+// crest up = punchier, silent = dead patch, clipped = too hot). Modulation is the optional Tier 2.5 temporal block
+// (nil when temporal analysis was not requested or the host did not return one).
 type Measurement struct {
-	DurationSec float64 `json:"durationSec"`
-	SampleRate  float64 `json:"sampleRate"`
-	Channels    int     `json:"channels"`
-	PeakDb      float64 `json:"peakDb"`     // max sample, dBFS
-	RmsDb       float64 `json:"rmsDb"`      // RMS level, dBFS
-	Crest       float64 `json:"crest"`      // peak/RMS ratio, dB (transient-ness)
-	CentroidHz  float64 `json:"centroidHz"` // spectral centroid = "brightness"
-	Bands       Bands   `json:"bands"`
-	Silent      bool    `json:"silent"`  // below a small threshold (dead patch / no output)
-	Clipped     bool    `json:"clipped"` // peak >= 0 dBFS
+	DurationSec float64     `json:"durationSec"`
+	SampleRate  float64     `json:"sampleRate"`
+	Channels    int         `json:"channels"`
+	PeakDb      float64     `json:"peakDb"`     // max sample, dBFS
+	RmsDb       float64     `json:"rmsDb"`      // RMS level, dBFS
+	Crest       float64     `json:"crest"`      // peak/RMS ratio, dB (transient-ness)
+	CentroidHz  float64     `json:"centroidHz"` // spectral centroid = "brightness"
+	Bands       Bands       `json:"bands"`
+	Silent      bool        `json:"silent"`               // below a small threshold (dead patch / no output)
+	Clipped     bool        `json:"clipped"`              // peak >= 0 dBFS
+	Modulation  *Modulation `json:"modulation,omitempty"` // Tier 2.5: non-nil only when temporal was requested
 }
 
 // GovernedState is the C3 coordination state as seen over the wire: who holds the whole-instance edit lease, who
@@ -408,6 +431,12 @@ func (lc *liveClient) Render(spec RenderSpec) (Measurement, error) {
 	if spec.InputLevel != 0 {
 		req["input_level"] = spec.InputLevel
 	}
+	if spec.Temporal {
+		req["temporal"] = true
+		if spec.FrameMs != 0 {
+			req["frame_ms"] = spec.FrameMs
+		}
+	}
 	resp, err := lc.request(req)
 	if err != nil {
 		return Measurement{}, err
@@ -420,6 +449,8 @@ func (lc *liveClient) Render(spec RenderSpec) (Measurement, error) {
 }
 
 // parseMeasurement decodes the wire `measurement` object (JSON numbers arrive as float64) into a Measurement.
+// When the host returned a `modulation` sub-map (Tier 2.5, opt-in), it is decoded into *Modulation; when absent
+// the field is left nil so callers can distinguish "not requested" from "no modulation detected".
 func parseMeasurement(m map[string]any) Measurement {
 	num := func(k string) float64 { f, _ := m[k].(float64); return f }
 	meas := Measurement{
@@ -437,7 +468,37 @@ func parseMeasurement(m map[string]any) Measurement {
 		bnum := func(k string) float64 { f, _ := b[k].(float64); return f }
 		meas.Bands = Bands{LowDb: bnum("low_db"), MidDb: bnum("mid_db"), HighDb: bnum("high_db")}
 	}
+	if mod, ok := m["modulation"].(map[string]any); ok {
+		meas.Modulation = parseModulation(mod)
+	}
 	return meas
+}
+
+// parseModulation decodes the wire `modulation` sub-map (snake_case keys) into a *Modulation. The centroid and rms
+// sub-maps each carry rate_hz / depth / regular / confidence. dominant is a string: "centroid" | "rms" | "none".
+func parseModulation(mod map[string]any) *Modulation {
+	parseSignal := func(v any) ModSignal {
+		s, _ := v.(map[string]any)
+		if s == nil {
+			return ModSignal{}
+		}
+		num := func(k string) float64 { f, _ := s[k].(float64); return f }
+		sig := ModSignal{
+			RateHz:     num("rate_hz"),
+			Depth:      num("depth"),
+			Confidence: num("confidence"),
+		}
+		sig.Regular, _ = s["regular"].(bool)
+		return sig
+	}
+	num := func(k string) float64 { f, _ := mod[k].(float64); return f }
+	dominant, _ := mod["dominant"].(string)
+	return &Modulation{
+		FrameMs:  int(num("frame_ms")),
+		Centroid: parseSignal(mod["centroid"]),
+		Rms:      parseSignal(mod["rms"]),
+		Dominant: dominant,
+	}
 }
 
 // SampleText sweeps a param across the given normalized points, collecting the plugin's rendered value text at

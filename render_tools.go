@@ -22,6 +22,8 @@ type renderAndMeasureIn struct {
 	InputKind  string  `json:"inputKind,omitempty" jsonschema:"effect excitation signal: sine | noise | impulse | silence. Ignored for an instrument. Host default (sine) if omitted."`
 	InputFreq  float64 `json:"inputFreq,omitempty" jsonschema:"sine frequency in Hz when inputKind=sine (effect)."`
 	InputLevel float64 `json:"inputLevel,omitempty" jsonschema:"input signal level 0..1 (effect)."`
+	Temporal   bool    `json:"temporal,omitempty" jsonschema:"opt in to Tier 2.5 temporal analysis: the reply will include a modulation block (rate/depth for centroid and rms) so LFO rate and depth are measurable. Off by default."`
+	FrameMs    int     `json:"frameMs,omitempty" jsonschema:"analysis frame size in ms for temporal analysis (default 25 ms when omitted)."`
 }
 
 // renderResult is the structured payload: the full measurement object plus the one-line human summary that the
@@ -33,16 +35,40 @@ type renderResult struct {
 
 // renderSummary formats the headline measurement as a single human line, e.g.
 // "peak -6.2 dBFS, RMS -18.4 dB, centroid 1.84 kHz, not clipped".
+// When a Modulation block is present (Tier 2.5 temporal analysis), a short phrase is appended:
+// "; LFO ~2.0 Hz on centroid (depth 1840 Hz)" or "; no modulation detected".
 func renderSummary(m Measurement) string {
 	clip := "not clipped"
 	if m.Clipped {
 		clip = "CLIPPED"
 	}
+	base := ""
 	if m.Silent {
-		return fmt.Sprintf("silent (peak %.1f dBFS, RMS %.1f dB): no output - dead patch?", m.PeakDb, m.RmsDb)
+		base = fmt.Sprintf("silent (peak %.1f dBFS, RMS %.1f dB): no output - dead patch?", m.PeakDb, m.RmsDb)
+	} else {
+		base = fmt.Sprintf("peak %.1f dBFS, RMS %.1f dB, centroid %.2f kHz, %s",
+			m.PeakDb, m.RmsDb, m.CentroidHz/1000.0, clip)
 	}
-	return fmt.Sprintf("peak %.1f dBFS, RMS %.1f dB, centroid %.2f kHz, %s",
-		m.PeakDb, m.RmsDb, m.CentroidHz/1000.0, clip)
+	if m.Modulation != nil {
+		mod := m.Modulation
+		if mod.Dominant != "" && mod.Dominant != "none" {
+			var sig ModSignal
+			if mod.Dominant == "centroid" {
+				sig = mod.Centroid
+			} else {
+				sig = mod.Rms
+			}
+			base += fmt.Sprintf("; LFO ~%.1f Hz on %s (depth %.0f)", sig.RateHz, mod.Dominant, sig.Depth)
+			if mod.Dominant == "rms" {
+				base += " dB"
+			} else {
+				base += " Hz"
+			}
+		} else {
+			base += "; no modulation detected"
+		}
+	}
+	return base
 }
 
 func (s *session) handleRenderAndMeasure(ctx context.Context, _ *mcp.CallToolRequest, in renderAndMeasureIn) (*mcp.CallToolResult, any, error) {

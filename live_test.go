@@ -253,14 +253,38 @@ func (fh *fakeHost) dispatch(req map[string]any, client int) map[string]any {
 		// has no DSP; audio correctness lives only in the gated real-host tests). The spectral centroid RESPONDS to
 		// the "cutoff" param (monotonic 200..4000 Hz across its normalized range), so a tune toward brightness has a
 		// real gradient to climb; the other numbers are canned. Mirrors the wire contract shape.
+		//
+		// When the request carries "temporal": true, the reply also includes a "modulation" block whose
+		// centroid.rate_hz responds to the cutoff param (1 + cutoff*9, so 1..10 Hz), making it tunable.
+		// When temporal is absent/false, the modulation block is omitted so existing non-temporal tests are stable.
 		fh.renders++
-		centroid := 200.0 + fh.params["cutoff"]*3800.0 // dispatch already holds fh.mu
-		return map[string]any{"ok": true, "measurement": map[string]any{
+		cutoff := fh.params["cutoff"] // dispatch already holds fh.mu
+		centroid := 200.0 + cutoff*3800.0
+		meas := map[string]any{
 			"duration_sec": 2.0, "sample_rate": 48000.0, "channels": 2,
 			"peak_db": -6.2, "rms_db": -18.4, "crest": 12.2, "centroid_hz": centroid,
 			"bands":  map[string]any{"low_db": -20.1, "mid_db": -16.8, "high_db": -28.0},
 			"silent": false, "clipped": false,
-		}}
+		}
+		if temporal, _ := req["temporal"].(bool); temporal {
+			frameMs := 25
+			if f, ok := req["frame_ms"].(float64); ok && f > 0 {
+				frameMs = int(f)
+			}
+			rate := 1.0 + cutoff*9.0 // 1..10 Hz, monotonic in cutoff
+			depth := cutoff * 2000.0 // 0..2000 Hz depth
+			meas["modulation"] = map[string]any{
+				"frame_ms": frameMs,
+				"centroid": map[string]any{
+					"rate_hz": rate, "depth": depth, "regular": true, "confidence": 0.9,
+				},
+				"rms": map[string]any{
+					"rate_hz": 0.0, "depth": 1.2, "regular": false, "confidence": 0.1,
+				},
+				"dominant": "centroid",
+			}
+		}
+		return map[string]any{"ok": true, "measurement": meas}
 	}
 	return map[string]any{"ok": false, "error": "unknown_cmd"}
 }

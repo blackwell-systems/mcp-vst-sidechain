@@ -18,7 +18,7 @@ import (
 
 type tuneParamIn struct {
 	ID      string  `json:"id" jsonschema:"the plugin parameter id to tune (a continuous param; use set_param choice= for discrete lists)"`
-	Measure string  `json:"measure" jsonschema:"the objective measurement: centroid_hz (brightness) | peak_db | rms_db (loudness) | crest | low_db | mid_db | high_db"`
+	Measure string  `json:"measure" jsonschema:"the objective measurement: centroid_hz | peak_db | rms_db | crest | low_db | mid_db | high_db, or a nested modulation measure: modulation.centroid.rate_hz | modulation.centroid.depth | modulation.rms.rate_hz | modulation.rms.depth"`
 	Goal    string  `json:"goal" jsonschema:"maximize | minimize | target"`
 	Target  float64 `json:"target,omitempty" jsonschema:"the target value in the measure's unit; required when goal=target (e.g. rms_db target -12)"`
 	Seeds   int     `json:"seeds,omitempty" jsonschema:"coarse uniform samples across the normalized range (default 5, min 2)"`
@@ -61,9 +61,13 @@ type tuneResult struct {
 }
 
 // measureValue pulls one named scalar out of a Measurement. The name matches the snake_case wire vocabulary so the
-// agent names the same measure it sees in render_and_measure output.
+// agent names the same measure it sees in render_and_measure output. Nested modulation measures
+// (modulation.centroid.rate_hz, modulation.centroid.depth, modulation.rms.rate_hz, modulation.rms.depth) read from
+// m.Modulation and return ok=false when the Modulation block is nil (temporal was not requested or not returned).
+// Both snake_case (rate_hz) and camelCase (rateHz) variants are accepted for friendliness.
 func measureValue(m Measurement, measure string) (float64, bool) {
-	switch strings.ToLower(strings.TrimSpace(measure)) {
+	key := strings.ToLower(strings.TrimSpace(measure))
+	switch key {
 	case "centroid_hz", "centroidhz", "centroid":
 		return m.CentroidHz, true
 	case "peak_db", "peakdb", "peak":
@@ -78,8 +82,35 @@ func measureValue(m Measurement, measure string) (float64, bool) {
 		return m.Bands.MidDb, true
 	case "high_db", "highdb", "high":
 		return m.Bands.HighDb, true
+	// Tier 2.5 nested modulation measures. Accept snake_case and camelCase for the leaf field.
+	case "modulation.centroid.rate_hz", "modulation.centroid.ratehz":
+		if m.Modulation == nil {
+			return 0, false
+		}
+		return m.Modulation.Centroid.RateHz, true
+	case "modulation.centroid.depth":
+		if m.Modulation == nil {
+			return 0, false
+		}
+		return m.Modulation.Centroid.Depth, true
+	case "modulation.rms.rate_hz", "modulation.rms.ratehz":
+		if m.Modulation == nil {
+			return 0, false
+		}
+		return m.Modulation.Rms.RateHz, true
+	case "modulation.rms.depth":
+		if m.Modulation == nil {
+			return 0, false
+		}
+		return m.Modulation.Rms.Depth, true
 	}
 	return 0, false
+}
+
+// isModulationMeasure reports whether the named measure requires a Tier 2.5 temporal analysis block (i.e. whether
+// the render spec must have Temporal=true). Any measure that starts with "modulation." qualifies.
+func isModulationMeasure(measure string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(measure)), "modulation.")
 }
 
 // tuneScore turns a measure value into a "higher is better" score for the goal, so the search always maximizes.
@@ -109,8 +140,8 @@ func (s *session) handleTuneParam(ctx context.Context, _ *mcp.CallToolRequest, i
 	if p.Type == "choice" {
 		return textResult(fmt.Sprintf("tune_param: %q is a choice param, not a continuum. Use set_param choice=<name> and render_and_measure to compare.", in.ID)), nil, nil
 	}
-	if _, ok := measureValue(Measurement{}, in.Measure); !ok {
-		return textResult(fmt.Sprintf("tune_param: unknown measure %q. Use one of centroid_hz, peak_db, rms_db, crest, low_db, mid_db, high_db.", in.Measure)), nil, nil
+	if _, ok := measureValue(Measurement{Modulation: &Modulation{}}, in.Measure); !ok {
+		return textResult(fmt.Sprintf("tune_param: unknown measure %q. Use one of centroid_hz, peak_db, rms_db, crest, low_db, mid_db, high_db, or modulation.centroid.rate_hz / modulation.centroid.depth / modulation.rms.rate_hz / modulation.rms.depth.", in.Measure)), nil, nil
 	}
 	goal := strings.ToLower(strings.TrimSpace(in.Goal))
 	switch goal {
@@ -135,6 +166,11 @@ func (s *session) handleTuneParam(ctx context.Context, _ *mcp.CallToolRequest, i
 		Note: in.Note, Velocity: in.Velocity, Channel: in.Channel, GateMs: in.GateMs,
 		DurationMs: in.DurationMs, InputKind: in.InputKind, InputFreq: in.InputFreq, InputLevel: in.InputLevel,
 	}
+	// Modulation measures require temporal analysis. Auto-enable it so the host returns a modulation block; a
+	// sensible default frame size (25 ms) is left as zero so the host applies its own default.
+	if isModulationMeasure(in.Measure) {
+		spec.Temporal = true
+	}
 
 	// The starting position, so we can restore it and report the delta.
 	_, startNorm, _, err := lc.GetParam(p.ID)
@@ -156,6 +192,12 @@ func (s *session) handleTuneParam(ctx context.Context, _ *mcp.CallToolRequest, i
 		m, e := lc.Render(spec)
 		if e != nil {
 			return 0, e
+		}
+		// Guard: a modulation measure requires the host to have returned a modulation block. When the block is
+		// absent (the plugin/host does not support temporal analysis, or Temporal was not set), fail early with
+		// an actionable message rather than silently scoring as zero.
+		if isModulationMeasure(in.Measure) && m.Modulation == nil {
+			return 0, fmt.Errorf("host returned no modulation block; the plugin/host may not support temporal analysis")
 		}
 		v, _ := measureValue(m, in.Measure)
 		evals = append(evals, tuneEval{Normalized: norm, Value: v})
