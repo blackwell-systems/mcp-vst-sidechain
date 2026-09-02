@@ -61,10 +61,22 @@ type ParamCatalog interface {
 type Catalog struct {
 	StateRootTag string
 	StateVersion int
+	Plugin       PluginIdentity // identity of the hosted plugin (for the semantic-store fingerprint); may be zero
 	Params       []ParamDef
 	byID         map[string]*ParamDef
 	effGroup     []string // parallel to Params: the effective (real-or-derived) group per param
 	derived      bool     // true when effGroup holds label-prefix sections rather than real groups
+}
+
+// PluginIdentity is the loaded plugin's identity, emitted by the C++ host in the catalog. It keys the semantic
+// store: the fingerprint is over name|manufacturer|format|sortedParamIDs|paramCount (version is recorded but NOT
+// in the key, so a surface-preserving version bump reuses the cached semantics).
+type PluginIdentity struct {
+	Name         string `json:"name,omitempty"`
+	Manufacturer string `json:"manufacturer,omitempty"`
+	Format       string `json:"format,omitempty"`
+	Version      string `json:"version,omitempty"`
+	UniqueID     int    `json:"uniqueId,omitempty"`
 }
 
 // NewCatalog builds a Catalog from an enumerated param list (the runtime path: the C++ host enumerated a loaded
@@ -128,10 +140,11 @@ func (c *Catalog) allHaveSection() bool {
 // params, count}). Fails loudly on an empty/corrupt catalog.
 func loadCatalogJSON(data []byte) (*Catalog, error) {
 	var raw struct {
-		StateRootTag string     `json:"stateRootTag"`
-		StateVersion int        `json:"stateVersion"`
-		Params       []ParamDef `json:"params"`
-		Count        int        `json:"count"`
+		StateRootTag string         `json:"stateRootTag"`
+		StateVersion int            `json:"stateVersion"`
+		Plugin       PluginIdentity `json:"plugin"`
+		Params       []ParamDef     `json:"params"`
+		Count        int            `json:"count"`
 	}
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("parse catalog json: %w", err)
@@ -142,6 +155,7 @@ func loadCatalogJSON(data []byte) (*Catalog, error) {
 	c := NewCatalog(raw.Params)
 	c.StateRootTag = orDefault(raw.StateRootTag, "PARAMS")
 	c.StateVersion = raw.StateVersion
+	c.Plugin = raw.Plugin
 	return c, nil
 }
 

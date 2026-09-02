@@ -27,6 +27,9 @@ type Config struct {
 	// Name/Version identify the server to the MCP client.
 	Name    string
 	Version string
+	// SemanticDir is the Phase-3 persistent semantic store directory (per-fingerprint files). Empty uses
+	// SIDECHAIN_SEMANTIC_DIR or a per-user cache dir.
+	SemanticDir string
 }
 
 // Run builds and runs the headless stdio MCP server until the transport closes. It fails fast if the catalog
@@ -45,7 +48,17 @@ func Run(ctx context.Context, cfg Config) error {
 	}
 	fmt.Fprintf(os.Stderr, "sidechain: loaded catalog (%d params) from %s\n", len(cat.All()), cfg.CatalogPath)
 
-	srv, _ := NewServer(cfg.Name, cfg.Version, cat)
+	srv, s := NewServer(cfg.Name, cfg.Version, cat)
+
+	// Attach the persistent semantic store: a param probed in a past session is recalled instead of re-swept, and
+	// agent annotations accumulate across runs. A load error (a corrupt file) is non-fatal - the server runs
+	// in-memory.
+	store := NewSemanticStore(orDefault(cfg.SemanticDir, defaultSemanticDir()))
+	if err := s.attachStore(store); err != nil {
+		fmt.Fprintf(os.Stderr, "sidechain: semantic store disabled (%v)\n", err)
+	} else {
+		fmt.Fprintf(os.Stderr, "sidechain: semantic store %s (fingerprint %s)\n", store.dir, s.entry.Fingerprint[:19])
+	}
 	return srv.Run(ctx, &mcp.StdioTransport{})
 }
 
@@ -65,6 +78,7 @@ func NewServer(name, version string, cat ParamCatalog) (*mcp.Server, *session) {
 	registerParamToolsOn(srv, s, func() LiveEndpoint { return s.live })
 	registerLiveTools(srv, s)
 	registerGovernedTools(srv, s)
+	registerSemanticTools(srv, s)
 	return srv, s
 }
 

@@ -20,9 +20,11 @@ import (
 func main() {
 	catalog := flag.String("catalog", os.Getenv("SIDECHAIN_CATALOG"),
 		"path to the plugin parameter catalog JSON (emitted by cpp/Host at plugin load; or set SIDECHAIN_CATALOG)")
+	semanticDir := flag.String("semantic-dir", os.Getenv("SIDECHAIN_SEMANTIC_DIR"),
+		"directory for the persistent semantic store (per-fingerprint files); empty uses a per-user cache dir")
 	flag.Parse()
 
-	if err := sidechain.Run(context.Background(), sidechain.Config{CatalogPath: *catalog}); err != nil {
+	if err := sidechain.Run(context.Background(), sidechain.Config{CatalogPath: *catalog, SemanticDir: *semanticDir}); err != nil {
 		log.Fatalf("sidechain: %v", err)
 	}
 }

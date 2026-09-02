@@ -30,6 +30,11 @@ type session struct {
 	params  map[string]float64
 	live    LiveEndpoint
 	infer   map[string]ParamInference // Phase-1 real-unit inferences, probed on demand, keyed by param id
+
+	// Phase 3 persistent semantic store (optional). store == nil keeps the pre-Phase-3 in-memory-only behavior;
+	// when set, infer is backed by entry (loaded on attach, written through on probe/annotate).
+	store *SemanticStore
+	entry *SemanticEntry
 }
 
 func newSession(cat ParamCatalog) *session {
@@ -51,6 +56,11 @@ func (s *session) probe(id string) ([]ValueSample, ParamInference, error) {
 		s.infer = map[string]ParamInference{}
 	}
 	s.infer[id] = pi
+	label := ""
+	if p := s.catalog.Get(id); p != nil {
+		label = p.Label
+	}
+	s.recordInferenceLocked(id, label, pi) // persist so a future session skips the sweep (no-op if no store)
 	return samples, pi, nil
 }
 
@@ -362,9 +372,24 @@ type describeParamIn struct {
 	ID string `json:"id" jsonschema:"the plugin parameter id to probe"`
 }
 
-// handleDescribeParam probes a live param's value text across its range and returns the recovered real-unit
-// semantics (unit/range/curve/bipolar, or discrete labels). This is the agent's way to learn what a hosted
-// param actually is before driving it by real value. Live only; the result is cached for set_param real=.
+// describeParamOut is the structured result of describe_param: the recovered inference, its derived behavior
+// class, any agent annotations, and (on a fresh probe) the raw value-text samples.
+type describeParamOut struct {
+	ID            string         `json:"id"`
+	Label         string         `json:"label"`
+	BehaviorClass string         `json:"behaviorClass,omitempty"`
+	Inference     ParamInference `json:"inference"`
+	Role          string         `json:"role,omitempty"`
+	Aliases       []string       `json:"aliases,omitempty"`
+	Polarity      string         `json:"polarity,omitempty"`
+	Cached        bool           `json:"cached"`
+	Samples       []ValueSample  `json:"samples,omitempty"`
+}
+
+// handleDescribeParam reports a param's recovered real-unit semantics (unit/range/curve/bipolar, or discrete
+// labels), its derived behavior class, and any agent annotations. If the semantic store already has this param's
+// inference (probed in a past session), it is returned WITHOUT re-probing - even headless. Otherwise it probes the
+// live plugin (a value-text sweep), caches, and persists so a future session skips the sweep.
 func (s *session) handleDescribeParam(ctx context.Context, _ *mcp.CallToolRequest, in describeParamIn) (*mcp.CallToolResult, any, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -372,20 +397,35 @@ func (s *session) handleDescribeParam(ctx context.Context, _ *mcp.CallToolReques
 	if p == nil {
 		return textResult(fmt.Sprintf("describe_param: unknown id %q. Use list_params to discover ids.", in.ID)), nil, nil
 	}
-	if s.live == nil {
-		return textResult("describe_param: not live. It reads the plugin's value text across the range, so connect_live first."), nil, nil
+
+	pi, cached := s.infer[in.ID]
+	var samples []ValueSample
+	if !cached {
+		if s.live == nil {
+			return textResult("describe_param: not cached and not live. It reads the plugin's value text across the range, so connect_live first (or a past session must have probed it)."), nil, nil
+		}
+		var err error
+		samples, pi, err = s.probe(in.ID)
+		if err != nil {
+			return textResult("describe_param failed: " + err.Error()), nil, nil
+		}
 	}
-	samples, pi, err := s.probe(in.ID)
-	if err != nil {
-		return textResult("describe_param failed: " + err.Error()), nil, nil
+
+	out := describeParamOut{ID: p.ID, Label: p.Label, BehaviorClass: behaviorClass(pi), Inference: pi, Cached: cached, Samples: samples}
+
+	msg := pi.summary(p.ID, p.Label) + " [" + behaviorClass(pi) + "]"
+	if s.entry != nil {
+		if sem := s.entry.Params[in.ID]; sem != nil {
+			out.Role, out.Aliases, out.Polarity = sem.Role, sem.Aliases, sem.Polarity
+			if sem.Role != "" {
+				msg += " role=" + sem.Role
+			}
+		}
 	}
-	out := struct {
-		ID        string         `json:"id"`
-		Label     string         `json:"label"`
-		Inference ParamInference `json:"inference"`
-		Samples   []ValueSample  `json:"samples"`
-	}{ID: p.ID, Label: p.Label, Inference: pi, Samples: samples}
-	return textResult(pi.summary(p.ID, p.Label)), out, nil
+	if cached {
+		msg += " (recalled from the semantic store)"
+	}
+	return textResult(msg), out, nil
 }
 
 // summary renders a one-line human description of an inference.

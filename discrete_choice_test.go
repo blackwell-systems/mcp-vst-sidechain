@@ -31,12 +31,7 @@ func TestSetDiscreteChoiceByLabel(t *testing.T) {
 	if !strings.Contains(textOf(dres), "discrete") {
 		t.Fatalf("describe summary = %q, want discrete", textOf(dres))
 	}
-	d, _ := dout.(struct {
-		ID        string         `json:"id"`
-		Label     string         `json:"label"`
-		Inference ParamInference `json:"inference"`
-		Samples   []ValueSample  `json:"samples"`
-	})
+	d, _ := dout.(describeParamOut)
 	if d.Inference.Numeric {
 		t.Fatalf("filterType should probe as discrete (Numeric=false), got %+v", d.Inference)
 	}

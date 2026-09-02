@@ -93,7 +93,9 @@ a `JucePluginBridge`) at the hosted processor. `main.cpp` is a thin CLI that dri
   base API is used deliberately: a hosted VST3/AU exposes its parameters as `HostedAudioProcessorParameter`,
   which is not a `RangedAudioParameter`, so a ranged cast would drop every hosted param. Each row carries
   `id`, `label`, `group`, `section`, `type`, `min`, `max`, `step`, `default`, `hasRealRange`, and (for choices)
-  `choices`. The root object also stamps `stateRootTag`, `stateVersion`, and `count`. Only automatable params are emitted.
+  `choices`. The root object also stamps `stateRootTag`, `stateVersion`, `count`, and a `plugin` identity object
+  (`name`/`manufacturer`/`format`/`version`/`uniqueId`, from the loaded `juce::PluginDescription`) that keys the
+  Phase-3 semantic store's fingerprint. Only automatable params are emitted.
 - **Sectioning (`group` vs `section`, `cpp/Sectioning.h`).** `group` is the raw parameter-tree group: VST3 units
   and AU clumps surface as nested `AudioProcessorParameterGroup`s, and enumeration records each param's immediate
   parent group name (empty for a flat tree). `section` is the EFFECTIVE navigable section: that group when present,
@@ -165,6 +167,13 @@ listener). To expose anything else over the same protocol, implement another `Pl
   by id, used when not connected live), the current `LiveEndpoint` (nil means headless), and the per-session
   inference cache (`infer`, keyed by param id). A single mutex serializes tool calls, which is also what keeps the
   line-delimited control protocol from interleaving.
+- **The semantic store (`semantic.go`, Phase 3).** When attached, the session's `infer` is backed by a persistent
+  store: a directory of per-fingerprint JSON files (`sha256(name|manufacturer|format|sortedParamIDs|count)`), keyed
+  by the catalog's `plugin` identity. A probe is written through (atomic temp+rename, field-level merge) so a
+  future session recalls it instead of re-sweeping; `annotate_params` accumulates the agent's own role/aliases/
+  polarity per param. Each param carries a derived behavior class (`float:log:hz`) and a free-form role
+  (`filter.cutoff`) on two orthogonal axes. Store dir via `--semantic-dir` / `SIDECHAIN_SEMANTIC_DIR`. See
+  [PHASE3-SCOPING.md](PHASE3-SCOPING.md).
 - **The `Catalog`.** The read side: indexed by id for O(1) lookup, with the pure param math (`clampReal`,
   `normToReal`, `realToNorm`, `choiceIndex`, `roundHalfUp`). It also computes an **effective-group** view once at
   construction (see the semantic layer, sectioning). `ParamDef.Group` and the wire shape are never mutated by the
@@ -267,7 +276,10 @@ headless session otherwise.
 | `get_param` | One parameter's definition + current value (value + normalized). Reads the live instance when connected; surfaces cached discrete labels if the param was probed. |
 | `set_param` | Set one param by `value` (real units when `hasRealRange`, else normalized 0..1 or a discrete index), `normalized` (always 0..1), `choice` (a choice NAME, or a live discrete-as-float param matched by label), or `real` (a real-unit target on a live hosted param, mapped via its value text). Validated + clamped. |
 | `set_params` | Set many params in one call, from a JSON array or a token-compact GCF table. Supports per-row `value`/`normalized`/`choice`/`real`. Unknown/invalid rows are skipped and reported, never fatal. |
-| `describe_param` | Probe a live param's value text across its range and report the recovered semantics (unit, real range, curve, bipolar, or discrete labels). Live only; the result is cached for `set_param real=`. |
+| `describe_param` | Probe a live param's value text and report the recovered semantics (unit, real range, curve, bipolar, or discrete labels) + a derived behavior class + any annotations. Recalls from the semantic store WITHOUT re-probing once seen (even headless); a fresh probe is cached and persisted. |
+| `annotate_params` | Merge-update agent-authored semantics (role, aliases, polarity, section, notes) per param and persist them. Headless; only provided fields change. |
+| `get_semantic_map` | The whole current-plugin semantic map (per-param behavior class, unit/range/curve when probed, annotations). The primary read for Phase 4. |
+| `forget_semantics` | Drop the current plugin's stored entry and clear the inference cache. |
 | `connect_live` / `disconnect_live` | Dial / drop the control socket (default `127.0.0.1:51703`); a new connection clears any stale inference cache. |
 | `play_note` / `all_notes_off` | Play a MIDI note (optional `holdMs` to auto-release) / panic all notes. Live only. |
 | `save_state` / `load_state` | Snapshot the whole patch as one opaque blob / recall it. Live only. |
@@ -339,8 +351,8 @@ label prefixes so a flat surface can be paged with `group=`. A leading token-pre
 the longest qualifying prefix, and the rest fall to `"other"` (sorted last). This is a **catalog-level view**:
 the `Catalog` computes an `effGroup` slice once at construction, used only by `Groups()` and `Filter()`. Real
 groups always win when present (`derived` is false); the derivation never mutates `ParamDef.Group` or the wire
-shape. This is what "Phase 2 is done" means. The per-session inference cache (Phase 1) is not persisted; a
-persistent semantic store (Phase 3) and intent mapping (Phase 4) are future work.
+shape. This is what "Phase 2 is done" means. Phase 3 (the persistent semantic store, `semantic.go`) now backs the
+inference cache and adds agent-authored semantics; intent mapping (Phase 4) is the remaining future work.
 
 ## GCF (token efficiency)
 

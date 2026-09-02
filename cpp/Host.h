@@ -59,6 +59,7 @@ private:
     juce::AudioPluginFormatManager formatManager;
     juce::MidiKeyboardState        keyboardState;
     std::unique_ptr<juce::AudioPluginInstance> plugin;
+    juce::PluginDescription                    loadedDesc; // identity of the loaded plugin (for the catalog fingerprint)
     std::unique_ptr<JucePluginBridge>          bridge;    // must outlive control (control holds bridge&)
     std::unique_ptr<ControlServer>             control;
 

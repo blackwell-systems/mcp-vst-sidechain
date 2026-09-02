@@ -399,7 +399,9 @@ func (s *session) handleConnectLive(ctx context.Context, _ *mcp.CallToolRequest,
 		s.live.Close()
 	}
 	s.live = lc
-	s.infer = map[string]ParamInference{} // new instance => any probed real-unit inferences are stale
+	// Reconnecting to the SAME plugin (same fingerprint) recalls persisted inferences from the store instead of
+	// forcing a re-probe; with no store this clears the cache (a fresh instance may differ).
+	s.reloadSemanticsLocked()
 	s.mu.Unlock()
 	return textResult(fmt.Sprintf("Connected LIVE to %s:%d. set_param / get_param now drive the RUNNING instance; play_note plays it; all_notes_off panics it.", host, port)), nil, nil
 }

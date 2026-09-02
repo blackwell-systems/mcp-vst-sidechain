@@ -8,6 +8,22 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Phase 3: the persistent semantic store.** Everything the bridge and the agent learn about a plugin's
+  parameters now persists per plugin, so a probe (`describe_param`'s value-text sweep) is paid once EVER and
+  agent-authored semantics survive restarts. The catalog now carries plugin identity (`Host::enumerateCatalog`
+  emits `name`/`manufacturer`/`format`/`version`/`uniqueId`); `semantic.go` keys a store by a surface FINGERPRINT
+  (`sha256(name|manufacturer|format|sortedParamIDs|count)`, version excluded so a surface-preserving bump reuses
+  the cache) over a directory of per-fingerprint JSON files with atomic temp+rename writes and field-level
+  merge-on-write (so concurrent processes never wholesale-clobber). Each param is classified on two orthogonal
+  axes: a DERIVED behavior class (`float:log:hz`, `discrete:enum`, ...) and a free-form, agent-authored ROLE
+  (`filter.cutoff`) with no bridge-enforced ontology. New tools: `annotate_params` (teach the bridge what params
+  mean, merge-updated), `get_semantic_map` (the whole plugin's semantics, the primary read for Phase 4),
+  `forget_semantics`; `describe_param` now recalls a cached inference from the store WITHOUT re-probing, even
+  headless. `connect_live` reloads persisted inferences for the same fingerprint instead of forcing a re-probe.
+  Store dir via `--semantic-dir` / `SIDECHAIN_SEMANTIC_DIR` (default: a per-user cache dir). Covered by the store
+  test suite (fingerprint equivalence, atomic round-trip + merge, behavior-class derivation, headless annotate +
+  reload, non-destructive invalidation) and a gated real-host `TestSemanticStoreLive` (probe once, recall headless)
+  run for every plugin. See `docs/PHASE3-SCOPING.md`.
 - **Concurrency MCP tools (C2/C3): the multi-controller substrate is now agent-reachable.** The C1/C2/C3 work
   was proven at the wire level but had no MCP surface; four tools expose it to an agent. `acquire_lease` /
   `release_lease` claim or release an exclusive edit lease on a param-group section (`section=`) or the whole

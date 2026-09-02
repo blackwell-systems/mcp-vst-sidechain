@@ -79,7 +79,9 @@ curve. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 |---|---|
 | `list_params` | The plugin's automatable parameters (id/label/type/range/choices/default). GCF-encoded. |
 | `get_param` | One parameter's definition + current value (real units + normalized). |
-| `describe_param` | Probe a live param's value text across its range and report the recovered semantics: unit (Hz/dB/ms/%/...), real range, curve shape, whether it is bipolar, or the labels when it is really a discrete control. How an agent learns what a hosted param actually is before driving it. |
+| `describe_param` | Probe a live param's value text across its range and report the recovered semantics: unit (Hz/dB/ms/%/...), real range, curve shape, whether it is bipolar, or the labels when it is really a discrete control, plus a derived behavior class. Recalls from the semantic store without re-probing once a param has been seen (even headless). |
+| `annotate_params` / `get_semantic_map` | Teach the bridge what params MEAN (a stable role like `filter.cutoff`, aliases, polarity) and read the whole plugin's semantic map back. Persisted per plugin (by fingerprint) across sessions. |
+| `forget_semantics` | Drop the stored semantics for the current plugin. |
 | `set_param` | Set one parameter by real units (`real=`, even on a hosted plugin whose catalog range is a bare 0..1: the value maps through the probed curve), normalized 0..1, or choice name. Validated + clamped. |
 | `set_params` | Set many params in one call, from a JSON array or a token-compact GCF table. |
 | `connect_live` / `disconnect_live` | Attach to / detach from a running host so the above drive the live instance. |

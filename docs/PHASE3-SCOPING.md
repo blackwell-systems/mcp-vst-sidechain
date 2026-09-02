@@ -1,8 +1,9 @@
 # Phase 3 scoping: the persistent semantic store
 
-Status: design, not yet implemented. This turns the Phase-3 sketch into a buildable spec by resolving each open
-decision with a recommended default, defining the data model / tool schemas / lifecycle / tests, and naming the
-one prerequisite. See [ARCHITECTURE.md](ARCHITECTURE.md) for the system and the Phase-1 inference this builds on.
+Status: IMPLEMENTED (`semantic.go`, `semantic_tools.go`). This document is the spec it was built to; the open
+decisions below were resolved with their recommended defaults (per-user cache dir; ship `get_semantic_map` now;
+version NOT in the fingerprint). See [ARCHITECTURE.md](ARCHITECTURE.md) for the system and the Phase-1 inference
+this builds on.
 
 ## Goal
 

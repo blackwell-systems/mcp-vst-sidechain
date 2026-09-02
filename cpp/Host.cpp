@@ -49,7 +49,8 @@ juce::String Host::load (const juce::String& pluginPath, double sampleRate, int 
         return "no VST3/AU plugin described by: " + pluginPath;
 
     juce::String err;
-    plugin = formatManager.createPluginInstance (*found.getFirst(), sampleRate, blockSize, err);
+    loadedDesc = *found.getFirst();   // retain the plugin identity for the catalog fingerprint
+    plugin = formatManager.createPluginInstance (loadedDesc, sampleRate, blockSize, err);
     if (plugin == nullptr)
         return "createPluginInstance failed: " + err;
 
@@ -68,6 +69,16 @@ juce::String Host::enumerateCatalog() const
     auto* root = new juce::DynamicObject();
     root->setProperty ("stateRootTag", "PARAMS");
     root->setProperty ("stateVersion", 0);   // opaque to the bridge; a host may stamp its own
+
+    // Plugin identity, for the Go side's semantic-store fingerprint (name|manufacturer|format|paramIDs|count).
+    // The version is recorded but not part of the fingerprint (a surface-preserving bump reuses the cache).
+    auto* ident = new juce::DynamicObject();
+    ident->setProperty ("name",         loadedDesc.name);
+    ident->setProperty ("manufacturer", loadedDesc.manufacturerName);
+    ident->setProperty ("format",       loadedDesc.pluginFormatName);
+    ident->setProperty ("version",      loadedDesc.version);
+    ident->setProperty ("uniqueId",     loadedDesc.uniqueId);
+    root->setProperty ("plugin", juce::var (ident));
 
     // Walk on the BASE AudioProcessorParameter API, not RangedAudioParameter. A HOSTED VST3/AU exposes its
     // parameters as juce::HostedAudioProcessorParameter (an AudioProcessorParameter that is NOT a

@@ -489,12 +489,7 @@ func TestDescribeAndSetReal(t *testing.T) {
 	if !strings.Contains(sum, "hz") || !strings.Contains(sum, "linear") {
 		t.Fatalf("describe summary = %q, want hz + linear", textOf(dres))
 	}
-	if d, ok := dout.(struct {
-		ID        string         `json:"id"`
-		Label     string         `json:"label"`
-		Inference ParamInference `json:"inference"`
-		Samples   []ValueSample  `json:"samples"`
-	}); !ok || d.Inference.Unit != "hz" || !approx(d.Inference.RealMax, 20000, 1) {
+	if d, ok := dout.(describeParamOut); !ok || d.Inference.Unit != "hz" || !approx(d.Inference.RealMax, 20000, 1) {
 		t.Fatalf("describe structured = %+v", dout)
 	}
 
@@ -535,12 +530,7 @@ func TestSetRealExponentialAnalytic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("describe: %v", err)
 	}
-	d, _ := dout.(struct {
-		ID        string         `json:"id"`
-		Label     string         `json:"label"`
-		Inference ParamInference `json:"inference"`
-		Samples   []ValueSample  `json:"samples"`
-	})
+	d, _ := dout.(describeParamOut)
 	if d.Inference.Fit == nil || d.Inference.Fit.Model != "exp" || !d.Inference.analyticReliable() {
 		t.Fatalf("expo should get a reliable exp fit, got %+v", d.Inference.Fit)
 	}
@@ -571,12 +561,7 @@ func TestSetRealPowerAnalytic(t *testing.T) {
 	if err != nil {
 		t.Fatalf("describe: %v", err)
 	}
-	d, _ := dout.(struct {
-		ID        string         `json:"id"`
-		Label     string         `json:"label"`
-		Inference ParamInference `json:"inference"`
-		Samples   []ValueSample  `json:"samples"`
-	})
+	d, _ := dout.(describeParamOut)
 	if d.Inference.Unit != "s" || d.Inference.Fit == nil || d.Inference.Fit.Model != "power" || !d.Inference.analyticReliable() {
 		t.Fatalf("power param should get a reliable power fit in s, got unit=%q fit=%+v", d.Inference.Unit, d.Inference.Fit)
 	}

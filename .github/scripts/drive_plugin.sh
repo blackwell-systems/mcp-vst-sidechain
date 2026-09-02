@@ -46,7 +46,7 @@ drive_plugin() {
   SIDECHAIN_SWEEP_PORT="$port" SIDECHAIN_SWEEP_CATALOG="$cat" \
     go test -run 'TestStateRoundTrip' -v . || rc=$?
 
-  local runexpr='TestFullSurfaceSweep|TestBatchSetParams|TestSectionLockstep'
+  local runexpr='TestFullSurfaceSweep|TestBatchSetParams|TestSectionLockstep|TestSemanticStoreLive'
   local midienv=""
   if [ "$midi" = "1" ]; then runexpr="$runexpr|TestMidiSmoke"; midienv="1"; fi
   SIDECHAIN_SWEEP_PORT="$port" \
