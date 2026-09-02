@@ -218,7 +218,9 @@ jobs:
         uses: actions/cache@v6
         with:
           path: surge
-          key: surge-xt-${{ runner.os }}-${{ env.SURGE_VERSION }}
+          # -2: bust the earlier Windows cache, which held a PARTIAL extraction (the raw unzip left the bundle's
+          # Contents/ subtree missing, so the host saw an empty .vst3). The Windows download now uses 7z (below).
+          key: surge-xt-${{ runner.os }}-${{ env.SURGE_VERSION }}-2
 
       - name: Download Surge XT (Linux/macOS)
         if: runner.os != 'Windows' && steps.surge-cache.outputs.cache-hit != 'true'
@@ -248,7 +250,14 @@ jobs:
           mkdir -p surge
           curl -sSL -o surge/surge.zip \
             "https://github.com/surge-synthesizer/releases-xt/releases/download/${SURGE_VERSION}/surge-xt-win64-${SURGE_VERSION}-pluginsonly.zip"
-          unzip -qo surge/surge.zip -d surge "Surge XT.vst3/*"
+          # Extract the FULL bundle with 7z: the runner's Git Bash unzip left the .vst3's Contents/ subtree missing
+          # (diagnosed via "Contents=0"), so the host saw an empty bundle. 7z is preinstalled and extracts the
+          # nested module (Contents/x86_64-win/Surge XT.vst3) reliably; fall back to unzip if 7z is ever absent.
+          if command -v 7z >/dev/null 2>&1; then
+            7z x -y -osurge surge/surge.zip >/dev/null
+          else
+            unzip -qo surge/surge.zip -d surge
+          fi
 
       # --- the smoke assertion: run the SHIPPED sidechain in managed self-test against the plugin, assert exit 0.
       # Managed mode spawns the adjacent sidechain-host (kept beside it in the bundle), waits for its catalog,
