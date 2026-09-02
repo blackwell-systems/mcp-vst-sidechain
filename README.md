@@ -5,7 +5,9 @@
 `mcp-vst-sidechain` is a generic [MCP](https://modelcontextprotocol.io) bridge that hosts any VST3/AU plugin
 and exposes its parameters to an AI agent in realtime. Point it at your licensed Serum, Diva, or Kontakt (or a
 free effect), and through a single MCP endpoint an agent can enumerate the plugin's full automatable control
-surface, read and set any parameter live, play notes, and save or recall its complete state.
+surface, read and set any parameter live (by real units like "1000 Hz", even on plugins that only expose a raw
+0..1), play notes, save or recall its complete state, and build up a durable map of what each parameter means.
+Several agents can drive one instance at once without fighting over the same controls.
 
 Sidechain talks to plugins only through the standard VST3/AU API, the same way a DAW hosts thousands of
 closed-source commercial plugins without ever seeing their source. You bring your own licensed binaries;
@@ -13,8 +15,9 @@ nothing is patched and nothing is redistributed.
 
 > Status: early but working. The Go MCP layer, the C++ control server, and the child-plugin host (the JUCE
 > `AudioPluginFormatManager` wrapper) are tested end to end: an integration matrix drives real VST3/AU plugins on
-> macOS and Linux, multiple agents can control one instance at once, and a semantic layer recovers real-unit
-> control from probe-only plugins. No release is tagged yet.
+> macOS and Linux, multiple agents can control one instance at once (with edit leases so they do not collide), a
+> semantic layer recovers real-unit control from probe-only plugins, and the learned semantics persist across
+> sessions. No release is tagged yet.
 
 ## Why
 
@@ -113,7 +116,7 @@ only.)
 ### 3. Load a plugin and start the host
 
 ```bash
-./cpp/build/sidechain-host_artefacts/sidechain-host \
+./cpp/build/sidechain-host_artefacts/Release/sidechain-host \
     --plugin "/Library/Audio/Plug-Ins/VST3/YourSynth.vst3" \
     --catalog plugin-catalog.json \
     --port 51703
@@ -140,6 +143,7 @@ to drive it live.
 | `--plugin` (host) | - | Path to a `.vst3` or `.component` to load. |
 | `--port` (host) / `connect_live` port | `51703` | Loopback control port. |
 | `SIDECHAIN_MCP_FORMAT` | `gcf` | `json` forces plain-JSON tool output instead of GCF. |
+| `--semantic-dir` / `SIDECHAIN_SEMANTIC_DIR` | per-user cache dir | Where learned param semantics persist (per-plugin files), so a probe/annotation is paid once and reused across sessions. |
 
 ## Using the library
 
