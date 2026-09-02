@@ -188,7 +188,12 @@ jobs:
           stem="sidechain_${{ steps.ver.outputs.version }}_${{ matrix.goos }}_${{ matrix.arch }}"
           mkdir -p unpacked
           if [ "${{ matrix.goos }}" = "windows" ]; then
-            unzip -qo "dl/${stem}.zip" -d unpacked
+            # Git Bash on windows-latest lacks `unzip`; prefer it if present, else 7z (preinstalled on the runner).
+            if command -v unzip >/dev/null 2>&1; then
+              unzip -qo "dl/${stem}.zip" -d unpacked
+            else
+              7z x -y -ounpacked "dl/${stem}.zip" >/dev/null
+            fi
           else
             tar -xzf "dl/${stem}.tar.gz" -C unpacked
             # Clear the quarantine attribute the same way the shipped NOTICE instructs users to (macOS only).

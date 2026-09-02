@@ -112,8 +112,17 @@ EOF
 archive_base="${stem}"
 if [ "$os" = "windows" ]; then
   archive="${archive_base}.zip"
-  # Zip from the stage's parent so the archive contains the top-level ${stem}/ directory.
-  ( cd "$(dirname "$stage")" && zip -qr "$out_dir/$archive" "$stem" )
+  # Zip from the stage's parent so the archive contains the top-level ${stem}/ directory. GitHub's windows-latest
+  # Git Bash does not ship `zip`, so prefer it when present (portability) and fall back to 7z, which is
+  # preinstalled on the Windows runner. Both produce a standard zip.
+  ( cd "$(dirname "$stage")" && \
+    if command -v zip >/dev/null 2>&1; then
+      zip -qr "$out_dir/$archive" "$stem"
+    elif command -v 7z >/dev/null 2>&1; then
+      7z a -tzip -bso0 -bsp0 "$out_dir/$archive" "$stem" >/dev/null
+    else
+      echo "no zip or 7z available to create $archive" >&2; exit 1
+    fi )
 else
   archive="${archive_base}.tar.gz"
   tar -czf "$out_dir/$archive" -C "$(dirname "$stage")" "$stem"
