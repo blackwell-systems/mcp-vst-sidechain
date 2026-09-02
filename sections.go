@@ -9,9 +9,10 @@
 // applied as a FALLBACK - only when the catalog is effectively ungrouped (every param is "other"/empty). When a
 // plugin exposes real groups, those are kept verbatim and no derivation happens.
 //
-// The C++ host mirrors this algorithm in JucePluginBridge::deriveLabelSections (cpp/JucePluginBridge.h) to bind
-// the C3 governed layer's leasable SECTIONS on a flat plugin, so an agent paging a flat plugin by section here can
-// lease that same section on the host. Keep the two in lockstep (verified against TAL-NoiseMaker's real labels).
+// The HOST is now the primary source of sectioning: it emits a per-param `section` (cpp/Sectioning.h) and the
+// catalog prefers it (see computeEffectiveGroups), so this Go derivation runs only as a FALLBACK for catalogs that
+// carry no `section` (older or hand-built). It is also the reference ORACLE the gated TestSectionLockstep checks
+// the host's output against on every plugin, so the two implementations stay provably in lockstep.
 
 package sidechain
 

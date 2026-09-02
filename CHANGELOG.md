@@ -80,14 +80,24 @@ All notable changes to this project are documented here. The format is based on
   governed-convergence engine for the small invariant-bearing coordination state. Validated by the gated
   `TestChangeNotifications` (controller A sets a param, controller B receives the attributed event). See
   `docs/CONCURRENCY.md`.
+- **The host emits derived sections in the catalog (`section`), and owns sectioning.** Each catalog row now carries
+  a `section` field (alongside the raw `group`): the EFFECTIVE navigable section, which is the param's tree group
+  when it has one, else a section DERIVED from shared label prefixes, else `"other"`. A new `cpp/Sectioning.h`
+  (`computeSections`) is the single source of truth on the host for this, used by BOTH the catalog emitter and the
+  C3 governed layer's leasable sections (collapsing what had been three separate tree walks / derivations into
+  one). The Go catalog now PREFERS the host-emitted `section` for its effective-group view (`list_params group=`,
+  `Groups`/`Filter`), so sectioning is computed once on the host rather than re-derived in Go; the Go derivation
+  (`sections.go`) is retained only as a fallback for catalogs without `section` and as the reference oracle. A new
+  gated `TestSectionLockstep`, run by `drive_plugin.sh` for every hosted plugin, asserts the host's emitted
+  sections equal the Go reference per param, so the two implementations are provably in lockstep in CI (validated
+  on Surge grouped = 774 params and TAL flat/derived = 89 params).
 - **Label-prefix sectioning ported to the host for flat plugins.** A plugin with no parameter-tree groups (a flat
-  parameter list) now still exposes leasable governed sections: `JucePluginBridge::deriveLabelSections` derives
-  them from shared label prefixes, a faithful C++ port of the Go catalog's `sections.go` (labels tokenized on
-  non-alphanumeric runs with pure-number tokens dropped, a prefix promoted to a section when at least three params
-  share it, each param taking its longest qualifying prefix). Verified to match the Go derivation exactly on
-  TAL-NoiseMaker's real labels (Amp, Delay, Envelope, Filter, Osc, Reverb, ...), so an agent paging a flat plugin
-  by section can lease that same section. Falls back only when the parameter tree exposes no groups; a report-only
-  Linux CI leg drives TAL's derived section leases end to end.
+  parameter list) exposes leasable governed sections derived from shared label prefixes (a faithful C++ port of the
+  Go catalog's `sections.go`: labels tokenized on non-alphanumeric runs with pure-number tokens dropped, a prefix
+  promoted to a section when at least three params share it, each param taking its longest qualifying prefix).
+  Verified to match the Go derivation exactly on TAL-NoiseMaker's real labels (Amp, Delay, Envelope, Filter, Osc,
+  Reverb, ...), so an agent paging a flat plugin by section can lease that same section. (Now folded into
+  `computeSections`, above.) A report-only Linux CI leg drives TAL's derived section leases end to end.
 - **Section leases bind to the plugin's param groups.** A governed section lease is now taken on a real param
   group by name (`govern{op:acquire_section, group:"Filters"}`) rather than an abstract index. `PluginBridge`
   gained `sectionGroups()` (JucePluginBridge walks the parameter tree for the distinct groups, first-seen order);

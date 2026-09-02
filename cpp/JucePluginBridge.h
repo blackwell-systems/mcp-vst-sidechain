@@ -1,18 +1,15 @@
 #pragma once
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_audio_basics/juce_audio_basics.h>
-#include <algorithm>
 #include <atomic>
-#include <cctype>
 #include <cmath>
-#include <functional>
 #include <memory>
 #include <string>
 #include <unordered_map>
-#include <unordered_set>
 #include <utility>
 #include <vector>
 #include "PluginBridge.h"
+#include "Sectioning.h"
 
 // ================================================================================================
 // sidechain::JucePluginBridge - the concrete PluginBridge that hosts a real VST3/AU. It is the ONLY piece that
@@ -55,40 +52,9 @@ public:
         }
         for (auto* p : params) p->addListener (this);
 
-        // Collect the distinct parameter groups (VST3 units / AU clumps), in first-seen order, the same way the
-        // catalog does. These are the leasable edit sections the governed layer binds to; a flat plugin yields none.
-        std::function<void (const juce::AudioProcessorParameterGroup&)> walk =
-            [&] (const juce::AudioProcessorParameterGroup& g)
-            {
-                for (auto* node : g)
-                {
-                    if (node->getParameter() != nullptr)
-                    {
-                        const juce::String gn = g.getName();
-                        if (gn.isNotEmpty())
-                        {
-                            const std::string s = gn.toStdString();
-                            if (std::find (groups.begin(), groups.end(), s) == groups.end())
-                                groups.push_back (s);
-                        }
-                    }
-                    else if (auto* sub = node->getGroup())
-                        walk (*sub);
-                }
-            };
-        walk (processor.getParameterTree());
-
-        // Flat plugin (no parameter-tree groups): derive sections from shared label prefixes, the same fallback the
-        // Go catalog view uses (sections.go). Keep the two in lockstep so an agent paging a flat plugin by section
-        // can lease that same section here.
-        if (groups.empty())
-        {
-            std::vector<std::string> labels;
-            for (auto* p : params)
-                if (p->isAutomatable())
-                    labels.push_back (p->getName (256).toStdString());
-            groups = deriveLabelSections (labels);
-        }
+        // The leasable governed sections: the plugin's param groups, or (for a flat plugin) sections derived from
+        // shared label prefixes. computeSections (Sectioning.h) is the single source of truth the catalog also uses.
+        groups = computeSections (processor).leasable;
     }
 
     ~JucePluginBridge() override
@@ -217,79 +183,6 @@ private:
         bool                           useReal = false;   // ranged AND continuous: value<->norm uses the plugin's curve
         std::string                    id;                // the stable string id (for change events)
     };
-
-    // Label-prefix sectioning, a faithful port of sections.go (deriveSections/labelTokens/sortedSections) for
-    // flat plugins. A leading token-prefix (labels split on non-alphanumeric runs, pure-number tokens dropped so
-    // "Osc 1 Tune"/"Osc 2 Tune" share "Osc") becomes a section when at least kSectionMinShare params share it;
-    // each param takes its LONGEST qualifying prefix. Returns the distinct section names, sorted case-insensitively
-    // ("other" is never leasable, so it is omitted here rather than sorted last). Keep in lockstep with sections.go.
-    static std::vector<std::string> deriveLabelSections (const std::vector<std::string>& labels)
-    {
-        constexpr int kSectionMinShare = 3;
-
-        auto tokenize = [] (const std::string& label)
-        {
-            std::vector<std::string> out;
-            std::string cur;
-            auto flush = [&]
-            {
-                if (! cur.empty())
-                {
-                    bool allDigits = true;
-                    for (char ch : cur) if (ch < '0' || ch > '9') { allDigits = false; break; }
-                    if (! allDigits) out.push_back (cur);   // pure-number tokens are indices, not section words
-                    cur.clear();
-                }
-            };
-            for (char ch : label)
-            {
-                const bool alnum = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
-                if (alnum) cur += ch; else flush();
-            }
-            flush();
-            return out;
-        };
-
-        std::vector<std::vector<std::string>> tokens;
-        tokens.reserve (labels.size());
-        std::unordered_map<std::string, int> prefixCount;
-        for (const auto& lbl : labels)
-        {
-            auto tk = tokenize (lbl);
-            std::string pref;
-            for (size_t l = 0; l < tk.size(); ++l)
-            {
-                if (l) pref += ' ';
-                pref += tk[l];
-                ++prefixCount[pref];
-            }
-            tokens.push_back (std::move (tk));
-        }
-
-        std::vector<std::string> sections;                 // distinct, in first-seen order (sorted below)
-        std::unordered_set<std::string> seen;
-        for (const auto& tk : tokens)
-        {
-            std::string chosen;                            // the longest qualifying prefix, if any
-            for (size_t l = tk.size(); l >= 1; --l)
-            {
-                std::string pref;
-                for (size_t k = 0; k < l; ++k) { if (k) pref += ' '; pref += tk[k]; }
-                auto it = prefixCount.find (pref);
-                if (it != prefixCount.end() && it->second >= kSectionMinShare) { chosen = pref; break; }
-            }
-            if (! chosen.empty() && seen.insert (chosen).second)
-                sections.push_back (chosen);
-        }
-
-        std::sort (sections.begin(), sections.end(), [] (const std::string& a, const std::string& b)
-        {
-            auto lower = [] (std::string s) { for (auto& ch : s) ch = (char) std::tolower ((unsigned char) ch); return s; };
-            const std::string la = lower (a), lb = lower (b);
-            return la != lb ? la < lb : a < b;
-        });
-        return sections;
-    }
 
     // Map a normalized value to catalog space (real units for a continuous native param, a step index for a
     // discrete one, else the normalized value itself).

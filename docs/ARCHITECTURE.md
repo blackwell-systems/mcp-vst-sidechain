@@ -92,12 +92,16 @@ a `JucePluginBridge`) at the hosted processor. `main.cpp` is a thin CLI that dri
   `AudioProcessorParameter` API (not `RangedAudioParameter`) and emits the catalog JSON the Go server reads. The
   base API is used deliberately: a hosted VST3/AU exposes its parameters as `HostedAudioProcessorParameter`,
   which is not a `RangedAudioParameter`, so a ranged cast would drop every hosted param. Each row carries
-  `id`, `label`, `group`, `type`, `min`, `max`, `step`, `default`, `hasRealRange`, and (for choices) `choices`.
-  The root object also stamps `stateRootTag`, `stateVersion`, and `count`. Only automatable params are emitted.
-- **Parameter-tree grouping.** VST3 units and AU clumps surface as nested `AudioProcessorParameterGroup`s in the
-  plugin's parameter tree. Enumeration walks that tree once and records each param's immediate parent group name,
-  giving an agent a handle to page a large surface. A plugin with a flat tree leaves the group empty, which the
-  Go side maps to `"other"`.
+  `id`, `label`, `group`, `section`, `type`, `min`, `max`, `step`, `default`, `hasRealRange`, and (for choices)
+  `choices`. The root object also stamps `stateRootTag`, `stateVersion`, and `count`. Only automatable params are emitted.
+- **Sectioning (`group` vs `section`, `cpp/Sectioning.h`).** `group` is the raw parameter-tree group: VST3 units
+  and AU clumps surface as nested `AudioProcessorParameterGroup`s, and enumeration records each param's immediate
+  parent group name (empty for a flat tree). `section` is the EFFECTIVE navigable section: that group when present,
+  else one DERIVED from shared label prefixes ("Filter Cutoff"/"Filter Resonance" -> "Filter"), else `"other"`.
+  `computeSections` is the single source of truth for this on the host - the same computation the C3 governed layer
+  uses for its leasable sections - so the host, not the Go side, derives sections; the Go catalog prefers the
+  emitted `section` and keeps its own derivation (`sections.go`) only as a fallback and as the reference oracle the
+  gated `TestSectionLockstep` cross-checks the host against on every plugin.
 - **Type inference from the base API.** A param that `isDiscrete()` with value-strings becomes a `choice` (with
   the strings as `choices`); a boolean or a 2-step param becomes `bool`; any other discrete param becomes `int`;
   everything else is `float`.

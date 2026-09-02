@@ -1,6 +1,5 @@
 #include "Host.h"
-#include <functional>
-#include <unordered_map>
+#include "Sectioning.h"
 
 namespace sidechain
 {
@@ -76,25 +75,11 @@ juce::String Host::enumerateCatalog() const
     // everything the bridge needs: a normalized value/default, a step count, and value<->text via the
     // plugin's own formatter. Real-unit endpoints come from getText(0/1). A stable string id comes from a
     // HostedAudioProcessorParameter when available, else the parameter index.
-    // Map each parameter to its group. VST3 "units" and AU parameter clumps surface as nested
-    // AudioProcessorParameterGroups in the plugin's parameter tree; the immediate parent's name gives an agent a
-    // handle to page a large surface (real instruments report hundreds of params). A plugin with a flat tree
-    // just leaves the group empty, which the Go side maps to "other" - no regression.
-    std::unordered_map<const juce::AudioProcessorParameter*, juce::String> groupOf;
-    {
-        std::function<void (const juce::AudioProcessorParameterGroup&)> walk =
-            [&] (const juce::AudioProcessorParameterGroup& g)
-            {
-                for (auto* node : g)
-                {
-                    if (auto* param = node->getParameter())
-                        groupOf[param] = g.getName();
-                    else if (auto* sub = node->getGroup())
-                        walk (*sub);
-                }
-            };
-        walk (plugin->getParameterTree());
-    }
+    // Section each param. `group` is the raw parameter-tree group (VST3 unit / AU clump), empty for a flat plugin.
+    // `section` is the EFFECTIVE navigable section: that group when present, else one derived from shared label
+    // prefixes, else "other". computeSections (Sectioning.h) is the single source of truth - the same computation
+    // the C3 governed layer uses for leasable sections - so the host, not the Go side, derives sections.
+    const auto sections = computeSections (*plugin);
 
     juce::Array<juce::var> params;
     const auto& all = plugin->getParameters();
@@ -158,8 +143,10 @@ juce::String Host::enumerateCatalog() const
             def = juce::jlimit (0.0, n, p->getDefaultValue() * n);
         }
 
-        const auto git = groupOf.find (p);
-        one->setProperty ("group",        git != groupOf.end() ? git->second : juce::String());
+        const auto rg = sections.rawGroup.find (p);
+        const auto ef = sections.effective.find (p);
+        one->setProperty ("group",        rg != sections.rawGroup.end() ? juce::String (rg->second) : juce::String());
+        one->setProperty ("section",      ef != sections.effective.end() ? juce::String (ef->second) : juce::String ("other"));
         one->setProperty ("type",         type);
         one->setProperty ("min",          lo);
         one->setProperty ("max",          hi);

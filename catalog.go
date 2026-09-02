@@ -31,8 +31,9 @@ import (
 type ParamDef struct {
 	ID           string   `json:"id"`
 	Label        string   `json:"label"`
-	Group        string   `json:"group"` // best-effort category; may be "" / "other"
-	Type         string   `json:"type"`  // float/int/bool/choice
+	Group        string   `json:"group"`             // best-effort raw category; may be "" / "other"
+	Section      string   `json:"section,omitempty"` // effective navigable section (host-emitted: raw group, else label-derived, else "other")
+	Type         string   `json:"type"`              // float/int/bool/choice
 	Min          float64  `json:"min"`
 	Max          float64  `json:"max"`
 	Step         float64  `json:"step"`
@@ -80,9 +81,12 @@ func NewCatalog(params []ParamDef) *Catalog {
 	return c
 }
 
-// computeEffectiveGroups fills effGroup once. If any param carries a real group (a non-empty group other than
-// "other"), the catalog keeps its real groups verbatim (no derivation). Only when the catalog is effectively
-// ungrouped (every param is "other") does it fall back to label-prefix sections.
+// computeEffectiveGroups fills effGroup once. The effective section is the host-emitted Section when the catalog
+// carries one for every param (the host is the single source of truth: raw group, else a label-prefix section,
+// else "other"). Older or hand-built catalogs without Section fall back to the Go derivation: real groups verbatim
+// when the plugin exposes any, else label-prefix sections (see sections.go). derived records which case we are in
+// (it drives Groups() ordering: real groups sort case-sensitively, derived sections case-insensitively with
+// "other" last).
 func (c *Catalog) computeEffectiveGroups() {
 	c.effGroup = make([]string, len(c.Params))
 	hasReal := false
@@ -92,15 +96,32 @@ func (c *Catalog) computeEffectiveGroups() {
 			break
 		}
 	}
+	c.derived = !hasReal
+
+	if c.allHaveSection() {
+		for i := range c.Params {
+			c.effGroup[i] = c.Params[i].Section
+		}
+		return
+	}
 	if hasReal {
-		c.derived = false
 		for i := range c.Params {
 			c.effGroup[i] = c.Params[i].Group
 		}
 		return
 	}
-	c.derived = true
 	c.effGroup = deriveSections(c.Params)
+}
+
+// allHaveSection reports whether every param carries a host-emitted effective section, so the catalog can use it
+// directly instead of re-deriving.
+func (c *Catalog) allHaveSection() bool {
+	for i := range c.Params {
+		if strings.TrimSpace(c.Params[i].Section) == "" {
+			return false
+		}
+	}
+	return len(c.Params) > 0
 }
 
 // loadCatalogJSON parses a catalog JSON blob (the shape the C++ host emits: {stateRootTag, stateVersion,

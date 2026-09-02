@@ -9,6 +9,26 @@ import (
 	"testing"
 )
 
+// TestHostSectionPreferred: when the catalog carries host-emitted Section fields, the effective-group view uses
+// them directly (the host is the single source of truth) instead of re-deriving from labels. Here the labels would
+// derive to a single "Xyz" section, but the host's Section says Filter/Amp - and the host wins.
+func TestHostSectionPreferred(t *testing.T) {
+	c := NewCatalog([]ParamDef{
+		{ID: "a", Label: "Xyz One", Section: "Filter", Type: "float"},
+		{ID: "b", Label: "Xyz Two", Section: "Filter", Type: "float"},
+		{ID: "c", Label: "Xyz Three", Section: "Amp", Type: "float"},
+	})
+	if g := c.Groups(); len(g) != 2 || g[0] != "Amp" || g[1] != "Filter" {
+		t.Fatalf("Groups should come from the host Section, got %v", g)
+	}
+	if m := c.Filter("Filter", ""); len(m) != 2 {
+		t.Fatalf("Filter by host Section: got %d want 2", len(m))
+	}
+	if m := c.Filter("amp", ""); len(m) != 1 || m[0].ID != "c" {
+		t.Fatalf("Filter amp by host Section: got %v", m)
+	}
+}
+
 // flatCatalog is a TAL-NoiseMaker-like catalog: NO groups reported, structure lives only in the labels.
 func flatCatalog() *Catalog {
 	return NewCatalog([]ParamDef{
