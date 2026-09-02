@@ -1,0 +1,360 @@
+name: Release
+
+# Tag-triggered release pipeline. On a v* tag it builds prebuilt, ready-to-run bundles so users skip the cold
+# JUCE build (roughly 20 minutes on a fresh checkout). Each bundle carries BOTH binaries together:
+#
+#   sidechain        the pure-Go MCP server (stdio). Cross-compiles trivially, built natively on each leg here.
+#   sidechain-host   the native JUCE plugin host. This is the load-bearing artifact: it needs per-platform
+#                    native toolchains plus a JUCE build, so GoReleaser / cross-compile cannot produce it. Its
+#                    build steps are copied verbatim from cpp.yml (deps, JUCE FetchContent cache, configure,
+#                    build the sidechain-host target in Release).
+#
+# The server discovers the host beside itself (managed mode), so both ship in one archive per platform.
+#
+# Job graph:
+#   build  (matrix: ubuntu-latest, macos-14, macos-13, windows-latest)
+#     -> builds both binaries, packages one archive per platform, uploads it as a workflow artifact.
+#   smoke  (needs: build; matrix: same OSes)
+#     -> downloads that OS's archive, unpacks it, downloads a free plugin (Surge XT VST3, as integration.yml
+#        does, under xvfb on Linux) and runs the SHIPPED binary: sidechain --plugin <p> --selftest. This proves
+#        the shipped bytes work via the primary entry point. REQUIRED gate.
+#   release (needs: build, smoke)
+#     -> downloads every archive, computes checksums.txt, and attaches everything to the GitHub Release.
+#
+# Deliberately deferred for a later release (do not add here): Homebrew tap, Scoop/winget, npm/pypi, Docker,
+# GoReleaser, and macOS code-signing + notarization. See the "later" note in the release job.
+
+on:
+  push:
+    tags: ['v*']
+  # Manual dispatch lets us dry-run the build + smoke path without cutting a real tag (the release job is
+  # tag-gated below, so a dispatch run builds and smoke-tests but does not publish).
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Free open-source plugin used by the smoke gate, pinned to the same version integration.yml proves against.
+  SURGE_VERSION: "1.3.4"
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # arm64 mac on macos-14; x86_64 mac on macos-13 for Intel coverage. Linux + Windows are amd64 runners.
+          - os: ubuntu-latest
+            goos: linux
+            arch: amd64
+          - os: macos-14
+            goos: macos
+            arch: arm64
+          - os: macos-13
+            goos: macos
+            arch: amd64
+          - os: windows-latest
+            goos: windows
+            arch: amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+          cache: true
+
+      # --- host build: copied from cpp.yml (deps, JUCE cache, configure, build sidechain-host in Release) ---
+      - name: Install Linux JUCE deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev libcurl4-openssl-dev \
+            libfreetype-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev libwebkit2gtk-4.1-dev libglu1-mesa-dev
+
+      - name: Cache JUCE FetchContent
+        uses: actions/cache@v6
+        with:
+          path: cpp/build/_deps
+          key: juce-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('cpp/CMakeLists.txt') }}
+
+      - name: Configure host
+        run: cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build host
+        run: cmake --build cpp/build --target sidechain-host --config Release
+
+      # --- Go server: pure Go, so a native go build on each leg is fine. Version is stamped into main.Version. ---
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          # Strip a leading refs/tags/v for a tag push; fall back to the short SHA for workflow_dispatch dry runs.
+          ref="${GITHUB_REF#refs/tags/}"
+          if [ "$ref" != "$GITHUB_REF" ]; then
+            version="${ref#v}"
+          else
+            version="0.0.0-dev+${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "building version $version"
+
+      - name: Build Go server
+        shell: bash
+        run: |
+          out="sidechain"
+          if [ "${{ matrix.goos }}" = "windows" ]; then out="sidechain.exe"; fi
+          go build -o "$out" -ldflags "-s -w -X main.Version=${{ steps.ver.outputs.version }}" ./cmd/sidechain
+
+      # --- package both binaries into one archive per platform (scripts/package_release.sh) ---
+      - name: Package bundle
+        id: pkg
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            host="cpp/build/sidechain-host_artefacts/Release/sidechain-host.exe"
+            go="sidechain.exe"
+          else
+            host="cpp/build/sidechain-host_artefacts/Release/sidechain-host"
+            go="sidechain"
+          fi
+          archive=$(scripts/package_release.sh \
+            "${{ steps.ver.outputs.version }}" "${{ matrix.goos }}" "${{ matrix.arch }}" \
+            "$host" "$go" dist)
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Upload bundle artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.pkg.outputs.archive }}
+          path: dist/${{ steps.pkg.outputs.archive }}
+          if-no-files-found: error
+
+  smoke:
+    # REQUIRED gate: run the SHIPPED binary in self-test on each platform, proving the released bytes work via
+    # the primary managed-mode entry point (server spawns the adjacent host, enumerates, connects, sets a param).
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            goos: linux
+            arch: amd64
+          - os: macos-14
+            goos: macos
+            arch: arm64
+          - os: macos-13
+            goos: macos
+            arch: amd64
+          - os: windows-latest
+            goos: windows
+            arch: amd64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Compute version
+        id: ver
+        shell: bash
+        run: |
+          ref="${GITHUB_REF#refs/tags/}"
+          if [ "$ref" != "$GITHUB_REF" ]; then
+            version="${ref#v}"
+          else
+            version="0.0.0-dev+${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Download this platform's bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: sidechain_${{ steps.ver.outputs.version }}_${{ matrix.goos }}_${{ matrix.arch }}${{ matrix.goos == 'windows' && '.zip' || '.tar.gz' }}
+          path: dl
+
+      - name: Unpack bundle
+        id: unpack
+        shell: bash
+        run: |
+          set -euo pipefail
+          stem="sidechain_${{ steps.ver.outputs.version }}_${{ matrix.goos }}_${{ matrix.arch }}"
+          mkdir -p unpacked
+          if [ "${{ matrix.goos }}" = "windows" ]; then
+            unzip -qo "dl/${stem}.zip" -d unpacked
+          else
+            tar -xzf "dl/${stem}.tar.gz" -C unpacked
+            # Clear the quarantine attribute the same way the shipped NOTICE instructs users to (macOS only).
+            if [ "${{ runner.os }}" = "macOS" ]; then
+              xattr -dr com.apple.quarantine "unpacked/${stem}" || true
+            fi
+          fi
+          echo "dir=unpacked/${stem}" >> "$GITHUB_OUTPUT"
+
+      # --- Linux JUCE runtime deps + xvfb: the host loads a plugin (JUCE touches X at construction), copied from
+      # integration.yml's smoke-linux leg. macOS/Windows need no extra runtime deps here. ---
+      - name: Install Linux runtime deps + xvfb
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libasound2-dev libjack-jackd2-dev libcurl4-openssl-dev \
+            libfreetype-dev libx11-dev libxcomposite-dev libxcursor-dev libxext-dev \
+            libxinerama-dev libxrandr-dev libxrender-dev libwebkit2gtk-4.1-dev libglu1-mesa-dev \
+            xvfb
+
+      # --- download a free plugin the way integration.yml does: Surge XT VST3, pinned official release. Surge
+      # ships a clean "pluginsonly" archive with a VST3 bundle for every platform, so one plugin covers all
+      # three OSes (integration.yml already proves this exact download + load path). ---
+      - name: Cache Surge XT
+        id: surge-cache
+        uses: actions/cache@v6
+        with:
+          path: surge
+          key: surge-xt-${{ runner.os }}-${{ env.SURGE_VERSION }}
+
+      - name: Download Surge XT (Linux/macOS)
+        if: runner.os != 'Windows' && steps.surge-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p surge
+          if [ "${{ runner.os }}" = "macOS" ]; then
+            curl -sSL -o surge/surge.zip \
+              "https://github.com/surge-synthesizer/releases-xt/releases/download/${SURGE_VERSION}/surge-xt-macos-${SURGE_VERSION}-pluginsonly.zip"
+            unzip -qo surge/surge.zip -d surge "Surge XT.vst3/*"
+          else
+            curl -sSL -o surge/surge.tar.gz \
+              "https://github.com/surge-synthesizer/releases-xt/releases/download/${SURGE_VERSION}/surge-xt-linux-${SURGE_VERSION}-pluginsonly.tar.gz"
+            tar xzf surge/surge.tar.gz -C surge "./Surge XT.vst3"
+          fi
+
+      - name: Download Surge XT (Windows)
+        if: runner.os == 'Windows' && steps.surge-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p surge
+          curl -sSL -o surge/surge.zip \
+            "https://github.com/surge-synthesizer/releases-xt/releases/download/${SURGE_VERSION}/surge-xt-win64-${SURGE_VERSION}-pluginsonly.zip"
+          unzip -qo surge/surge.zip -d surge "Surge XT.vst3/*"
+
+      # --- the smoke assertion: run the SHIPPED sidechain in managed self-test against the plugin, assert exit 0.
+      # Managed mode spawns the adjacent sidechain-host (kept beside it in the bundle), waits for its catalog,
+      # connects, sets a param. On Linux the host is wrapped in xvfb-run -a (integration.yml pattern). ---
+      - name: Self-test the shipped binary (Linux/macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="${{ steps.unpack.outputs.dir }}"
+          plugin="$PWD/surge/Surge XT.vst3"
+          test -d "$plugin" || { echo "plugin not found: $plugin"; ls -la surge; exit 1; }
+          if [ "${{ runner.os }}" = "Linux" ]; then
+            xvfb-run -a "$dir/sidechain" --plugin "$plugin" --selftest
+          else
+            "$dir/sidechain" --plugin "$plugin" --selftest
+          fi
+          echo "self-test passed"
+
+      - name: Self-test the shipped binary (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          dir="${{ steps.unpack.outputs.dir }}"
+          plugin="$PWD/surge/Surge XT.vst3"
+          test -d "$plugin" || { echo "plugin not found: $plugin"; ls -la surge; exit 1; }
+          "$dir/sidechain.exe" --plugin "$plugin" --selftest
+          echo "self-test passed"
+
+  release:
+    needs: [build, smoke]
+    # Publish only on a real tag push. A workflow_dispatch dry run exercises build + smoke but stops here.
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all bundles
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Compute version
+        id: ver
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          set -euo pipefail
+          # One sha256 line per bundle (sorted for a stable file), the standard `sha256sum -c` format.
+          sha256sum sidechain_* | sort -k2 > checksums.txt
+          cat checksums.txt
+
+      - name: Release notes
+        id: notes
+        run: |
+          v="${{ steps.ver.outputs.version }}"
+          {
+            echo "## Sidechain v$v"
+            echo
+            echo "Prebuilt, ready-to-run bundles. Each archive contains BOTH binaries in one directory: the Go"
+            echo "MCP server (\`sidechain\`) and the native JUCE host (\`sidechain-host\`). No JUCE build needed."
+            echo
+            echo "### Install"
+            echo
+            echo "1. Download the archive for your platform below and unpack it."
+            echo "2. macOS only: clear Gatekeeper quarantine on the unpacked directory (these bundles are not yet"
+            echo "   signed or notarized):"
+            echo
+            echo '   ```bash'
+            echo "   xattr -dr com.apple.quarantine ./sidechain_${v}_macos_arm64"
+            echo '   ```'
+            echo
+            echo "3. Register the server in your MCP client, pointing it at a plugin (managed mode spawns the host"
+            echo "   beside it automatically):"
+            echo
+            echo '   ```bash'
+            echo "   claude mcp add sidechain -- /absolute/path/to/sidechain --plugin \"/path/to/YourPlugin.vst3\""
+            echo '   ```'
+            echo
+            echo "   Or in Claude Desktop (\`claude_desktop_config.json\`):"
+            echo
+            echo '   ```json'
+            echo '   {'
+            echo '     "mcpServers": {'
+            echo '       "sidechain": {'
+            echo '         "command": "/absolute/path/to/sidechain",'
+            echo '         "args": ["--plugin", "/path/to/YourPlugin.vst3"]'
+            echo '       }'
+            echo '     }'
+            echo '   }'
+            echo '   ```'
+            echo
+            echo "Verify a bundle before trusting it with \`sha256sum -c checksums.txt\`."
+          } > notes.md
+          echo "path=notes.md" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: ${{ steps.notes.outputs.path }}
+          files: |
+            dist/sidechain_*
+            dist/checksums.txt
+          fail_on_unmatched_files: true
+
+      # Later (deferred, do NOT implement in this first release):
+      #   * macOS code-signing + notarization of sidechain-host / sidechain, so the xattr quarantine step above
+      #     is no longer needed. This would slot in as a step on the macos-* build legs (import cert, codesign,
+      #     notarytool submit + staple) before packaging.
+      #   * Homebrew tap / Scoop / winget manifests pointing at these release archives + checksums. A Homebrew
+      #     cask would download the archive, run the quarantine step, and symlink sidechain onto PATH.
+      # Kept out on purpose: this first release is bundles + checksums + a GitHub Release gated by the smoke job.
