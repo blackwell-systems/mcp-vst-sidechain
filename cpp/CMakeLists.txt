@@ -49,6 +49,14 @@ target_link_libraries(sidechain-host PRIVATE
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags)
 
+# Warnings-as-errors on OUR two translation units ONLY (main.cpp, Host.cpp), so warnings in our code fail the build
+# and cannot rot. It is NOT applied target-wide: juce_add_console_app compiles JUCE's own module sources into the
+# target, and JUCE is not warning-clean under -Werror (e.g. a deprecated wstring_convert in juce_audio_processors),
+# which is why a target-wide flag was deferred. Our TUs still pull in JUCE headers, so this also covers the headers
+# as we use them. JUCE is PINNED (SIDECHAIN_JUCE_TAG); the baseline is clean across ubuntu/macOS/Windows.
+set_source_files_properties(main.cpp Host.cpp PROPERTIES COMPILE_OPTIONS
+    "$<$<CXX_COMPILER_ID:MSVC>:/WX>$<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-Werror>")
+
 # Minimal unit test for the pure label-prefix section derivation (SectionDerivation.h). It has NO JUCE dependency,
 # so it is a plain executable that builds in a second and needs no plugin - run it via ctest, or compile the .cpp
 # directly (see its header). This gives the derivation C++ unit coverage on the side where it now lives; the gated

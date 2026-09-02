@@ -267,12 +267,13 @@ jobs:
           drive_plugin "TAL-NoiseMaker" "$HOME/plugins/TAL-NoiseMaker.vst3" 51991 1
 
       # Flat-plugin section leases (C3): TAL exposes NO parameter-tree groups, so the host derives leasable sections
-      # from shared label prefixes (JucePluginBridge, a port of sections.go). This exercises that fallback end to
+      # from shared label prefixes (computeSections, a port of sections.go). This exercises that fallback end to
       # end: assert the derivation is non-empty (regression-to-empty fails here), then drive group-bound leases on
-      # the derived sections. Report-only for now (new).
-      - name: Flat-plugin section leases (label-prefix derivation, TAL) - report-only
+      # the derived sections. REQUIRED: the derivation is deterministic and has run green; a regression here (empty
+      # or wrong sections) should red the pipeline. The Go TestSectionLockstep separately proves it matches the Go
+      # reference on every plugin.
+      - name: Flat-plugin section leases (label-prefix derivation, TAL) - REQUIRED
         if: ${{ !cancelled() }}
-        continue-on-error: true
         run: |
           set -euo pipefail
           xvfb-run -a "$SIDECHAIN_HOST_BIN" --plugin "$HOME/plugins/TAL-NoiseMaker.vst3" --catalog talgov.json --port 52020 >host-talgov.log 2>&1 &

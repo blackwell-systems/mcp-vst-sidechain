@@ -187,6 +187,15 @@ All notable changes to this project are documented here. The format is based on
 
 ### Changed
 
+- **CI hardening pass.** C++ warnings-as-errors is enabled now that the baseline is confirmed clean across
+  ubuntu/macOS/Windows: `cpp/CMakeLists.txt` compiles our two translation units (`main.cpp`, `Host.cpp`) with
+  `-Werror` / `/WX`, scoped to those files so JUCE's own non-clean module sources (a deprecated `wstring_convert`,
+  etc., which `juce_add_console_app` compiles into the target) stay exempt - a warning in OUR code now fails the
+  required build. The flat-plugin section-lease leg (TAL label-prefix derivation) is promoted from report-only to
+  REQUIRED (deterministic, green across runs). clang-tidy stays intentionally report-only (the runner's linter
+  version drifts; the compiler `-Werror` is the hard gate) and gains `--extra-arg=-Wno-error` so the source
+  `-Werror` does not trip its parse; govulncheck stays report-only (stdlib-CVE noise). The comments now state which
+  legs are report-only by design rather than awaiting promotion.
 - **Integration workflow drives multiple plugins on macOS + Linux.** The single-plugin drive is refactored into
   a shared `drive_plugin` helper (`.github/scripts/drive_plugin.sh`) that starts the host, waits for the
   catalog, and runs the generic gated suite. macOS keeps Surge XT VST3 as the hard-required leg (plus the

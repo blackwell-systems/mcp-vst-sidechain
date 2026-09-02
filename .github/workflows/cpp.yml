@@ -67,11 +67,13 @@ jobs:
       - name: Build
         run: cmake --build cpp/build --target sidechain-host --config Release
 
-      # Report-only lint of OUR sources only. --header-filter is restricted to
-      # cpp/ so JUCE's third-party headers (which ship their own .clang-tidy)
-      # are not linted; -p points clang-tidy at the compile database for flags.
-      # continue-on-error keeps this non-blocking; promote to a required gate
-      # once it is confirmed clean on CI. Linux leg only (clang-tidy preinstalled).
+      # Report-only lint of OUR sources only (--header-filter restricted to cpp/ so JUCE's own headers, which ship
+      # their own .clang-tidy, are not linted; -p reads the compile database). Kept report-only INTENTIONALLY: the
+      # clang-tidy version on the runner image drifts and a bump can surface new findings on unchanged code. The
+      # hard C++ gate is the compiler warnings-as-errors: the Build step above compiles main.cpp/Host.cpp with
+      # -Werror (see cpp/CMakeLists.txt, scoped to our two TUs so JUCE's own non-clean module sources are exempt),
+      # so a warning in our code fails the required build. --extra-arg=-Wno-error keeps that source -Werror from
+      # tripping clang-tidy's own parse on a JUCE-header compiler warning.
       - name: clang-tidy (report-only)
         if: runner.os == 'Linux'
         continue-on-error: true
@@ -79,11 +81,5 @@ jobs:
           clang-tidy --version
           clang-tidy -p cpp/build \
             --header-filter='(^|/)cpp/' \
+            --extra-arg=-Wno-error \
             cpp/main.cpp cpp/Host.cpp
-
-      # TODO(warnings-as-errors): the sidechain-host target already links
-      # juce::juce_recommended_warning_flags. Flipping warnings to errors
-      # (e.g. -DCMAKE_CXX_FLAGS="-Werror" or MSVC /WX) is deferred until a
-      # clean warning baseline is confirmed on CI across all three legs; do
-      # not enable blind, since a single upstream-triggered warning would red
-      # this leg. Promote once the CI logs show a warning-free build.
