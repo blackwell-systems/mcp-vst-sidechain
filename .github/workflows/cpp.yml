@@ -20,6 +20,19 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Fast, JUCE-free unit test of the pure label-prefix section derivation (cpp/SectionDerivation.h). It compiles
+  # in a second with the system compiler (no JUCE fetch, no plugin), so unlike the best-effort host build below it
+  # is a reliable, deterministic gate. Mirrors the Go sections_test.go cases; the gated Go TestSectionLockstep
+  # separately proves the host's emitted sections match the Go reference on real plugins.
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Build and run section-derivation-test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -o sdt cpp/tests/section_derivation_test.cpp
+          ./sdt
+
   build:
     strategy:
       fail-fast: false

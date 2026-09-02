@@ -1,12 +1,12 @@
 #pragma once
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <algorithm>
-#include <cctype>
 #include <functional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include "SectionDerivation.h"
 
 // ================================================================================================
 // sidechain::computeSections - the ONE place the host computes a plugin's navigable sections. Both the catalog
@@ -15,83 +15,14 @@
 // sectioning on the host.
 //
 // A param's EFFECTIVE section is: its parameter-tree group (VST3 unit / AU clump) when the plugin exposes one;
-// otherwise a section DERIVED from shared label prefixes; otherwise "other". The derivation is a faithful port of
-// the Go catalog's sections.go (deriveSections/labelTokens/sortedSections) - the Go side prefers the host-emitted
-// `section` and keeps its own derivation only as a fallback and as the reference oracle a gated test cross-checks
-// this against (TestSectionLockstep), so the two stay provably in lockstep.
+// otherwise a section DERIVED from shared label prefixes (SectionDerivation.h, unit-tested standalone); otherwise
+// "other". The derivation mirrors the Go catalog's sections.go - the Go side prefers the host-emitted `section`
+// and keeps its own derivation only as a fallback and as the reference oracle the gated TestSectionLockstep
+// cross-checks this against, so the two stay provably in lockstep.
 // ================================================================================================
 
 namespace sidechain
 {
-
-inline constexpr int kSectionMinShare = 3;    // a label prefix becomes a section when >= this many params share it
-
-// deriveSectionPerParam: for each label, the longest leading token-prefix shared (as a prefix) by at least
-// kSectionMinShare labels, or "other". Labels are split on non-alphanumeric runs with pure-number tokens dropped
-// (so "Osc 1 Tune"/"Osc 2 Tune" share "Osc"). Returns a vector parallel to `labels`. Mirrors sections.go.
-inline std::vector<std::string> deriveSectionPerParam (const std::vector<std::string>& labels)
-{
-    auto tokenize = [] (const std::string& label)
-    {
-        std::vector<std::string> out;
-        std::string cur;
-        auto flush = [&]
-        {
-            if (! cur.empty())
-            {
-                bool allDigits = true;
-                for (char ch : cur) if (ch < '0' || ch > '9') { allDigits = false; break; }
-                if (! allDigits) out.push_back (cur);   // pure-number tokens are indices, not section words
-                cur.clear();
-            }
-        };
-        for (char ch : label)
-        {
-            const bool alnum = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9');
-            if (alnum) cur += ch; else flush();
-        }
-        flush();
-        return out;
-    };
-
-    std::vector<std::vector<std::string>> tokens;
-    tokens.reserve (labels.size());
-    std::unordered_map<std::string, int> prefixCount;
-    for (const auto& lbl : labels)
-    {
-        auto tk = tokenize (lbl);
-        std::string pref;
-        for (size_t l = 0; l < tk.size(); ++l)
-        {
-            if (l) pref += ' ';
-            pref += tk[l];
-            ++prefixCount[pref];
-        }
-        tokens.push_back (std::move (tk));
-    }
-
-    std::vector<std::string> out (labels.size(), "other");
-    for (size_t i = 0; i < tokens.size(); ++i)
-    {
-        const auto& tk = tokens[i];
-        for (size_t l = tk.size(); l >= 1; --l)          // longest qualifying prefix wins
-        {
-            std::string pref;
-            for (size_t k = 0; k < l; ++k) { if (k) pref += ' '; pref += tk[k]; }
-            auto it = prefixCount.find (pref);
-            if (it != prefixCount.end() && it->second >= kSectionMinShare) { out[i] = pref; break; }
-        }
-    }
-    return out;
-}
-
-// Case-insensitive ordering used for the distinct section list (matches the Go catalog's alphabetical groups).
-inline bool sectionLess (const std::string& a, const std::string& b)
-{
-    auto lower = [] (std::string s) { for (auto& ch : s) ch = (char) std::tolower ((unsigned char) ch); return s; };
-    const std::string la = lower (a), lb = lower (b);
-    return la != lb ? la < lb : a < b;
-}
 
 // The result of sectioning a plugin: the raw tree group and the effective section for each automatable parameter,
 // plus the distinct leasable sections (non-"other", sorted).

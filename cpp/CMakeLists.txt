@@ -48,3 +48,12 @@ target_link_libraries(sidechain-host PRIVATE
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags)
+
+# Minimal unit test for the pure label-prefix section derivation (SectionDerivation.h). It has NO JUCE dependency,
+# so it is a plain executable that builds in a second and needs no plugin - run it via ctest, or compile the .cpp
+# directly (see its header). This gives the derivation C++ unit coverage on the side where it now lives; the gated
+# Go TestSectionLockstep separately proves the host output matches the Go reference on real plugins.
+enable_testing()
+add_executable(section-derivation-test tests/section_derivation_test.cpp)
+set_target_properties(section-derivation-test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+add_test(NAME section-derivation COMMAND section-derivation-test)
