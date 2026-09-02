@@ -16,14 +16,29 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
 // Config configures the headless server.
 type Config struct {
-	// CatalogPath is a JSON file (emitted by cpp/Host) describing the loaded plugin's parameter catalog.
+	// CatalogPath is a JSON file (emitted by cpp/Host) describing the loaded plugin's parameter catalog. Used in
+	// external-host mode (the agent calls connect_live itself). Mutually exclusive with Plugin.
 	CatalogPath string
+	// Plugin is a VST3/AU path (or AU identifier) that selects MANAGED-host mode: the server spawns and supervises
+	// the cpp host itself, waits for its catalog, auto-connects the live endpoint, then serves MCP. Mutually
+	// exclusive with CatalogPath.
+	Plugin string
+	// HostBin is an explicit path to the sidechain-host binary (managed mode). Empty triggers discovery: next to
+	// the running executable, then on PATH.
+	HostBin string
+	// Port is the control port. In managed mode 0 means "pick a free ephemeral port". In external mode it is
+	// unused (connect_live carries its own default).
+	Port int
+	// SelfTest, in managed mode, runs the managed startup, verifies it works (enumerate/connect/read/set), prints a
+	// one-line result to stderr, and exits without serving MCP over stdio.
+	SelfTest bool
 	// Name/Version identify the server to the MCP client.
 	Name    string
 	Version string
@@ -33,13 +48,20 @@ type Config struct {
 }
 
 // Run builds and runs the headless stdio MCP server until the transport closes. It fails fast if the catalog
-// cannot be loaded (a server with no catalog cannot validate or clamp any set).
+// cannot be loaded (a server with no catalog cannot validate or clamp any set). Setting Plugin selects managed
+// mode (spawn + supervise the host); setting CatalogPath selects external mode. Exactly one must be set.
 func Run(ctx context.Context, cfg Config) error {
-	if cfg.Name == "" {
-		cfg.Name = "mcp-vst-sidechain"
-	}
-	if cfg.Version == "" {
-		cfg.Version = "0.1.0"
+	cfg.applyDefaults()
+
+	hasPlugin := strings.TrimSpace(cfg.Plugin) != ""
+	hasCatalog := strings.TrimSpace(cfg.CatalogPath) != ""
+	switch {
+	case hasPlugin && hasCatalog:
+		return fmt.Errorf("--plugin and --catalog are mutually exclusive: --plugin spawns and supervises the host (managed mode); --catalog attaches to an already-running external host")
+	case !hasPlugin && !hasCatalog:
+		return fmt.Errorf("set either --plugin <path|AU-id> (managed mode: sidechain spawns the host) or --catalog <path> (external mode: attach to a running host)")
+	case hasPlugin:
+		return runManaged(ctx, cfg)
 	}
 
 	cat, err := loadCatalogFile(cfg.CatalogPath)
@@ -49,17 +71,30 @@ func Run(ctx context.Context, cfg Config) error {
 	fmt.Fprintf(os.Stderr, "sidechain: loaded catalog (%d params) from %s\n", len(cat.All()), cfg.CatalogPath)
 
 	srv, s := NewServer(cfg.Name, cfg.Version, cat)
+	attachStore(s, cfg.SemanticDir)
+	return srv.Run(ctx, &mcp.StdioTransport{})
+}
 
-	// Attach the persistent semantic store: a param probed in a past session is recalled instead of re-swept, and
-	// agent annotations accumulate across runs. A load error (a corrupt file) is non-fatal - the server runs
-	// in-memory.
-	store := NewSemanticStore(orDefault(cfg.SemanticDir, defaultSemanticDir()))
+// applyDefaults fills the server identity defaults shared by every mode.
+func (cfg *Config) applyDefaults() {
+	if cfg.Name == "" {
+		cfg.Name = "mcp-vst-sidechain"
+	}
+	if cfg.Version == "" {
+		cfg.Version = "0.1.0"
+	}
+}
+
+// attachStore binds the persistent semantic store to a session so a param probed in a past session is recalled
+// instead of re-swept and agent annotations accumulate across runs. A load error (a corrupt file) is non-fatal:
+// the server runs in-memory. Shared by external and managed modes.
+func attachStore(s *session, semanticDir string) {
+	store := NewSemanticStore(orDefault(semanticDir, defaultSemanticDir()))
 	if err := s.attachStore(store); err != nil {
 		fmt.Fprintf(os.Stderr, "sidechain: semantic store disabled (%v)\n", err)
 	} else {
 		fmt.Fprintf(os.Stderr, "sidechain: semantic store %s (fingerprint %s)\n", store.dir, s.entry.Fingerprint[:19])
 	}
-	return srv.Run(ctx, &mcp.StdioTransport{})
 }
 
 // NewServer builds the MCP server (generic param tools + live verbs) over a catalog and returns it plus the
