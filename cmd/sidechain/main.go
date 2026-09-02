@@ -18,6 +18,9 @@ import (
 	sidechain "github.com/blackwell-systems/mcp-vst-sidechain"
 )
 
+// Version is stamped by the release build via -ldflags "-X main.Version=<tag>"; an unstamped build reports "dev".
+var Version = "dev"
+
 func main() {
 	plugin := flag.String("plugin", "",
 		"MANAGED mode: VST3/AU path (or AU identifier) to host. sidechain spawns and supervises the host, waits for its catalog, and auto-connects live. Mutually exclusive with --catalog")
@@ -40,6 +43,7 @@ func main() {
 		Port:        *port,
 		SelfTest:    *selftest,
 		SemanticDir: *semanticDir,
+		Version:     Version,
 	})
 	if err != nil {
 		log.Fatalf("sidechain: %v", err)

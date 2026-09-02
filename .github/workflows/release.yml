@@ -235,8 +235,12 @@ jobs:
             tar xzf surge/surge.tar.gz -C surge "./Surge XT.vst3"
           fi
 
+      # Windows smoke is REPORT-ONLY: headless VST3 hosting on the Windows runner is unproven (integration.yml
+      # drives plugins only on macOS and Linux/xvfb), so a Windows runtime failure must not block a release. The
+      # Windows bundle still builds and ships; promote this leg to required once it is green across a few runs.
       - name: Download Surge XT (Windows)
         if: runner.os == 'Windows' && steps.surge-cache.outputs.cache-hit != 'true'
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -263,8 +267,9 @@ jobs:
           fi
           echo "self-test passed"
 
-      - name: Self-test the shipped binary (Windows)
+      - name: Self-test the shipped binary (Windows) - report-only
         if: runner.os == 'Windows'
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
