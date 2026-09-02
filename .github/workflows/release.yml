@@ -12,7 +12,7 @@ name: Release
 # The server discovers the host beside itself (managed mode), so both ship in one archive per platform.
 #
 # Job graph:
-#   build  (matrix: ubuntu-latest, macos-14, macos-13, windows-latest)
+#   build  (matrix: ubuntu-latest, macos-14, windows-latest)
 #     -> builds both binaries, packages one archive per platform, uploads it as a workflow artifact.
 #   smoke  (needs: build; matrix: same OSes)
 #     -> downloads that OS's archive, unpacks it, downloads a free plugin (Surge XT VST3, as integration.yml
@@ -48,16 +48,15 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # arm64 mac on macos-14; x86_64 mac on macos-13 for Intel coverage. Linux + Windows are amd64 runners.
+          # arm64 mac on macos-14. Linux + Windows are amd64 runners. Intel-mac (x86_64) is deferred: the macos-13
+          # runner queue is chronically slow and would block the whole matrix; the better long-term answer is a
+          # UNIVERSAL macOS binary built on macos-14 (CMAKE_OSX_ARCHITECTURES=arm64;x86_64 / lipo), added later.
           - os: ubuntu-latest
             goos: linux
             arch: amd64
           - os: macos-14
             goos: macos
             arch: arm64
-          - os: macos-13
-            goos: macos
-            arch: amd64
           - os: windows-latest
             goos: windows
             arch: amd64
@@ -152,9 +151,6 @@ jobs:
           - os: macos-14
             goos: macos
             arch: arm64
-          - os: macos-13
-            goos: macos
-            arch: amd64
           - os: windows-latest
             goos: windows
             arch: amd64
