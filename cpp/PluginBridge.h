@@ -125,8 +125,8 @@ public:
     virtual bool saveState (std::string& base64Out) = 0;     // whole-patch snapshot; false if unavailable
 
     // Offline-render the plugin per the spec and measure the accumulated output. Runs on the single applier
-    // thread (like get_full_state): it re-prepares the processor (resets DSP state, not params) so the render is
-    // deterministic, drives it with a MIDI note (instrument) or a synthesized input signal (effect), loops
+    // thread (like get_full_state): it resets the processor's DSP state (not params) so the render is
+    // deterministic, drives it with a MIDI note (note-driven) or a synthesized input signal (pure effect), loops
     // processBlock over the duration, and analyzes the output. Returns a Measurement with ok=false if there is
     // nothing to render. The default is a no-op ok=false so a non-audio bridge need not implement it.
     virtual Measurement renderAndMeasure (const RenderSpec&) { return {}; }

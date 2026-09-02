@@ -178,10 +178,10 @@ public:
     }
 
     // ---- offline render + measure (message thread only) ----
-    // Re-prepare the processor (resets DSP state: envelopes, LFO phase, filter memory; NOT params, so the current
-    // patch is what we measure), drive it with a MIDI note (instrument) or a synthesized input signal (effect),
-    // loop processBlock over the duration accumulating the output, then analyze. Auto-detects instrument vs effect
-    // from the processor's bus layout: accepts MIDI AND has 0 audio input channels => instrument, else effect.
+    // Reset the processor's DSP state (envelopes, LFO phase, filter memory; NOT params, so the current edited patch
+    // is what we measure), drive it with a MIDI note (note-driven) or a synthesized input signal (pure effect),
+    // loop processBlock over the duration accumulating the output, then analyze. Auto-detects the stimulus from the
+    // processor: accepts MIDI => note-driven (input left silent), else a pure effect fed the input signal.
     Measurement renderAndMeasure (const RenderSpec& spec) override
     {
         Measurement out;
@@ -200,9 +200,13 @@ public:
             return out;   // nothing to measure (no audio output)
         }
 
-        // Instrument if it accepts MIDI and has no audio input; otherwise an effect. This also honours the
-        // request implicitly: an instrument ignores the input signal fields, an effect ignores note/gate.
-        const bool isInstrument = processor.acceptsMidi() && numInputs == 0;
+        // Note-driven if it accepts MIDI; otherwise a pure audio effect. We key on acceptsMidi ALONE, not
+        // (acceptsMidi && numInputs==0): many synths expose an audio-input bus too (Surge XT reports 2 inputs for
+        // its audio-in oscillator / vocoder), so gating on zero inputs misclassifies them as effects and renders
+        // silence. A note-driven plugin gets the note with its input left silent (measuring what it SYNTHESISES,
+        // not leaked input); a pure effect gets the input signal and ignores note/gate. The rare MIDI-controlled
+        // effect lands in the note-driven branch, which is the correct stimulus for it.
+        const bool isInstrument = processor.acceptsMidi();
 
         const int durationMs = juce::jmax (1, spec.durationMs);
         const int totalSamples = (int) std::llround ((double) durationMs * sampleRate / 1000.0);
@@ -212,9 +216,14 @@ public:
             return out;
         }
 
-        // Re-prepare so the render is deterministic regardless of prior renders / edits (params are untouched).
-        processor.releaseResources();
-        processor.prepareToPlay (sampleRate, blockSize);
+        // Reset DSP state (filter memory, envelopes, LFO phase, reverb tails) so each render is deterministic and
+        // free of the prior render's tail, then drive a fresh note. Use reset(), NOT releaseResources() +
+        // prepareToPlay(): the release/prepare cycle makes the hosted plugin rebuild its DSP from its patch/default
+        // state and drops the parameter values pushed in via set_param, so every render came out identical to the
+        // default patch regardless of edits (a filter cutoff change had zero audible effect). reset() clears state
+        // while preserving the applied parameters. The host already prepared the processor at load (Host::load) at
+        // this same rate/block, so no re-prepare is needed.
+        processor.reset();
 
         // Note-on at sample 0, note-off at gateMs (clamped into the render). Only meaningful for an instrument.
         const int gateSample = juce::jlimit (0, totalSamples,

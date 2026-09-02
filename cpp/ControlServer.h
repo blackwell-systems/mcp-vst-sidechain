@@ -400,7 +400,7 @@ private:
 
     // -------- offline render + measure (Tier 1 + 2; see docs/RENDER-SCOPING.md) ------------------
     // A render is a bounded BLOCKING command on the single applier thread (like get_full_state): the bridge
-    // re-prepares the processor, drives it with a MIDI note (instrument) or an input signal (effect), loops
+    // resets the processor's DSP state, drives it with a MIDI note (note-driven) or an input signal (effect), loops
     // processBlock over the duration, and analyzes the output. It serializes with param sets, so it introduces no
     // new concurrency hazard. All request fields are optional and carry the RenderSpec defaults; the host
     // auto-detects instrument vs effect. The reply carries the measurement object.
@@ -669,7 +669,7 @@ private:
                 }
                 break;
             case Kind::Render:
-                // Bounded blocking render on the single applier: re-prepares, drives, processBlock loop, analyzes.
+                // Bounded blocking render on the single applier: reset, drive, processBlock loop, analyze.
                 // Serializes with param sets (no new hazard), so a measured patch is exactly the current state.
                 if (c.done)
                     c.done->measurement = bridge.renderAndMeasure (c.render);
