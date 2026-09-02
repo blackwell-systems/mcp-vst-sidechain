@@ -46,7 +46,34 @@ juce::String Host::load (const juce::String& pluginPath, double sampleRate, int 
         list.scanAndAddFile (pluginPath, /*dontRescanIfAlreadyInList*/ false, found, *fmt);
 
     if (found.isEmpty())
-        return "no VST3/AU plugin described by: " + pluginPath;
+    {
+        // Enrich the failure so a headless/CI run can tell WHY the scan found nothing (rather than a bare "no
+        // plugin"). We report whether the path resolves on disk, whether it is a bundle directory, and, per
+        // registered format, whether that format even thinks the path could be its plugin type
+        // (fileMightContainThisPluginType). For a VST3 bundle we also probe the inner module path.
+        juce::File f (pluginPath);
+        juce::String diag;
+        diag << "no VST3/AU plugin described by: " << pluginPath
+             << " [exists=" << (f.exists() ? "1" : "0")
+             << " isDir=" << (f.isDirectory() ? "1" : "0");
+        for (auto* fmt : formatManager.getFormats())
+            diag << " " << fmt->getName() << ".might="
+                 << (fmt->fileMightContainThisPluginType (pluginPath) ? "1" : "0");
+        if (f.isDirectory())
+        {
+            const auto inner = f.getChildFile ("Contents");
+            diag << " Contents=" << (inner.isDirectory() ? "1" : "0");
+            if (inner.isDirectory())
+            {
+                juce::StringArray subs;
+                for (const auto& e : juce::RangedDirectoryIterator (inner, false, "*", juce::File::findDirectories))
+                    subs.add (e.getFile().getFileName());
+                diag << " Contents/={" << subs.joinIntoString (",") << "}";
+            }
+        }
+        diag << "]";
+        return diag;
+    }
 
     juce::String err;
     loadedDesc = *found.getFirst();   // retain the plugin identity for the catalog fingerprint
