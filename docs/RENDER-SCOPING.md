@@ -1,7 +1,8 @@
 # Render + analysis scoping: giving the agent ears
 
-Status: IMPLEMENTED (Tier 1 + Tier 2; Tier 3 chain deferred). Offline-renders a hosted plugin and returns objective
-measurements, so an agent can EVALUATE its own edits ("did it get brighter?") instead of tweaking blind. Peer docs:
+Status: IMPLEMENTED (Tier 1 render + Tier 2 static analysis). Tier 2.5 (modulation-aware / temporal measurement) and
+Tier 3 (plugin chain) are designed and deferred. Offline-renders a hosted plugin and returns objective measurements,
+so an agent can EVALUATE its own edits ("did it get brighter?") instead of tweaking blind. Peer docs:
 [ARCHITECTURE.md](ARCHITECTURE.md) (the system), [POSITIONING.md](POSITIONING.md) (why this is on our side of the
 wall a DAW server cannot reach), [PHASE3-SCOPING.md](PHASE3-SCOPING.md) (the store this measures against).
 
@@ -86,6 +87,75 @@ This covers the common intents: brighter (centroid / high band up), louder (rms/
 dead (silent), too hot (clipped). Centroid and bands use `juce::dsp::FFT`; peak/RMS/crest/silence/clip are trivial
 and live in the JUCE-free `cpp/RenderAnalysis.h` (unit-tested standalone).
 
+### Tier 2.5 (design, deferred): modulation-aware (temporal) measurement
+
+**The problem.** Tier 2 collapses the whole render to one number per metric. That is exactly right for a static
+patch, and exactly WRONG for anything time-varying: an LFO, a slow filter sweep, tremolo, auto-pan, a moving
+envelope. A cutoff wobbling at 2 Hz and a static cutoff at the wobble's mean produce nearly the same
+centroid-over-the-whole-buffer, so the Tier-2 feedback signal is blind to modulation by construction. Intents like
+"add movement", "make it wobble", "vibrato", "a slow evolving pad" cannot be verified or tuned against a
+time-collapsed measurement. This is the single measurement gap that keeps the render loop from reaching modulation.
+
+**The primitive: a per-frame series, not a buffer summary.** Run the SAME offline render (a held note for a synth,
+a sustained input for an effect), but analyze it in short frames (default ~25 ms hop) instead of collapsing it.
+That yields a short time series for the metrics that can move: `centroid_hz[t]` (a filter LFO / sweep shows here)
+and `rms_db[t]` (tremolo / a volume LFO shows here). From each envelope, derive modulation descriptors:
+
+- `rate_hz`: the dominant periodicity of the envelope, from the autocorrelation (or FFT) of the detrended frame
+  series. This is the LFO rate.
+- `depth`: the excursion of the envelope over the render (centroid range in Hz, rms range in dB) = how deep the
+  modulation is.
+- `regular`: periodic (a clean LFO) vs irregular (sample-and-hold, noise, drift), from the sharpness of the
+  autocorrelation peak.
+- `confidence`: how trustworthy the estimate is (see the render-length guardrail below).
+
+**Wire shape (opt-in).** Temporal analysis is off by default (it adds a frame series and only matters for
+time-varying patches). A request opts in with `temporal` fields; the reply gains a `modulation` block alongside the
+Tier-2 summary:
+
+```jsonc
+// request adds:  { "temporal": true, "frame_ms": 25 }   // frame_ms optional, default 25
+// reply adds:
+"modulation": {
+  "frame_ms": 25,
+  "centroid": { "rate_hz": 2.03, "depth": 1840.0, "regular": true,  "confidence": 0.91 },  // Hz excursion
+  "rms":      { "rate_hz": 0.0,  "depth": 1.2,    "regular": false, "confidence": 0.20 },  // dB excursion
+  "dominant": "centroid"   // which signal carries the strongest modulation (or "none")
+}
+```
+
+Reporting BOTH `centroid` and `rms` means we do not need to know a priori WHAT the LFO modulates: a filter LFO lands
+in `centroid`, a tremolo in `rms`, and `dominant` flags the stronger. (A pitch LFO / vibrato needs a pitch-track
+envelope, `f0_hz[t]`, a later addition; centroid picks up most timbral movement in the meantime.)
+
+**Render-length guardrail.** Periodicity needs several cycles to estimate: a 0.5 Hz LFO needs multiple seconds. The
+render duration must cover at least ~3 cycles of the slowest rate of interest, so `durationMs` should scale with the
+target rate (or the host bumps it and notes it). Below that, `confidence` is low and `rate_hz` is reported as a
+best-effort estimate, never as a false precision.
+
+**How it closes the loop for modulation.** Once `modulation` exists, LFO RATE and DEPTH become ordinary scalars
+that `tune_param` optimizes: "vibrato near 6 Hz" is `tune_param(lfoRate, measure=modulation.centroid.rate_hz,
+goal=target, target=6)`; "deeper wobble" is `tune_param(lfoDepth, measure=modulation.centroid.depth,
+goal=maximize)`. The parts that are NOT a 1-D continuum stay where they belong: the LFO WAVEFORM (a discrete choice)
+and the DESTINATION/ROUTING (a discrete selector or a mod-matrix cell) are set directly by the agent via
+`set_param choice=`, driven by the recipe it holds ("vibrato = LFO -> pitch, ~6 Hz, low depth") over the semantic
+map. A compositional intent like "add a slow wobble" becomes the agent SEQUENCING 1-D tunes (set destination +
+waveform, tune rate, tune depth, render and verify periodicity) rather than any new multi-D optimizer on the server.
+
+**Where it stays hard (honest limits).** This measures modulation; it does not DISCOVER the mod routing. Where a
+plugin exposes its LFO wiring only through its GUI (not as automatable params), it stays out of reach, the same
+GUI-only wall as everything else. Where routing IS a param, the mapping "param X is LFO1 rate, Y is LFO1->cutoff
+depth, Z selects the destination" varies wildly per plugin and is rarely recoverable from value text, so it is
+exactly the hard-won, per-plugin structural knowledge the Phase-3 semantic store is there to persist: the agent
+works out a synth's modulation topology once, `annotate_params` records those roles, and later sessions recall it.
+
+**Implementation notes.** The frame loop reuses the render buffer; per-frame RMS is trivial and per-frame centroid
+reuses the existing FFT path at the frame hop. The envelope statistics (range, autocorrelation, peak sharpness)
+are pure and belong in the JUCE-free `cpp/RenderAnalysis.h` next to the Tier-2 core, unit-testable against
+synthetic envelopes (a 2 Hz sine envelope -> `rate_hz ~ 2`, `regular`; a ramp -> `rate_hz ~ 0`; noise ->
+`!regular`). Non-goals: full modulation-matrix discovery, per-sample automation capture, and pitch tracking (a
+later `f0_hz[t]` addition for vibrato).
+
 ### Tier 3 (deferred): a linear plugin chain
 
 Load N instances and process them in series (output of A -> input of B), measuring the final output: synth ->
@@ -144,13 +214,17 @@ auditions it, or it becomes a starting asset. Off by default.
 4. [done] Gated E2E: `TestRenderBrighter` (TAL cutoff raises centroid) + `TestRenderSmoke` wired into
    `drive_plugin.sh`.
 5. [done] Docs: folded into ARCHITECTURE (tool table + wire protocol + render section); this doc marked implemented.
-6. [deferred] Tier 3: multi-instance linear chain + per-node param addressing.
+6. [deferred] Tier 2.5: modulation-aware measurement (per-frame series -> `modulation` block) so LFO rate/depth are
+   measurable and tunable; the primitive that makes time-varying intents legible to the loop.
+7. [deferred] Tier 3: multi-instance linear chain + per-node param addressing.
 
 ## Decisions (as shipped)
 
 1. **Effect input default:** `sine` at 220 Hz; `noise`/`impulse`/`silence` also available via `inputKind`.
-2. **The analysis set:** peak/RMS/crest/centroid/3-band/silent/clipped shipped. LUFS, finer spectrum, and a
-   transient/attack-time measure remain possible later additions.
+2. **The analysis set:** peak/RMS/crest/centroid/3-band/silent/clipped shipped (all static, whole-buffer). LUFS, a
+   finer spectrum, and a transient/attack-time measure are possible later additions. The biggest gap is TEMPORAL:
+   the static set is blind to modulation (LFOs, sweeps, tremolo), which Tier 2.5 addresses with a per-frame series
+   and a `modulation` block (rate/depth/regular). See Tier 2.5 above.
 3. **Reset state per render:** YES, via `reset()` (deterministic; see the pitfall about NOT using release/prepare).
 4. **WAV export:** deferred (the measurement is the core; WAV is the human-audition bridge, easy to add later).
 5. **Tier 3 chain:** deferred. Single-plugin render + measure is the high-value core and works on today's host.

@@ -89,6 +89,11 @@ the trace makes that visible so the agent can decide to look elsewhere.
   without an ontology in the bridge.
 - **Richer measures** (LUFS, attack time, a finer spectrum) if intents demand them; these extend the render
   analysis set, and `tune_param` picks them up for free once `measure` accepts them.
+- **Modulation intents** ("wobble", "vibrato", "movement") depend on the temporal measurement in
+  RENDER-SCOPING Tier 2.5: once the render emits a `modulation` block (rate/depth), an LFO's rate and depth become
+  ordinary scalars `tune_param` optimizes (`measure=modulation.centroid.rate_hz`), while the waveform and routing
+  stay agent-set `set_param choice=` moves. The static analysis set is blind to modulation, so that primitive is the
+  prerequisite for tuning anything time-varying.
 
 ## Test plan
 
