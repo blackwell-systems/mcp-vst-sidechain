@@ -52,10 +52,17 @@ jobs:
       - name: Test (race + coverage)
         run: go test -race -coverprofile=cover.out ./...
 
-      - name: Coverage summary
+      - name: Coverage summary + floor (>= 90%)
         run: |
+          go tool cover -func=cover.out | tail -1
           echo '### Go coverage' >> "$GITHUB_STEP_SUMMARY"
           go tool cover -func=cover.out | tail -1 >> "$GITHUB_STEP_SUMMARY"
+          pct=$(go tool cover -func=cover.out | awk '/^total:/ {gsub(/%/,"",$3); print $3}')
+          echo "total statement coverage: ${pct}%"
+          awk -v p="$pct" 'BEGIN { exit (p+0 >= 90.0) ? 0 : 1 }' || {
+            echo "::error::Go coverage ${pct}% is below the 90% floor (add unit tests; see docs/TESTING.md)"
+            exit 1
+          }
 
   # Required gate: staticcheck is clean today, and pinned so a new release cannot red the build unexpectedly.
   staticcheck:
