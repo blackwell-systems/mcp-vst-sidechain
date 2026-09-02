@@ -65,11 +65,11 @@ side `PluginBridge` (what the control plane can drive) with `ControlServer` as t
   │                                                                                              │
   │  cmd/sidechain/main.go ──▶ Run() ──▶ NewServer()                                             │
   │                                                                                              │
-  │     Catalog  (ParamCatalog)      loaded from the catalog JSON; validate + clamp + sections  │
-  │     session                      one per process; holds catalog + live endpoint + infer cache│
-  │     liveClient  (LiveEndpoint)   the wire client over the control socket                    │
-  │     RegisterParamTools / registerLiveTools   the MCP tool surface on one *mcp.Server        │
-  │     GCF (structuredResult)       token-compact encoding of the big read tool                │
+  │     Catalog  (ParamCatalog)      loaded from the catalog JSON; identity + validate + sections│
+  │     session                      catalog + live endpoint + infer cache + semantic store     │
+  │     liveClient  (LiveEndpoint)   the async wire client (reply demux + change-event channel)  │
+  │     registerParam/Live/Governed/Semantic Tools   the MCP tool surface on one *mcp.Server     │
+  │     SemanticStore (semantic.go)  per-fingerprint persistent semantics; GCF for big reads     │
   └──────────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -385,10 +385,11 @@ agent --MCP set_param{id, real:1000}--> Go handleSetParam ──▶ setParamReal
 ### A `describe_param`
 
 ```
-agent --MCP describe_param{id}--> Go handleDescribeParam (live only)
-   session.probe(id): SampleText sweeps 21 norms over the socket, restores the original, returns samples
-   inferParam(samples) -> unit/range/curve/bipolar or discrete labels; cached on the session
-   reply: a one-line summary + the samples + inference (JSON StructuredContent)
+agent --MCP describe_param{id}--> Go handleDescribeParam
+   if the semantic store already has this param's inference -> recall it (no probe, works headless)
+   else (live): session.probe(id) sweeps 21 norms over the socket, restores, infers unit/range/curve/labels,
+                caches on the session AND writes through to the store (so a future session skips the sweep)
+   reply: a one-line summary + behavior class + any role annotation + inference (JSON StructuredContent)
 ```
 
 ### A `save_state` / `load_state` round-trip
@@ -403,13 +404,15 @@ load_state{state} --> liveClient LoadState -> {cmd:load_state, state}
 
 ## Testing and CI architecture
 
-The Go layer is tested at four levels; the C++ host is exercised only through the real-plugin integration jobs
-(there is no C++ unit test target).
+The Go layer is tested at several levels; the C++ host is exercised through the real-plugin integration jobs plus
+one small C++ unit target for the pure section-derivation algorithm (`cpp/tests/section_derivation_test.cpp`, no
+JUCE, run by the `cpp.yml` `unit` job).
 
-- **Unit tests (always green, no plugin).** Catalog math, sectioning, inference, GCF, and the handler logic are
-  covered by table tests (`catalog_test.go`, `catalog_more_test.go`, `sections_test.go`, `infer_test.go`,
-  `infer_more_test.go`, `gcf_more_test.go`, `paramtools_more_test.go`, `discrete_choice_test.go`,
-  `server_test.go`). The power fit is unit-tested only (`TestSetRealPowerAnalytic` with a synthetic
+- **Unit tests (always green, no plugin).** Catalog math, sectioning, inference, GCF, the concurrency conflict
+  tier (`governed_test.go`, an exhaustive enumeration of the governed state), the semantic store (`semantic_test.go`:
+  fingerprint equivalence, atomic round-trip + merge, behavior-class, headless annotate + reload, non-destructive
+  invalidation), the concurrency/semantic MCP tools (`govtools_test.go`, `semantic_test.go`), and the handler logic
+  are covered by table tests. The power fit is unit-tested only (`TestSetRealPowerAnalytic` with a synthetic
   `32*norm^6.5` s curve): a survey of the plugins on hand found none whose clean power-law params carry a real
   unit, so there is no real-plugin power-fit E2E.
 - **The in-process fake host (`live_test.go`).** A goroutine speaks the `ControlServer` line-JSON protocol
@@ -433,27 +436,38 @@ The Go layer is tested at four levels; the C++ host is exercised only through th
   - **AU load+drive smoke (`au_live_test.go`, gated on `SIDECHAIN_AU_*`).** Loads an Apple built-in AU by
     component identifier, enumerates its catalog, and drives it over the socket, closing the AU gap (everything
     else exercises VST3).
+  - **Sectioning + semantic store (gated on the sweep env, run per plugin by `drive_plugin.sh`).**
+    `TestSectionLockstep` asserts the host's emitted per-param `section` equals the Go reference derivation (so the
+    two implementations cannot drift); `TestSemanticStoreLive` probes a real param once, then a second HEADLESS
+    session recalls it from the store (proving probe-once-ever).
+  - **Concurrency (gated on the sweep env, the C1+C2+C3 leg).** `TestMultiClientLive` (independent concurrent
+    control), `TestChangeNotifications` (a set by one controller is pushed to another), `TestGovernedLive` +
+    `TestGovernedToolsLive` (hierarchical edit leases via the wire and via the MCP tools), and
+    `TestGovernedDisconnectFreesLease` (crash-safe lease cleanup). See [CONCURRENCY.md](CONCURRENCY.md).
   - **Power-fit survey (`scan_test.go`, gated on `SIDECHAIN_SCAN_*`).** Probes every param on a running host and
     flags any clean analytic power fit; a survey aid, not a CI assertion.
 - **The CI matrix.**
 
   | Workflow | Runs on | Gate | What |
   |---|---|---|---|
-  | `go.yml` | ubuntu | required | gofmt, `go mod tidy`, build, vet, `go test -race -coverprofile`; a required pinned `staticcheck`; a report-only `govulncheck` (dominated by stdlib CVEs, so it would red on toolchain drift). |
-  | `cpp.yml` | ubuntu + macOS-14 + windows | best-effort | Configure + build the JUCE host (VST3 everywhere, AU on macOS). `fail-fast:false` so one leg does not red the others. Report-only clang-tidy on Linux; warnings-as-errors is a deferred TODO. |
-  | `integration.yml` (`smoke`) | macOS-14 | mixed | Build the host; Surge XT VST3 (synth) is the hard-required generic-suite leg plus the Surge-only capability tests; a report-only Surge XT Effects VST3 leg (a non-synth, no MIDI); a report-only Apple-AU load+drive. |
-  | `integration.yml` (`smoke-linux`) | ubuntu | report-only | Build the host once, then drive Surge XT, TAL-NoiseMaker, Dexed, and Surge XT Effects VST3 under `xvfb-run` (headless JUCE plugin hosting still touches X at construction). |
+  | `go.yml` | ubuntu | required | gofmt, `go mod tidy`, build, vet, `go test -race -coverprofile`; a required pinned `staticcheck`; a report-only `govulncheck` (stdlib-CVE noise, so it would red on toolchain drift). |
+  | `cpp.yml` (`unit`) | ubuntu | required | Compile + run the JUCE-free section-derivation unit test with `-Wall -Wextra -Werror`. Fast, deterministic. |
+  | `cpp.yml` (`build`) | ubuntu + macOS-14 + windows | best-effort | Configure + build the JUCE host (VST3 everywhere, AU on macOS), `fail-fast:false`. Our two TUs compile with `-Werror` / `/WX` (scoped so JUCE's own module sources are exempt), so a warning in our code fails the build. clang-tidy is report-only by design (runner linter-version drift). |
+  | `integration.yml` (`smoke`) | macOS-14 | required + report | Build the host; required legs: Surge XT (synth, generic suite + capability), Surge XT Effects VST3, an Apple-AU load+drive, and the C1+C2+C3 concurrency leg. Report-only: none currently. |
+  | `integration.yml` (`smoke-linux`) | ubuntu | required + report | Build once, then drive Surge XT / TAL-NoiseMaker / Dexed (required) and Surge XT Effects (report-only: its state round-trip does not restore headless on Linux) under `xvfb-run`, plus a required flat-plugin section-lease leg (TAL derived sections). |
 
   The plugin-drive steps share `.github/scripts/drive_plugin.sh`, which starts the host, waits for the catalog,
-  asserts enumeration > 0, and runs the generic gated suite pointed at that host. Everything unproven is
-  `continue-on-error` until it has been green on CI for a few runs, mirroring the report-only staticcheck /
-  govulncheck pattern. Validated locally against Surge XT (774 params) and TAL-NoiseMaker (89 params).
+  asserts enumeration > 0, and runs the generic gated suite (sweep / state / batch / MIDI / section-lockstep /
+  semantic-store) pointed at that host. A new leg lands `continue-on-error` and is promoted to required once green
+  across runs (the report-only staticcheck / govulncheck pattern). Validated locally against Surge XT (774 params)
+  and TAL-NoiseMaker (89 params).
 
 ## Configuration
 
-Two environment variables are read by the running Go server: `SIDECHAIN_CATALOG` (the catalog JSON path,
-equivalent to `--catalog`) and `SIDECHAIN_MCP_FORMAT` (`json` forces plain JSON output instead of GCF). The
-control port is a `--port` flag on the C++ host and a `port` argument to `connect_live` (both default 51703);
+Environment variables read by the running Go server: `SIDECHAIN_CATALOG` (the catalog JSON path, equivalent to
+`--catalog`), `SIDECHAIN_MCP_FORMAT` (`json` forces plain JSON output instead of GCF), and `SIDECHAIN_SEMANTIC_DIR`
+(the persistent semantic-store directory, equivalent to `--semantic-dir`; empty defaults to a per-user cache dir).
+The control port is a `--port` flag on the C++ host and a `port` argument to `connect_live` (both default 51703);
 there is no port environment variable in the running path (the `SIDECHAIN_PORT` name appears only in tool-schema
 prose). The remaining `SIDECHAIN_*` variables are test gates, not runtime configuration.
 
@@ -463,8 +477,9 @@ prose). The remaining `SIDECHAIN_*` variables are test gates, not runtime config
   as parameters, are invisible to any host. That is the same surface a human automating in a DAW gets.
 - **Parameter-metadata quality varies wildly.** Well-behaved plugins name params cleanly; many expose garbage
   ("Param 47") or hundreds of undifferentiated entries. The Phase-1 semantic layer recovers real units from value
-  text where the plugin renders them, but a param that renders bare numbers stays "normalized only," and a
-  name-to-meaning layer over generic names is still future work.
+  text where the plugin renders them (a param that renders bare numbers stays "normalized only"); the Phase-3
+  store lets the agent attach a durable name-to-meaning layer (roles) on top, but the roles are agent-supplied, not
+  inferred by the bridge. Turning intent into param moves over that map ("make it brighter", Phase 4) is future work.
 - **Real units only on native ranged params by default.** A hosted VST3/AU param arrives as
   `HostedAudioProcessorParameter` with no `NormalisableRange`, so its catalog range is a bare 0..1
   (`hasRealRange: false`); real-unit targeting on it goes through the value-text probe (`set_param real=`), not a
@@ -475,9 +490,10 @@ prose). The remaining `SIDECHAIN_*` variables are test gates, not runtime config
   is reachable by wrapping it into a VST3 with an external adapter; the bridge never sees VST2, and wrapper
   fidelity varies.
 - **Multiple controllers, one instance.** The `ControlServer` serves many connections at once (concurrency
-  C1/C2): each gets a `clientID`, drives the plugin independently, and receives `param_changed` events for others'
-  changes. The gated E2E tests still disconnect explicitly (a leaked connection holds a handler thread and muddies
-  identity/attribution assertions). "Concurrency" here means many controllers of one instance, not many hosts; see
+  C1/C2/C3): each gets a `clientID`, drives the plugin independently, receives `param_changed` events for others'
+  changes, and can claim hierarchical edit leases (governed by a conflict tier on the single applier). The gated
+  E2E tests still disconnect explicitly (a leaked connection holds a handler thread and muddies identity/attribution
+  assertions). "Concurrency" here means many controllers of one instance, not many hosts; see
   [CONCURRENCY.md](CONCURRENCY.md).
 - **The power fit is unit-tested only.** No surveyed real plugin exposes a clean power-law param the real-unit set
   path can drive (see the note by `fitPower` and `TestScanPowerFits`).
