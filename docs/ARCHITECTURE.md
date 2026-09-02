@@ -234,6 +234,10 @@ bytes on the one socket. Commands mirror the MCP tools closely, so the Go server
 | `load_state` | `{state}` | `{ok, loaded}` |
 | `get_full_state` | - | `{ok, state}` |
 | `get_state` | - | `{ok, count, params}` |
+| `govern` | `{op, group?}` | `{ok, resolution, governed}` |
+| `get_governed` | - | `{ok, governed, sections}` |
+
+The server also PUSHES unsolicited events (no reply id): `{event: "param_changed", param, normalized, value, text, by}` on any parameter change, and `{event: "governed_changed", governed, resolution, by}` on a lease/generation change. `ping` additionally returns the connection's `client` id.
 
 The listener's `set_param` accepts `value`, `normalized`, or `choice` (a discrete index). In practice the Go
 client only ever sends `value` (real units, for a `hasRealRange` param) or `normalized`: everything else,
@@ -268,6 +272,9 @@ headless session otherwise.
 | `play_note` / `all_notes_off` | Play a MIDI note (optional `holdMs` to auto-release) / panic all notes. Live only. |
 | `save_state` / `load_state` | Snapshot the whole patch as one opaque blob / recall it. Live only. |
 | `reset_init` | Recall the host-supplied init/default patch (a no-op ack if the host wired no hook). Live only. |
+| `acquire_lease` / `release_lease` | Claim / release an exclusive edit lease on a param-group section (`section=`) or the whole instance (the C3 governed layer): applied / compensated / rejected. Live only. |
+| `get_leases` | The current instance/section lease holders, the leasable sections, the patch generation, and your controller id. Live only. |
+| `poll_events` | Drain the server-pushed `param_changed` / `governed_changed` events since the last poll (deduped to latest-per-param, other controllers only by default). Live only. |
 
 ### The four ways to set one value
 

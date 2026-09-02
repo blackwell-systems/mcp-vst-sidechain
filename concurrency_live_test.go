@@ -7,6 +7,7 @@
 package sidechain
 
 import (
+	"context"
 	"os"
 	"strconv"
 	"sync"
@@ -338,6 +339,75 @@ func TestGovernedLive(t *testing.T) {
 			t.Fatalf("B did not receive the governed_changed generation bump within the window")
 		}
 	}
+}
+
+// TestGovernedToolsLive drives the C3 governed MCP tools (acquire_lease / release_lease / get_leases) end to end
+// against the real host through a session, proving an actual agent can claim edit leases (not just the raw wire
+// tests). It discovers a leasable section from get_leases, claims the whole instance then that section, confirms
+// via get_leases, and releases both. Poll-acquires the instance since a prior gated test's lease may still be
+// clearing on the host's message thread. Gated on the sweep env.
+func TestGovernedToolsLive(t *testing.T) {
+	portStr := os.Getenv("SIDECHAIN_SWEEP_PORT")
+	catPath := os.Getenv("SIDECHAIN_SWEEP_CATALOG")
+	if portStr == "" || catPath == "" {
+		t.Skip("set SIDECHAIN_SWEEP_PORT + SIDECHAIN_SWEEP_CATALOG to run the governed-tools E2E test")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("bad port: %v", err)
+	}
+	data, err := os.ReadFile(catPath)
+	if err != nil {
+		t.Fatalf("read catalog: %v", err)
+	}
+	cat, err := loadCatalogJSON(data)
+	if err != nil {
+		t.Fatalf("load catalog: %v", err)
+	}
+	s := newSession(cat)
+	ctx := context.Background()
+	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: port}); err != nil {
+		t.Fatalf("connect_live: %v", err)
+	}
+	defer s.handleDisconnectLive(ctx, nil, emptyIn{})
+
+	_, gout, _ := s.handleGetLeases(ctx, nil, emptyIn{})
+	lr, ok := gout.(leaseResult)
+	if !ok || lr.You == 0 {
+		t.Fatalf("get_leases did not report a client id: %+v", gout)
+	}
+	if len(lr.Leasable) == 0 {
+		t.Skip("plugin exposes no leasable sections")
+	}
+	me := lr.You
+
+	// Claim the whole instance, tolerating a brief window where a prior test's lease is still being freed.
+	deadline := time.After(3 * time.Second)
+	for {
+		_, aout, _ := s.handleAcquireLease(ctx, nil, acquireLeaseIn{})
+		ar := aout.(leaseResult)
+		if ar.Resolution != "rejected" && ar.Instance == me {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("could not acquire the instance lease via MCP tools: %+v", ar)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+
+	// Claim a section as the instance holder, confirm via get_leases, then release both.
+	sec := lr.Leasable[0]
+	_, sout, _ := s.handleAcquireLease(ctx, nil, acquireLeaseIn{Section: sec})
+	if sr := sout.(leaseResult); sr.Resolution != "applied" || sr.Sections[sec] != me {
+		t.Fatalf("acquire section %q via MCP tools: %+v", sec, sr)
+	}
+	if _, g2, _ := s.handleGetLeases(ctx, nil, emptyIn{}); g2.(leaseResult).Instance != me {
+		t.Fatalf("get_leases should show you holding the instance: %+v", g2)
+	}
+	s.handleReleaseLease(ctx, nil, releaseLeaseIn{Section: sec})
+	s.handleReleaseLease(ctx, nil, releaseLeaseIn{})
+	t.Logf("governed tools E2E OK: client %d acquired the instance + section %q via MCP tools, then released", me, sec)
 }
 
 // TestGovernedDisconnectFreesLease checks the crash-safe cleanup wired into ControlServer: a controller that holds

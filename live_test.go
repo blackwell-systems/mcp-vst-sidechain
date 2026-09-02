@@ -80,6 +80,14 @@ type fakeHost struct {
 	state  string             // last-saved / loaded opaque state
 	resets int                // reset_init count
 	cmds   map[string]int     // per-command call counts (e.g. how many get_param probes the sweep issued)
+
+	// C2/C3: identity + a minimal in-memory governed model (enough to exercise the governed MCP tools; the full
+	// conflict tier is proven in governed_test.go and the gated live tests).
+	nextClient int
+	instance   int            // whole-instance lease holder; 0 = free
+	sections   map[string]int // param group -> holder
+	generation int            // bumped on a whole-patch change (load_state)
+	leasable   []string       // the leasable sections this fake exposes
 }
 
 func startFakeHost(t *testing.T) *fakeHost {
@@ -88,7 +96,10 @@ func startFakeHost(t *testing.T) *fakeHost {
 	if err != nil {
 		t.Fatalf("fake host listen: %v", err)
 	}
-	fh := &fakeHost{ln: ln, params: map[string]float64{}, reals: map[string]float64{}, state: "<STATE/>", cmds: map[string]int{}}
+	fh := &fakeHost{
+		ln: ln, params: map[string]float64{}, reals: map[string]float64{}, state: "<STATE/>", cmds: map[string]int{},
+		sections: map[string]int{}, leasable: []string{"Amp", "Filter", "Osc"},
+	}
 	go fh.serve()
 	return fh
 }
@@ -108,6 +119,10 @@ func (fh *fakeHost) serve() {
 
 func (fh *fakeHost) handle(conn net.Conn) {
 	defer conn.Close()
+	fh.mu.Lock()
+	fh.nextClient++
+	client := fh.nextClient
+	fh.mu.Unlock()
 	rd := bufio.NewReader(conn)
 	for {
 		line, err := rd.ReadBytes('\n')
@@ -118,7 +133,7 @@ func (fh *fakeHost) handle(conn net.Conn) {
 		if json.Unmarshal(line, &req) != nil {
 			continue
 		}
-		resp := fh.dispatch(req)
+		resp := fh.dispatch(req, client)
 		if id, ok := req["id"]; ok {
 			resp["id"] = id
 		}
@@ -127,14 +142,79 @@ func (fh *fakeHost) handle(conn net.Conn) {
 	}
 }
 
-func (fh *fakeHost) dispatch(req map[string]any) map[string]any {
+// govObj builds the wire `governed` object from the fake's in-memory state.
+func (fh *fakeHost) govObj() map[string]any {
+	secs := map[string]any{}
+	for n, h := range fh.sections {
+		secs[n] = h
+	}
+	return map[string]any{"instance_lease": fh.instance, "section_leases": secs, "generation": fh.generation}
+}
+
+func fhContains(xs []string, s string) bool {
+	for _, x := range xs {
+		if x == s {
+			return true
+		}
+	}
+	return false
+}
+
+func (fh *fakeHost) dispatch(req map[string]any, client int) map[string]any {
 	fh.mu.Lock()
 	defer fh.mu.Unlock()
 	cmd, _ := req["cmd"].(string)
 	fh.cmds[cmd]++
 	switch cmd {
 	case "ping":
-		return map[string]any{"ok": true, "pong": true}
+		return map[string]any{"ok": true, "pong": true, "client": client}
+	case "govern":
+		op, _ := req["op"].(string)
+		grp, _ := req["group"].(string)
+		switch op {
+		case "acquire_instance":
+			if fh.instance != 0 && fh.instance != client {
+				return map[string]any{"ok": true, "resolution": "rejected", "governed": fh.govObj()}
+			}
+			fh.instance = client
+			res := "applied"
+			for n, h := range fh.sections {
+				if h != client {
+					delete(fh.sections, n)
+					res = "compensated"
+				}
+			}
+			return map[string]any{"ok": true, "resolution": res, "governed": fh.govObj()}
+		case "release_instance":
+			if fh.instance == client {
+				fh.instance = 0
+			}
+			return map[string]any{"ok": true, "resolution": "applied", "governed": fh.govObj()}
+		case "acquire_section":
+			if !fhContains(fh.leasable, grp) {
+				return map[string]any{"ok": false, "error": "unknown_section"}
+			}
+			if fh.instance != 0 && fh.instance != client {
+				return map[string]any{"ok": true, "resolution": "rejected", "governed": fh.govObj()}
+			}
+			if h, ok := fh.sections[grp]; ok && h != client {
+				return map[string]any{"ok": true, "resolution": "rejected", "governed": fh.govObj()}
+			}
+			fh.sections[grp] = client
+			return map[string]any{"ok": true, "resolution": "applied", "governed": fh.govObj()}
+		case "release_section":
+			if h, ok := fh.sections[grp]; ok && h == client {
+				delete(fh.sections, grp)
+			}
+			return map[string]any{"ok": true, "resolution": "applied", "governed": fh.govObj()}
+		}
+		return map[string]any{"ok": false, "error": "unknown_op"}
+	case "get_governed":
+		secs := make([]any, len(fh.leasable))
+		for i, s := range fh.leasable {
+			secs[i] = s
+		}
+		return map[string]any{"ok": true, "governed": fh.govObj(), "sections": secs}
 	case "set_param":
 		id, _ := req["param"].(string)
 		if rv, ok := req["value"].(float64); ok { // real-unit forward (HasRealRange param)
@@ -153,6 +233,7 @@ func (fh *fakeHost) dispatch(req map[string]any) map[string]any {
 	case "load_state":
 		st, _ := req["state"].(string)
 		fh.state = st
+		fh.generation++ // a whole-patch change bumps the governed generation (mirrors the real host)
 		return map[string]any{"ok": true, "loaded": true}
 	case "reset_init":
 		fh.resets++

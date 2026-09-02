@@ -86,6 +86,9 @@ curve. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `play_note` / `all_notes_off` | Play a MIDI note (optionally auto-released) / panic. |
 | `save_state` / `load_state` | Snapshot the whole patch as one opaque blob / recall it. Round-tripped through the plugin's own state, never inspected. |
 | `reset_init` | Reset the running plugin to its init/default patch. |
+| `acquire_lease` / `release_lease` | Claim (or release) an exclusive edit lease on a param-group section, or the whole instance, so multiple agents driving one plugin don't fight over the same knobs. Returns applied/compensated/rejected. |
+| `get_leases` | Show the current edit leases, the leasable sections, the patch generation, and your own controller id. |
+| `poll_events` | What changed on the plugin since your last poll: parameter and lease changes made by other controllers. |
 
 ## Quickstart
 

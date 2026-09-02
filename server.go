@@ -64,6 +64,7 @@ func NewServer(name, version string, cat ParamCatalog) (*mcp.Server, *session) {
 	// accessor just returns it. One session, one live field, shared by both tool sets.
 	registerParamToolsOn(srv, s, func() LiveEndpoint { return s.live })
 	registerLiveTools(srv, s)
+	registerGovernedTools(srv, s)
 	return srv, s
 }
 

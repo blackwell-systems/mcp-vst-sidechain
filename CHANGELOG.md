@@ -8,6 +8,17 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Concurrency MCP tools (C2/C3): the multi-controller substrate is now agent-reachable.** The C1/C2/C3 work
+  was proven at the wire level but had no MCP surface; four tools expose it to an agent. `acquire_lease` /
+  `release_lease` claim or release an exclusive edit lease on a param-group section (`section=`) or the whole
+  instance (omit it), so several agents driving one plugin do not fight over the same knobs; the reply reports how
+  the conflict tier resolved it (applied / compensated / rejected) and the resulting leases. `get_leases` shows the
+  current instance/section holders, the leasable sections, the patch generation, and the caller's own controller
+  id. `poll_events` drains the server-pushed change events (`param_changed` / `governed_changed`) since the last
+  poll, collapsed to the latest value per param and filtered to OTHER controllers' changes by default
+  (`includeSelf=true` to include echoes). Backed by new `LiveEndpoint` methods (`ClientID`, `Govern`,
+  `GetGoverned`, `DrainEvents`) on the async `liveClient`. Covered by in-memory tool tests (`TestGovernedTools`,
+  `TestPollEventsDedupAndEcho`) and a gated real-host E2E (`TestGovernedToolsLive`) in the required concurrency leg.
 - **`describe_param` tool.** Probes a live param's value text across its range and reports the recovered
   real-unit semantics: unit (Hz/dB/ms/%/semitones), real range, curve shape (linear/log/exp), whether it is
   bipolar, or the labels when it is really a discrete control. This is how an agent learns what a hosted param

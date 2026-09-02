@@ -42,7 +42,26 @@ type LiveEndpoint interface {
 	ResetInit() error
 	GetFullState() (xml string, err error)
 	LoadState(xml string) error
+
+	// Concurrency surface (C2/C3). ClientID is this controller's identity (0 if unknown). Govern applies a
+	// governed command (op is acquire_instance/release_instance/acquire_section/release_section; group names the
+	// section for the section ops) and returns how the conflict tier resolved it plus the resulting state.
+	// GetGoverned reads the current governed state and the leasable sections. DrainEvents returns the buffered
+	// server-pushed change events (param_changed / governed_changed) since the last drain, oldest first.
+	ClientID() int
+	Govern(op, group string) (resolution string, gov GovernedState, err error)
+	GetGoverned() (gov GovernedState, sections []string, err error)
+	DrainEvents() []map[string]any
+
 	Close()
+}
+
+// GovernedState is the C3 coordination state as seen over the wire: who holds the whole-instance edit lease, who
+// holds each section (param group) lease, and the monotone patch generation (bumped on a whole-patch change).
+type GovernedState struct {
+	InstanceLease int            `json:"instance_lease"`
+	SectionLeases map[string]int `json:"section_leases"`
+	Generation    int            `json:"generation"`
 }
 
 // liveClient speaks the (now multiplexed async) control protocol over one socket. The host serves many clients
@@ -176,6 +195,78 @@ func (lc *liveClient) cancel(id int) {
 // Events returns the channel of server-pushed param_changed notifications (buffered; drop-if-full). A controller
 // can ignore events whose "by" equals its own clientID (its own echo).
 func (lc *liveClient) Events() <-chan map[string]any { return lc.events }
+
+// DrainEvents non-blockingly pulls every buffered server-pushed event (param_changed / governed_changed), oldest
+// first, and returns them. It never blocks: it stops at the first empty read, so it is safe to poll.
+func (lc *liveClient) DrainEvents() []map[string]any {
+	var out []map[string]any
+	for {
+		select {
+		case ev := <-lc.events:
+			out = append(out, ev)
+		default:
+			return out
+		}
+	}
+}
+
+// ClientID is the controller identity the host assigned at the ping handshake (0 if not connected).
+func (lc *liveClient) ClientID() int { return lc.clientID }
+
+// parseGoverned decodes the wire `governed` object into a GovernedState.
+func parseGoverned(v any) GovernedState {
+	g := GovernedState{SectionLeases: map[string]int{}}
+	m, _ := v.(map[string]any)
+	if m == nil {
+		return g
+	}
+	if f, ok := m["instance_lease"].(float64); ok {
+		g.InstanceLease = int(f)
+	}
+	if f, ok := m["generation"].(float64); ok {
+		g.Generation = int(f)
+	}
+	if secs, ok := m["section_leases"].(map[string]any); ok {
+		for name, hv := range secs {
+			if hf, ok := hv.(float64); ok {
+				g.SectionLeases[name] = int(hf)
+			}
+		}
+	}
+	return g
+}
+
+// Govern applies a governed command over the socket (the host runs the conflict tier on its single applier and
+// pushes a governed_changed event). A rejection is a normal reply (resolution "rejected"), not an error.
+func (lc *liveClient) Govern(op, group string) (string, GovernedState, error) {
+	req := map[string]any{"cmd": "govern", "op": op}
+	if group != "" {
+		req["group"] = group
+	}
+	resp, err := lc.request(req)
+	if err != nil {
+		return "", GovernedState{}, err
+	}
+	res, _ := resp["resolution"].(string)
+	return res, parseGoverned(resp["governed"]), nil
+}
+
+// GetGoverned reads the current governed state and the leasable sections (the plugin's param groups).
+func (lc *liveClient) GetGoverned() (GovernedState, []string, error) {
+	resp, err := lc.request(map[string]any{"cmd": "get_governed"})
+	if err != nil {
+		return GovernedState{}, nil, err
+	}
+	var sections []string
+	if arr, ok := resp["sections"].([]any); ok {
+		for _, s := range arr {
+			if str, ok := s.(string); ok {
+				sections = append(sections, str)
+			}
+		}
+	}
+	return parseGoverned(resp["governed"]), sections, nil
+}
 
 // ---- LiveEndpoint impl ----
 
