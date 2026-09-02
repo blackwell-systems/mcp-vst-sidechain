@@ -32,6 +32,10 @@ jobs:
         run: |
           c++ -std=c++17 -Wall -Wextra -Werror -o sdt cpp/tests/section_derivation_test.cpp
           ./sdt
+      - name: Build and run render-analysis-test
+        run: |
+          c++ -std=c++17 -Wall -Wextra -Werror -o rat cpp/tests/render_analysis_test.cpp
+          ./rat
 
   build:
     strategy:

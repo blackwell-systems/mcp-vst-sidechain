@@ -45,6 +45,7 @@ target_link_libraries(sidechain-host PRIVATE
     juce::juce_audio_processors
     juce::juce_audio_utils
     juce::juce_audio_devices
+    juce::juce_dsp                     # juce::dsp::FFT for the render path's spectral centroid / band energy
     juce::juce_recommended_config_flags
     juce::juce_recommended_lto_flags
     juce::juce_recommended_warning_flags)
@@ -65,3 +66,10 @@ enable_testing()
 add_executable(section-derivation-test tests/section_derivation_test.cpp)
 set_target_properties(section-derivation-test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
 add_test(NAME section-derivation COMMAND section-derivation-test)
+
+# Minimal unit test for the pure, JUCE-free half of the render measurement (RenderAnalysis.h: peak/rms/crest/
+# silent/clipped). Same pattern as above: a plain standalone executable, no JUCE, no plugin. The FFT-based
+# centroid/bands live in the JUCE-linked render path and are validated by the gated E2E, not here.
+add_executable(render-analysis-test tests/render_analysis_test.cpp)
+set_target_properties(render-analysis-test PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON)
+add_test(NAME render-analysis COMMAND render-analysis-test)

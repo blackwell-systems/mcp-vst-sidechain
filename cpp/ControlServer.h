@@ -42,6 +42,7 @@
 // protocol is multiplexed async (a reply carries the request `id`; an event carries an `event` field). Requests:
 //   ping · get_param{param} · set_param{param,(value|normalized|choice)} · note_on{chan,note,vel} ·
 //   note_off{chan,note} · all_notes_off · reset_init · load_state{state} · get_full_state · get_state ·
+//   render{note,velocity,channel,gate_ms,duration_ms,input_kind,input_freq,input_level} ·
 //   govern{op:(acquire_instance|release_instance|acquire_section{group}|release_section{group})} · get_governed.
 //   (load_state/get_full_state carry `state`: base64 of the plugin's own opaque state bytes, handled by the bridge.
 //    govern applies a command to the C3 governed coordination state (hierarchical edit leases + patch generation)
@@ -104,10 +105,11 @@ private:
         std::string state;
         Resolution  govRes  = Resolution::Applied;   // Govern: how the conflict tier resolved the command
         GovState    govState;                        // Govern / GetGoverned: the governed state after the command
+        Measurement measurement;                     // Render: the measured output of the offline render
     };
 
     enum class Kind : uint8_t { SetParam, NoteOn, NoteOff, AllNotesOff, ResetInit, LoadState, GetFullState,
-                                Govern, GetGoverned };
+                                Govern, GetGoverned, Render };
     struct Command
     {
         Kind  kind = Kind::SetParam;
@@ -116,6 +118,7 @@ private:
         float f = 0.0f;
         std::string                 payload;    // LoadState: the base64 opaque blob
         GovCmd                      gov;        // Govern: the governed command
+        RenderSpec                  render;     // Render: the offline-render spec
         std::shared_ptr<Completion> done;       // null => fire-and-forget
         int   clientId = 0;                      // originating controller (attribution for change events)
     };
@@ -304,6 +307,9 @@ private:
         if (cmd == "get_state")
             return handleGetState (id);
 
+        if (cmd == "render")
+            return handleRender (req, id, clientId);
+
         if (cmd == "govern")
             return handleGovern (req, id, clientId);
 
@@ -390,6 +396,64 @@ private:
             o.setProperty ("count",  (int) all.size());
             o.setProperty ("params", juce::var (params));
         });
+    }
+
+    // -------- offline render + measure (Tier 1 + 2; see docs/RENDER-SCOPING.md) ------------------
+    // A render is a bounded BLOCKING command on the single applier thread (like get_full_state): the bridge
+    // re-prepares the processor, drives it with a MIDI note (instrument) or an input signal (effect), loops
+    // processBlock over the duration, and analyzes the output. It serializes with param sets, so it introduces no
+    // new concurrency hazard. All request fields are optional and carry the RenderSpec defaults; the host
+    // auto-detects instrument vs effect. The reply carries the measurement object.
+    juce::String handleRender (const juce::var& req, const juce::var& id, int clientId)
+    {
+        RenderSpec spec;   // defaults; each field is overridden only if present in the request
+        if (req.hasProperty ("note"))        spec.note       = (int)   req.getProperty ("note", spec.note);
+        if (req.hasProperty ("velocity"))    spec.velocity   = (float) (double) req.getProperty ("velocity", spec.velocity);
+        if (req.hasProperty ("channel"))     spec.channel    = (int)   req.getProperty ("channel", spec.channel);
+        if (req.hasProperty ("gate_ms"))     spec.gateMs     = (int)   req.getProperty ("gate_ms", spec.gateMs);
+        if (req.hasProperty ("duration_ms")) spec.durationMs = (int)   req.getProperty ("duration_ms", spec.durationMs);
+        if (req.hasProperty ("input_freq"))  spec.inputFreq  = (double) req.getProperty ("input_freq", spec.inputFreq);
+        if (req.hasProperty ("input_level")) spec.inputLevel = (float) (double) req.getProperty ("input_level", spec.inputLevel);
+        if (req.hasProperty ("input_kind"))
+        {
+            const juce::String k = req.getProperty ("input_kind", juce::var()).toString();
+            if      (k == "silence") spec.inputKind = InputKind::Silence;
+            else if (k == "sine")    spec.inputKind = InputKind::Sine;
+            else if (k == "noise")   spec.inputKind = InputKind::Noise;
+            else if (k == "impulse") spec.inputKind = InputKind::Impulse;
+            else return errorReply ("bad_input_kind", id);
+        }
+
+        Command c; c.kind = Kind::Render; c.render = spec; c.clientId = clientId;
+        auto done = submit (std::move (c), 5000);   // generous: a render is bounded but not instant
+        if (done == nullptr)
+            return errorReply ("timeout", id);
+        if (! done->measurement.ok)
+            return errorReply ("render_failed", id);
+        return okReply (id, [&] (juce::DynamicObject& o)
+        {
+            o.setProperty ("measurement", measurementToVar (done->measurement));
+        });
+    }
+
+    static juce::var measurementToVar (const Measurement& m)
+    {
+        auto* bands = new juce::DynamicObject();
+        bands->setProperty ("low_db",  m.lowDb);
+        bands->setProperty ("mid_db",  m.midDb);
+        bands->setProperty ("high_db", m.highDb);
+        auto* o = new juce::DynamicObject();
+        o->setProperty ("duration_sec", m.durationSec);
+        o->setProperty ("sample_rate",  m.sampleRate);
+        o->setProperty ("channels",     m.channels);
+        o->setProperty ("peak_db",      m.peakDb);
+        o->setProperty ("rms_db",       m.rmsDb);
+        o->setProperty ("crest",        m.crest);
+        o->setProperty ("centroid_hz",  m.centroidHz);
+        o->setProperty ("bands",        juce::var (bands));
+        o->setProperty ("silent",       m.silent);
+        o->setProperty ("clipped",      m.clipped);
+        return juce::var (o);
     }
 
     // -------- governed coordination state (C3 conflict tier; see GovernedState.h / docs/CONCURRENCY.md) ---------
@@ -603,6 +667,12 @@ private:
                     c.done->govState = governed;
                     c.done->stateOk  = true;
                 }
+                break;
+            case Kind::Render:
+                // Bounded blocking render on the single applier: re-prepares, drives, processBlock loop, analyzes.
+                // Serializes with param sets (no new hazard), so a measured patch is exactly the current state.
+                if (c.done)
+                    c.done->measurement = bridge.renderAndMeasure (c.render);
                 break;
         }
     }

@@ -1,14 +1,17 @@
 #pragma once
 #include <juce_audio_processors/juce_audio_processors.h>
 #include <juce_audio_basics/juce_audio_basics.h>
+#include <juce_dsp/juce_dsp.h>
 #include <atomic>
 #include <cmath>
+#include <cstddef>
 #include <memory>
 #include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
 #include "PluginBridge.h"
+#include "RenderAnalysis.h"
 #include "Sectioning.h"
 
 // ================================================================================================
@@ -174,6 +177,105 @@ public:
         return true;
     }
 
+    // ---- offline render + measure (message thread only) ----
+    // Re-prepare the processor (resets DSP state: envelopes, LFO phase, filter memory; NOT params, so the current
+    // patch is what we measure), drive it with a MIDI note (instrument) or a synthesized input signal (effect),
+    // loop processBlock over the duration accumulating the output, then analyze. Auto-detects instrument vs effect
+    // from the processor's bus layout: accepts MIDI AND has 0 audio input channels => instrument, else effect.
+    Measurement renderAndMeasure (const RenderSpec& spec) override
+    {
+        Measurement out;
+
+        const double sampleRate = processor.getSampleRate() > 0.0 ? processor.getSampleRate() : 48000.0;
+        int blockSize = processor.getBlockSize() > 0 ? processor.getBlockSize() : 512;
+        if (blockSize <= 0)
+            blockSize = 512;
+
+        const int numInputs  = processor.getTotalNumInputChannels();
+        const int numOutputs = processor.getTotalNumOutputChannels();
+        const int numChannels = juce::jmax (1, numInputs, numOutputs);   // buffer width the processor can use
+        if (numOutputs <= 0)
+        {
+            out.ok = false;
+            return out;   // nothing to measure (no audio output)
+        }
+
+        // Instrument if it accepts MIDI and has no audio input; otherwise an effect. This also honours the
+        // request implicitly: an instrument ignores the input signal fields, an effect ignores note/gate.
+        const bool isInstrument = processor.acceptsMidi() && numInputs == 0;
+
+        const int durationMs = juce::jmax (1, spec.durationMs);
+        const int totalSamples = (int) std::llround ((double) durationMs * sampleRate / 1000.0);
+        if (totalSamples <= 0)
+        {
+            out.ok = false;
+            return out;
+        }
+
+        // Re-prepare so the render is deterministic regardless of prior renders / edits (params are untouched).
+        processor.releaseResources();
+        processor.prepareToPlay (sampleRate, blockSize);
+
+        // Note-on at sample 0, note-off at gateMs (clamped into the render). Only meaningful for an instrument.
+        const int gateSample = juce::jlimit (0, totalSamples,
+                                             (int) std::llround ((double) juce::jmax (0, spec.gateMs) * sampleRate / 1000.0));
+        const int channel = juce::jlimit (1, 16, spec.channel);
+        const int note    = juce::jlimit (0, 127, spec.note);
+        const float vel   = juce::jlimit (0.0f, 1.0f, spec.velocity);
+
+        // Accumulate the whole render summed to mono for the headline numbers (matches the analysis contract).
+        std::vector<float> mono;
+        mono.reserve ((std::size_t) totalSamples);
+
+        juce::AudioBuffer<float> buffer (numChannels, blockSize);
+        juce::uint64 inputPhaseSamples = 0;   // running sample index, for a continuous input sine across blocks
+        juce::Random rng (0xC0FFEE);          // seeded => deterministic noise
+
+        int pos = 0;
+        while (pos < totalSamples)
+        {
+            const int thisBlock = juce::jmin (blockSize, totalSamples - pos);
+            buffer.clear();
+
+            // ---- build the input for an effect (an instrument leaves the input silent) ----
+            if (! isInstrument && numInputs > 0)
+                fillInput (buffer, numInputs, thisBlock, spec, sampleRate, inputPhaseSamples, rng);
+            inputPhaseSamples += (juce::uint64) thisBlock;
+
+            // ---- MIDI for an instrument (note-on / note-off land in the block that contains them) ----
+            juce::MidiBuffer midi;
+            if (isInstrument)
+            {
+                if (pos == 0)
+                    midi.addEvent (juce::MidiMessage::noteOn (channel, note, vel), 0);
+                if (gateSample >= pos && gateSample < pos + thisBlock)
+                    midi.addEvent (juce::MidiMessage::noteOff (channel, note), gateSample - pos);
+            }
+
+            // Present exactly thisBlock samples to the processor, then accumulate.
+            juce::AudioBuffer<float> view (buffer.getArrayOfWritePointers(), numChannels, thisBlock);
+            processor.processBlock (view, midi);
+
+            appendMono (mono, view, numOutputs, thisBlock);
+            pos += thisBlock;
+        }
+
+        // ---- fill the measurement: pure core (RenderAnalysis.h) + the FFT path ----
+        const BasicMeasurement basic = analyzeMono (mono.data(), mono.size());
+        out.ok          = true;
+        out.durationSec = (double) totalSamples / sampleRate;
+        out.sampleRate  = sampleRate;
+        out.channels    = numOutputs;
+        out.peakDb      = basic.peakDb;
+        out.rmsDb       = basic.rmsDb;
+        out.crest       = basic.crest;
+        out.silent      = basic.silent;
+        out.clipped     = basic.clipped;
+
+        analyzeSpectrum (mono, sampleRate, out);
+        return out;
+    }
+
 private:
     struct ParamRef
     {
@@ -203,6 +305,113 @@ private:
         out.value      = valueForCatalog (ref, norm);
         if (withText)
             out.text = ref.rp->getText (norm, 256).toStdString();
+    }
+
+    // -------- render helpers (message thread) ----------------------------------------------------
+    // Synthesize the excitation signal into every input channel for the current block. `phaseSamples` is the
+    // running sample index across the whole render, so a sine is phase-continuous between blocks.
+    static void fillInput (juce::AudioBuffer<float>& buffer, int numInputs, int numSamples,
+                           const RenderSpec& spec, double sampleRate, juce::uint64 phaseSamples, juce::Random& rng)
+    {
+        const float level = juce::jlimit (0.0f, 1.0f, spec.inputLevel);
+        for (int i = 0; i < numSamples; ++i)
+        {
+            float s = 0.0f;
+            switch (spec.inputKind)
+            {
+                case InputKind::Silence:
+                    s = 0.0f;
+                    break;
+                case InputKind::Sine:
+                {
+                    const double t = (double) (phaseSamples + (juce::uint64) i) / sampleRate;
+                    s = level * (float) std::sin (juce::MathConstants<double>::twoPi * spec.inputFreq * t);
+                    break;
+                }
+                case InputKind::Noise:
+                    s = level * (rng.nextFloat() * 2.0f - 1.0f);   // white noise in [-level, level]
+                    break;
+                case InputKind::Impulse:
+                    s = (phaseSamples == 0 && i == 0) ? level : 0.0f;   // a single unit sample at t=0
+                    break;
+            }
+            for (int ch = 0; ch < numInputs; ++ch)
+                buffer.setSample (ch, i, s);
+        }
+    }
+
+    // Append this block's output, summed across channels to mono (matching the measurement contract).
+    static void appendMono (std::vector<float>& mono, const juce::AudioBuffer<float>& view, int numOutputs, int numSamples)
+    {
+        const int chans = juce::jmin (numOutputs, view.getNumChannels());
+        for (int i = 0; i < numSamples; ++i)
+        {
+            float sum = 0.0f;
+            for (int ch = 0; ch < chans; ++ch)
+                sum += view.getSample (ch, i);
+            mono.push_back (chans > 0 ? sum / (float) chans : 0.0f);
+        }
+    }
+
+    // The FFT-based measures (spectral centroid in Hz; 3-band energy low <200 / mid 200-2000 / high >2000, dBFS).
+    // Averages the magnitude spectrum over successive Hann-windowed frames (juce::dsp::FFT), so the numbers are
+    // stable over the whole render rather than a single frame. Leaves the defaults (silent floor) on empty input.
+    static void analyzeSpectrum (const std::vector<float>& mono, double sampleRate, Measurement& out)
+    {
+        if (mono.empty() || sampleRate <= 0.0)
+            return;
+
+        constexpr int fftOrder = 11;                 // 2048-point FFT: about 23 Hz bins at 48 kHz
+        constexpr int fftSize  = 1 << fftOrder;
+        const int numBins = fftSize / 2;             // real-signal spectrum is symmetric; keep the lower half
+        if ((int) mono.size() < fftSize)
+            return;                                   // too short for one frame; leave FFT measures at the floor
+
+        juce::dsp::FFT fft (fftOrder);
+        juce::dsp::WindowingFunction<float> window ((std::size_t) fftSize, juce::dsp::WindowingFunction<float>::hann);
+
+        std::vector<float> avgMag ((std::size_t) numBins, 0.0f);
+        const int hop = fftSize / 2;                 // 50% overlap
+        int frames = 0;
+        std::vector<float> fftData ((std::size_t) (fftSize * 2), 0.0f);   // in-place complex buffer for JUCE FFT
+
+        for (std::size_t start = 0; start + (std::size_t) fftSize <= mono.size(); start += (std::size_t) hop)
+        {
+            std::fill (fftData.begin(), fftData.end(), 0.0f);
+            for (int i = 0; i < fftSize; ++i)
+                fftData[(std::size_t) i] = mono[start + (std::size_t) i];
+            window.multiplyWithWindowingTable (fftData.data(), (std::size_t) fftSize);
+            fft.performFrequencyOnlyForwardTransform (fftData.data());   // magnitudes land in [0, fftSize)
+            for (int b = 0; b < numBins; ++b)
+                avgMag[(std::size_t) b] += fftData[(std::size_t) b];
+            ++frames;
+        }
+        if (frames == 0)
+            return;
+
+        const double binHz = sampleRate / (double) fftSize;
+        double weightedFreq = 0.0, magSum = 0.0;
+        double lowE = 0.0, midE = 0.0, highE = 0.0;   // summed power per band
+        for (int b = 1; b < numBins; ++b)             // skip DC (bin 0) for the centroid / bands
+        {
+            const double mag = (double) avgMag[(std::size_t) b] / (double) frames;
+            const double freq = (double) b * binHz;
+            weightedFreq += freq * mag;
+            magSum       += mag;
+
+            const double power = mag * mag;
+            if (freq < 200.0)        lowE  += power;
+            else if (freq <= 2000.0) midE  += power;
+            else                     highE += power;
+        }
+
+        out.centroidHz = (magSum > 0.0) ? (weightedFreq / magSum) : 0.0;
+        // Band energy as an RMS-like dBFS level (sqrt of summed power, normalized by the FFT size so full-scale
+        // maps near 0 dBFS). These are relative brightness/tilt indicators, not calibrated absolute levels.
+        const double norm = (double) fftSize;
+        out.lowDb  = linearToDb (std::sqrt (lowE)  / norm);
+        out.midDb  = linearToDb (std::sqrt (midE)  / norm);
+        out.highDb = linearToDb (std::sqrt (highE) / norm);
     }
 
     // -------- juce::AudioProcessorParameter::Listener --------------------------------------------
