@@ -423,6 +423,12 @@ private:
             else if (k == "impulse") spec.inputKind = InputKind::Impulse;
             else return errorReply ("bad_input_kind", id);
         }
+        // Tier 2.5: optional temporal analysis fields. When "temporal" is absent or false, behavior is unchanged
+        // and no modulation block is emitted. "frame_ms" is optional (default 25, clamped in the bridge).
+        if (req.hasProperty ("temporal"))
+            spec.temporal = (bool) req.getProperty ("temporal", false);
+        if (req.hasProperty ("frame_ms"))
+            spec.frameMs = (int) req.getProperty ("frame_ms", spec.frameMs);
 
         Command c; c.kind = Kind::Render; c.render = spec; c.clientId = clientId;
         auto done = submit (std::move (c), 5000);   // generous: a render is bounded but not instant
@@ -434,6 +440,17 @@ private:
         {
             o.setProperty ("measurement", measurementToVar (done->measurement));
         });
+    }
+
+    // Serialize a ModSignal into a DynamicObject with the pinned snake_case wire shape.
+    static juce::var modSignalToVar (const ModSignal& s)
+    {
+        auto* o = new juce::DynamicObject();
+        o->setProperty ("rate_hz",    s.rateHz);
+        o->setProperty ("depth",      s.depth);
+        o->setProperty ("regular",    s.regular);
+        o->setProperty ("confidence", s.confidence);
+        return juce::var (o);
     }
 
     static juce::var measurementToVar (const Measurement& m)
@@ -453,6 +470,17 @@ private:
         o->setProperty ("bands",        juce::var (bands));
         o->setProperty ("silent",       m.silent);
         o->setProperty ("clipped",      m.clipped);
+        // Tier 2.5: emit the modulation block ONLY when present=true (i.e. temporal=true was requested).
+        // When temporal was false, present is false and the key is omitted entirely (no null/zero emission).
+        if (m.modulation.present)
+        {
+            auto* mod = new juce::DynamicObject();
+            mod->setProperty ("frame_ms",  m.modulation.frameMs);
+            mod->setProperty ("centroid",  modSignalToVar (m.modulation.centroid));
+            mod->setProperty ("rms",       modSignalToVar (m.modulation.rms));
+            mod->setProperty ("dominant",  juce::String (m.modulation.dominant));
+            o->setProperty ("modulation",  juce::var (mod));
+        }
         return juce::var (o);
     }
 

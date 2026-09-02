@@ -282,6 +282,15 @@ public:
         out.clipped     = basic.clipped;
 
         analyzeSpectrum (mono, sampleRate, out);
+
+        // ---- Tier 2.5: temporal (modulation-aware) measurement (only when requested) ----
+        // Slides non-overlapping frames over the mono buffer. For each frame compute the RMS (dBFS) and
+        // the spectral centroid (Hz) using the same per-frame FFT approach as analyzeSpectrum but applied to
+        // a single frame. This builds two envelope time series (centroidHz[], rmsDb[]) that then feed the
+        // pure analyzeEnvelope estimator (RenderAnalysis.h) to detect LFO rate/depth/regularity.
+        if (spec.temporal)
+            analyzeModulation (mono, sampleRate, spec, out);
+
         return out;
     }
 
@@ -421,6 +430,114 @@ private:
         out.lowDb  = linearToDb (std::sqrt (lowE)  / norm);
         out.midDb  = linearToDb (std::sqrt (midE)  / norm);
         out.highDb = linearToDb (std::sqrt (highE) / norm);
+    }
+
+    // -------- Tier 2.5: temporal modulation analysis (message thread) ---------------------------
+    // Slides non-overlapping frames over the mono buffer. Per frame: compute rms (dBFS) and spectral centroid
+    // (Hz via a single windowed FFT). Build two envelope series; run analyzeEnvelope on each to estimate LFO
+    // rate/depth. Pick the dominant signal by a normalized strength score; fill measurement.modulation.
+    static void analyzeModulation (const std::vector<float>& mono, double sampleRate,
+                                   const RenderSpec& spec, Measurement& out)
+    {
+        // Clamp frameMs to the [5, 100] range (per the wire contract); then compute frame length in samples.
+        const int frameMs  = juce::jlimit (5, 100, spec.frameMs > 0 ? spec.frameMs : 25);
+        const int frameLen = juce::jmax (1, (int) std::llround ((double) frameMs * sampleRate / 1000.0));
+
+        // The envelope sample rate: one measurement per frame.
+        const double fsEnv = sampleRate / (double) frameLen;
+
+        const int totalSamples = (int) mono.size();
+        const int numFrames    = totalSamples / frameLen;   // integer; the last partial frame is dropped
+
+        // Always fill the block as present=true (with potentially low confidence) so the caller can see the
+        // frame parameters; we just cannot reliably estimate a rate if we have fewer than 4 frames.
+        out.modulation.present  = true;
+        out.modulation.frameMs  = frameMs;
+
+        if (numFrames < 1)
+            return;   // present=true but all signals stay at defaults (zero confidence)
+
+        // Per-frame FFT setup (reuse the same FFT order as analyzeSpectrum when the frame is long enough;
+        // otherwise use the largest order that fits). A single windowed FFT per frame is sufficient.
+        int fftOrder = 11;   // 2048-point is the default
+        while (fftOrder > 1 && (1 << fftOrder) > frameLen)
+            --fftOrder;
+        const int fftSize = 1 << fftOrder;
+        const int numBins = fftSize / 2;
+        const double binHz = sampleRate / (double) fftSize;
+
+        // Only allocate FFT objects when a frame is long enough for at least one bin past DC.
+        const bool canFFT = (frameLen >= fftSize && fftSize >= 4);
+        juce::dsp::FFT                          fft (fftOrder);
+        juce::dsp::WindowingFunction<float>     window ((std::size_t) fftSize, juce::dsp::WindowingFunction<float>::hann);
+        std::vector<float>                      fftData ((std::size_t) (fftSize * 2), 0.0f);
+
+        // Envelope time series: one value per frame.
+        std::vector<float> centroidEnv ((std::size_t) numFrames, 0.0f);
+        std::vector<float> rmsDbEnv    ((std::size_t) numFrames, 0.0f);
+
+        for (int f = 0; f < numFrames; ++f)
+        {
+            const int start = f * frameLen;
+
+            // RMS of this frame (dBFS).
+            double sumSq = 0.0;
+            for (int i = 0; i < frameLen; ++i)
+            {
+                const double s = (double) mono[(std::size_t) (start + i)];
+                sumSq += s * s;
+            }
+            const double rmsLinear = std::sqrt (sumSq / (double) frameLen);
+            rmsDbEnv[(std::size_t) f] = (float) linearToDb (rmsLinear);
+
+            // Spectral centroid of this frame via a single windowed FFT (only when the frame is long enough).
+            if (canFFT)
+            {
+                std::fill (fftData.begin(), fftData.end(), 0.0f);
+                for (int i = 0; i < fftSize; ++i)
+                    fftData[(std::size_t) i] = mono[(std::size_t) (start + i)];
+                window.multiplyWithWindowingTable (fftData.data(), (std::size_t) fftSize);
+                fft.performFrequencyOnlyForwardTransform (fftData.data());
+                double wFreq = 0.0, mSum = 0.0;
+                for (int b = 1; b < numBins; ++b)
+                {
+                    const double mag  = (double) fftData[(std::size_t) b];
+                    const double freq = (double) b * binHz;
+                    wFreq += freq * mag;
+                    mSum  += mag;
+                }
+                centroidEnv[(std::size_t) f] = (mSum > 0.0) ? (float) (wFreq / mSum) : 0.0f;
+            }
+            // If canFFT is false (very short frame), centroid stays 0 for this frame.
+        }
+
+        // Analyze each envelope for periodicity using the pure JUCE-free estimator.
+        const EnvStats centStat = analyzeEnvelope (centroidEnv.data(), (std::size_t) numFrames, fsEnv);
+        const EnvStats rmsStat  = analyzeEnvelope (rmsDbEnv.data(),    (std::size_t) numFrames, fsEnv);
+
+        // Fill the wire-visible ModSignal structs.
+        out.modulation.centroid.rateHz     = centStat.rateHz;
+        out.modulation.centroid.depth      = centStat.depth;
+        out.modulation.centroid.confidence = centStat.confidence;
+        out.modulation.centroid.regular    = centStat.regular;
+
+        out.modulation.rms.rateHz     = rmsStat.rateHz;
+        out.modulation.rms.depth      = rmsStat.depth;
+        out.modulation.rms.confidence = rmsStat.confidence;
+        out.modulation.rms.regular    = rmsStat.regular;
+
+        // dominant: compare normalized strength scores. Normalize centroid depth by 2000 Hz and rms depth by
+        // 12 dB so both are on roughly the same [0, 1] scale. A signal only scores above zero when regular is
+        // true; irregular movement still gets a depth measurement but does not claim to be dominant.
+        const double centScore = centStat.regular ? centStat.confidence * (centStat.depth / 2000.0) : 0.0;
+        const double rmsScore  = rmsStat.regular  ? rmsStat.confidence  * (rmsStat.depth  / 12.0)   : 0.0;
+        const double kDomThreshold = 1.0e-4;   // below this, neither is meaningfully dominant
+        if (centScore > rmsScore && centScore > kDomThreshold)
+            out.modulation.dominant = "centroid";
+        else if (rmsScore > centScore && rmsScore > kDomThreshold)
+            out.modulation.dominant = "rms";
+        else
+            out.modulation.dominant = "none";
     }
 
     // -------- juce::AudioProcessorParameter::Listener --------------------------------------------

@@ -107,6 +107,99 @@ void testEmpty()
     const BasicMeasurement z = analyzeMono (none.data(), 0);
     expectTrue (z.silent, "empty.zeroLen");
 }
+
+// ================================================================================================
+// Tier 2.5: analyzeEnvelope tests (JUCE-free, same file, same tiny-assert style).
+// ================================================================================================
+
+using sidechain::analyzeEnvelope;
+using sidechain::EnvStats;
+
+// A periodic sine envelope sampled at fsEnv=40 Hz for ~2 s (80 frames) at 2 Hz.
+// Expected: rateHz within ~10% of 2.0, regular=true, depth ~ 2*amplitude, confidence > 0.5.
+void testSineEnvelope()
+{
+    // 2 Hz sine, amplitude 1.0, fsEnv = 40 Hz, 80 frames (2.0 s of envelope).
+    constexpr std::size_t n = 80;
+    constexpr double fsEnv  = 40.0;
+    constexpr double rate   = 2.0;
+    constexpr float  amp    = 1.0f;
+    const double twoPi = 6.283185307179586;
+
+    std::vector<float> env (n);
+    for (std::size_t i = 0; i < n; ++i)
+        env[i] = amp * (float) std::sin (twoPi * rate * (double) i / fsEnv);
+
+    const EnvStats s = analyzeEnvelope (env.data(), n, fsEnv);
+
+    // Rate should be within 10% of 2 Hz.
+    expectTrue (std::fabs (s.rateHz - rate) / rate < 0.10, "sineEnv.rateHz ~2 Hz");
+    // depth should be approximately 2 * amplitude (peak-to-peak).
+    expectNear (s.depth, (double) (2.0f * amp), 0.15, "sineEnv.depth ~2.0");
+    expectTrue (s.regular, "sineEnv.regular");
+    expectTrue (s.confidence > 0.5, "sineEnv.confidence>0.5");
+}
+
+// A linear ramp envelope: aperiodic, so regular=false and confidence should be low.
+// depth = span of the ramp.
+void testRampEnvelope()
+{
+    constexpr std::size_t n    = 60;
+    constexpr double      fsEnv = 40.0;
+    std::vector<float> env (n);
+    for (std::size_t i = 0; i < n; ++i)
+        env[i] = (float) i / (float) (n - 1);   // 0 .. 1 linear ramp
+
+    const EnvStats s = analyzeEnvelope (env.data(), n, fsEnv);
+    expectTrue (! s.regular, "rampEnv.notRegular");
+    // depth should be approximately 1 (span of the 0..1 ramp).
+    expectNear (s.depth, 1.0, 0.05, "rampEnv.depth~1.0");
+}
+
+// White-noise envelope: irregular, should not be detected as regular.
+void testNoiseEnvelope()
+{
+    // Pseudo-random noise using a simple LCG so the test is deterministic.
+    constexpr std::size_t n    = 80;
+    constexpr double      fsEnv = 40.0;
+    std::vector<float> env (n);
+    uint32_t state = 0xDEADBEEFu;
+    for (std::size_t i = 0; i < n; ++i)
+    {
+        state = state * 1664525u + 1013904223u;
+        env[i] = (float) (int32_t) state * (1.0f / 2147483648.0f);   // in [-1, 1]
+    }
+    const EnvStats s = analyzeEnvelope (env.data(), n, fsEnv);
+    // White noise has no strong autocorrelation peak so regular should be false.
+    expectTrue (! s.regular, "noiseEnv.notRegular");
+}
+
+// Flat (constant) envelope: depth ~ 0, regular=false, confidence 0.
+void testFlatEnvelope()
+{
+    constexpr std::size_t n    = 40;
+    constexpr double      fsEnv = 40.0;
+    std::vector<float> env (n, 0.5f);   // constant
+
+    const EnvStats s = analyzeEnvelope (env.data(), n, fsEnv);
+    expectNear (s.depth, 0.0, 1.0e-4, "flatEnv.depth~0");
+    expectTrue (! s.regular, "flatEnv.notRegular");
+    expectNear (s.confidence, 0.0, 1.0e-9, "flatEnv.confidence0");
+    expectNear (s.rateHz, 0.0, 1.0e-9, "flatEnv.rateHz0");
+}
+
+// Too-short span (n < 4): returns default (no-op) without crashing.
+void testTooShortEnvelope()
+{
+    constexpr double fsEnv = 40.0;
+    std::vector<float> env = { 0.1f, 0.9f, 0.1f };   // n=3 < 4
+    const EnvStats s = analyzeEnvelope (env.data(), env.size(), fsEnv);
+    // Should not crash; result is all-zero defaults.
+    expectNear (s.rateHz, 0.0, 1.0e-9, "shortEnv.rateHz0");
+    expectTrue (! s.regular, "shortEnv.notRegular");
+    expectNear (s.confidence, 0.0, 1.0e-9, "shortEnv.confidence0");
+}
+
 } // namespace
 
 int main()
@@ -116,6 +209,13 @@ int main()
     testLouderHasHigherRms();
     testBelowThresholdIsSilent();
     testEmpty();
+
+    // Tier 2.5: envelope analysis tests.
+    testSineEnvelope();
+    testRampEnvelope();
+    testNoiseEnvelope();
+    testFlatEnvelope();
+    testTooShortEnvelope();
 
     if (g_failures == 0)
     {

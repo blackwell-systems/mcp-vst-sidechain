@@ -56,11 +56,39 @@ struct RenderSpec
     InputKind inputKind = InputKind::Sine;   // excitation for an effect render
     double    inputFreq = 220.0;             // Sine frequency in Hz
     float     inputLevel = 0.5f;             // Sine / Noise / Impulse amplitude, 0..1
+
+    // Tier 2.5: temporal (modulation-aware) measurement. When false (default), behavior is unchanged and no
+    // modulation block is emitted. When true, the render is analyzed in short frames and a modulation block
+    // describing LFO rate/depth of any time variation is added to the measurement.
+    bool temporal = false;
+    int  frameMs  = 25;   // per-frame hop in ms for the temporal analysis; clamped to [5, 100]
+};
+
+// Tier 2.5: per-signal modulation descriptor. Emitted for one envelope (centroid or rms) when temporal=true.
+// depth is in Hz for the centroid envelope and in dB for the rms envelope, matching the input units.
+struct ModSignal
+{
+    double rateHz     = 0.0;   // dominant LFO rate estimated from autocorrelation, Hz
+    double depth      = 0.0;   // excursion of the envelope: max - min (Hz for centroid, dB for rms)
+    double confidence = 0.0;   // 0..1 reliability of the rate estimate
+    bool   regular    = false; // true iff the autocorrelation peak is sharp (>= 0.5) AND >= 2 cycles fit
+};
+
+// Tier 2.5: the full modulation block, present in a Measurement only when temporal=true was requested.
+// present=false means the block is omitted from the wire reply entirely (no null/zero emission).
+struct Modulation
+{
+    bool      present  = false;       // false => not emitted; true => emit the modulation block
+    int       frameMs  = 25;          // the actual frame length used, clamped to [5, 100]
+    ModSignal centroid;               // spectral-centroid envelope periodicity (filter LFO / pitch sweep shows here)
+    ModSignal rms;                    // RMS-level envelope periodicity (tremolo / volume LFO shows here)
+    std::string dominant = "none";    // "centroid", "rms", or "none" (which signal carries the stronger modulation)
 };
 
 // The measurement returned from a render. The peak/rms/crest/silent/clipped half is the JUCE-free
 // BasicMeasurement (RenderAnalysis.h, unit-tested standalone); centroid/bands come from the FFT path in the
 // JUCE-linked bridge. `ok` is false when there is nothing to render (no plugin) or the render could not run.
+// When temporal=true was requested, the modulation block is filled (present=true) alongside the Tier-2 fields.
 struct Measurement
 {
     bool   ok = false;
@@ -80,6 +108,8 @@ struct Measurement
 
     bool   silent  = true;
     bool   clipped = false;
+
+    Modulation modulation;     // Tier 2.5: only emitted when modulation.present is true (i.e. temporal=true)
 };
 
 // The control plane implements this so the bridge can report a parameter change. May be invoked from ANY thread
