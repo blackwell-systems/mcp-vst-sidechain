@@ -436,6 +436,10 @@ JUCE, run by the `cpp.yml` `unit` job).
   - **AU load+drive smoke (`au_live_test.go`, gated on `SIDECHAIN_AU_*`).** Loads an Apple built-in AU by
     component identifier, enumerates its catalog, and drives it over the socket, closing the AU gap (everything
     else exercises VST3).
+  - **Full tool surface (`full_tool_surface_test.go`, gated, run per plugin).** `TestFullToolSurfaceLive` drives
+    EVERY MCP tool handler against the real host in one run - reads, writes, state (save/load/reset), MIDI, the
+    governed leases, the semantic tools, and `poll_events` surfacing a real change pushed by a second controller -
+    so no tool is only unit- or fake-host-tested. All 19 handlers are exercised end to end.
   - **Sectioning + semantic store (gated on the sweep env, run per plugin by `drive_plugin.sh`).**
     `TestSectionLockstep` asserts the host's emitted per-param `section` equals the Go reference derivation (so the
     two implementations cannot drift); `TestSemanticStoreLive` probes a real param once, then a second HEADLESS

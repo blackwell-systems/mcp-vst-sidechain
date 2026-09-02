@@ -176,6 +176,13 @@ All notable changes to this project are documented here. The format is based on
 
 ### Tests
 
+- **Complete tool-surface E2E: every MCP tool is now exercised against a real host in CI.** An audit found 13 of
+  19 tool handlers had real-host coverage; the other 6 (`poll_events`, `reset_init`, `list_params`,
+  `annotate_params`, `get_semantic_map`, `forget_semantics`) were only unit- or fake-host-tested. A new gated
+  `TestFullToolSurfaceLive` (`full_tool_surface_test.go`, run per plugin by `drive_plugin.sh`) drives ALL 19
+  handlers end to end against the running plugin in one pass - reads, writes, whole-patch state, MIDI, the governed
+  edit leases, the semantic tools (annotate -> read back in the map -> forget), and `poll_events` surfacing a real
+  `param_changed` pushed by a SECOND controller. Validated on Surge XT and TAL-NoiseMaker.
 - **C3 governed-state model stub + exhaustive-enumeration verification (`governed.go`, `governed_test.go`).** A
   first, illustrative cut of the small discrete coordination state a future C3 conflict tier would govern (an
   exclusive-edit lease, a voice-mode gate, a panic/playback latch), kept separate from the continuous plugin
