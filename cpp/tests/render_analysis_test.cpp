@@ -10,6 +10,7 @@
 
 #include "../RenderAnalysis.h"
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <vector>
 
