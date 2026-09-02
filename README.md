@@ -27,7 +27,9 @@ generic, realtime control bridge between an agent and an arbitrary plugin. Sidec
 
 There's no polished, standalone tool for this yet. The existing attempts are prototypes, DAW-specific
 controllers, or heavy agent-DAWs; none is a cross-platform generic bridge, and none handles the token cost of
-the huge parameter surfaces real plugins expose.
+the huge parameter surfaces real plugins expose. Sidechain deliberately does NOT try to be a DAW: it owns deep,
+semantic control of a single instrument or effect, the sub-task DAW tools serve worst. See
+[docs/POSITIONING.md](docs/POSITIONING.md) for the landscape and where this is differentiated.
 
 ### Built on GCF for large parameter sets
 
