@@ -249,12 +249,15 @@ func (fh *fakeHost) dispatch(req map[string]any, client int) map[string]any {
 		fh.panics++
 		return map[string]any{"ok": true}
 	case "render":
-		// Canned deterministic measurement so the render_and_measure tool is testable in-memory (the fake has no
-		// DSP; audio correctness lives only in the gated real-host tests). Mirrors the wire contract shape.
+		// Deterministic measurement so the render_and_measure AND tune_param tools are testable in-memory (the fake
+		// has no DSP; audio correctness lives only in the gated real-host tests). The spectral centroid RESPONDS to
+		// the "cutoff" param (monotonic 200..4000 Hz across its normalized range), so a tune toward brightness has a
+		// real gradient to climb; the other numbers are canned. Mirrors the wire contract shape.
 		fh.renders++
+		centroid := 200.0 + fh.params["cutoff"]*3800.0 // dispatch already holds fh.mu
 		return map[string]any{"ok": true, "measurement": map[string]any{
 			"duration_sec": 2.0, "sample_rate": 48000.0, "channels": 2,
-			"peak_db": -6.2, "rms_db": -18.4, "crest": 12.2, "centroid_hz": 1840.0,
+			"peak_db": -6.2, "rms_db": -18.4, "crest": 12.2, "centroid_hz": centroid,
 			"bands":  map[string]any{"low_db": -20.1, "mid_db": -16.8, "high_db": -28.0},
 			"silent": false, "clipped": false,
 		}}

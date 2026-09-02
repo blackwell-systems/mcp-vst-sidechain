@@ -266,12 +266,13 @@ jobs:
           source .github/scripts/drive_plugin.sh
           drive_plugin "TAL-NoiseMaker" "$HOME/plugins/TAL-NoiseMaker.vst3" 51991 1
 
-      # Make-it-brighter (render + analysis payoff): the canonical closed loop on a REAL plugin. TAL-NoiseMaker's
-      # init patch has an active lowpass (unlike Surge XT's, whose filter is Off in its init patch, so its cutoff is
-      # inaudible without patch setup), so opening its Filter Cutoff sweeps the spectral centroid ~10x. Set cutoff
-      # low, render a held note, measure the centroid; set it high, render again; assert the centroid rose. This is
-      # the objective proof that the agent can HEAR a parameter change. REQUIRED. The cutoff id is resolved by label.
-      - name: Make-it-brighter render loop (TAL Filter Cutoff) - REQUIRED
+      # Make-it-brighter (render + analysis + Phase-4 payoff): the canonical closed loop on a REAL plugin.
+      # TAL-NoiseMaker's init patch has an active lowpass (unlike Surge XT's, whose filter is Off in its init patch,
+      # so its cutoff is inaudible without patch setup), so opening its Filter Cutoff sweeps the spectral centroid
+      # ~10x. TestRenderBrighter proves the agent can HEAR a parameter change (low vs high, centroid rose);
+      # TestTuneBrighterLive proves the agent can act on it AUTONOMOUSLY (tune_param maximizes the centroid by
+      # searching the cutoff and lands it bright). REQUIRED. The cutoff id is resolved by label.
+      - name: Make-it-brighter render + tune loop (TAL Filter Cutoff) - REQUIRED
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
@@ -282,7 +283,7 @@ jobs:
           test -s brite.json || { echo "host did not write a catalog"; cat host-brite.log; exit 1; }
           CUTOFF=$(python3 -c "import json; d=json.load(open('brite.json')); print(next(p['id'] for p in d['params'] if p['label']=='Filter Cutoff'))")
           SIDECHAIN_LIVE_PORT=52021 SIDECHAIN_LIVE_CATALOG=brite.json SIDECHAIN_LIVE_PARAM="$CUTOFF" \
-            go test -run 'TestRenderBrighter' -v .
+            go test -run 'TestRenderBrighter|TestTuneBrighterLive' -v .
 
       # Flat-plugin section leases (C3): TAL exposes NO parameter-tree groups, so the host derives leasable sections
       # from shared label prefixes (computeSections, a port of sections.go). This exercises that fallback end to

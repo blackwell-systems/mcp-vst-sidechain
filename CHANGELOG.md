@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Phase 4 (increment 1): `tune_param`, the autonomous make-it-brighter loop.** With the semantic map (Phase 3)
+  and ears (render + analysis), the agent can now close the loop: `tune_param` drives ONE parameter toward a goal
+  (`maximize`/`minimize`/`target`) on ONE measurement (`centroid_hz`/`peak_db`/`rms_db`/`crest`/band) by rendering
+  and measuring at each step, a bounded coarse-seed + golden-section search (~9 renders). The AGENT picks the
+  param, measure, and direction from the semantic map ("brighter" -> the `filter.cutoff` role, `centroid_hz`,
+  maximize); the server converges it objectively and returns the value it settled on plus the full search trace.
+  The bridge holds no intent ontology, matching the Phase-3 split (semantics in the agent, mechanism in the
+  server). `restore=true` makes it a measure-only what-if; the default leaves the param at the best value found.
+  Proven end to end by `TestTuneBrighterLive` (TAL Filter Cutoff: `maximize centroid_hz` starts dark and lands the
+  cutoff bright, 57 Hz -> ~2.5 kHz) and in-memory tune tests against a param-responsive fake host. See
+  `docs/PHASE4-SCOPING.md`.
+
 - **Render + analysis: the agent can now HEAR its edits (`render_and_measure`).** The host offline-renders the
   hosted plugin (no audio device, no realtime) and measures the output, closing the perception loop: "make it
   brighter" becomes verifiable (the spectral centroid rose) instead of a blind guess. Anything that accepts MIDI

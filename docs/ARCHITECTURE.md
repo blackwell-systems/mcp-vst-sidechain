@@ -182,6 +182,9 @@ listener). To expose anything else over the same protocol, implement another `Pl
 - **Render + analysis (`render_tools.go`).** Registers `render_and_measure`; the `LiveEndpoint.Render` client
   method carries the `RenderSpec` over the wire and decodes the snake_case `Measurement` reply. The Phase-4
   feedback signal (see the render section under the wire protocol).
+- **Closed-loop tuning (`tune_tools.go`, Phase 4).** Registers `tune_param`: a bounded coarse-seed + golden-section
+  search that drives one param toward a goal on one measure, using `set_param` + `Render` as the objective. Pure
+  mechanism (no intent ontology); the agent picks what to tune from the semantic map. See `docs/PHASE4-SCOPING.md`.
 
 ### The seam interfaces
 
@@ -307,6 +310,7 @@ headless session otherwise.
 | `get_leases` | The current instance/section lease holders, the leasable sections, the patch generation, and your controller id. Live only. |
 | `poll_events` | Drain the server-pushed `param_changed` / `governed_changed` events since the last poll (deduped to latest-per-param, other controllers only by default). Live only. |
 | `render_and_measure` | Offline-render the current patch (a MIDI note for anything that accepts MIDI, else a synthesized `inputKind` signal for a pure effect) and return an objective `measurement` (peak/RMS/crest dB, spectral centroid, three-band split, silent/clipped) plus a one-line human summary. The Phase-4 feedback signal: set a param, render, read back whether it got brighter/louder. Live only. |
+| `tune_param` | Drive ONE param toward a goal (`maximize`/`minimize`/`target`) on ONE `measure` (centroid_hz/peak_db/rms_db/crest/band), rendering + measuring at each step (a bounded coarse-seed + golden-section search). The agent picks the param/measure/direction from the semantic map; the tool converges it and returns the value it settled on plus the search trace. The autonomous make-it-brighter loop (Phase 4). Live only. |
 
 ### The four ways to set one value
 
@@ -372,7 +376,9 @@ the longest qualifying prefix, and the rest fall to `"other"` (sorted last). Thi
 the `Catalog` computes an `effGroup` slice once at construction, used only by `Groups()` and `Filter()`. Real
 groups always win when present (`derived` is false); the derivation never mutates `ParamDef.Group` or the wire
 shape. This is what "Phase 2 is done" means. Phase 3 (the persistent semantic store, `semantic.go`) now backs the
-inference cache and adds agent-authored semantics; intent mapping (Phase 4) is the remaining future work.
+inference cache and adds agent-authored semantics. Phase 4 (intent -> params) has begun: `tune_param` (its first
+increment) closes the loop mechanically, with the agent supplying the intent -> (param, measure, direction) mapping
+over the semantic map and the server converging it against the render loop (see below, and `docs/PHASE4-SCOPING.md`).
 
 ## GCF (token efficiency)
 
@@ -486,6 +492,10 @@ algorithm (`cpp/tests/section_derivation_test.cpp`) and the pure render-analysis
     and deliberately not asserted. `TestRenderBrighter` (gated on `SIDECHAIN_LIVE_*`, run against TAL-NoiseMaker's
     Filter Cutoff, whose init patch has an active lowpass) is the canonical make-it-brighter proof: render low
     cutoff, render high cutoff, assert the spectral centroid rose (~10x in practice).
+  - **Closed-loop tuning (`tune_tools_test.go` in-memory, `tune_live_test.go` gated).** The in-memory tests drive
+    `tune_param` against the fake host (whose centroid responds to the param) and assert maximize/minimize/target
+    converge and the set/restore landing is correct. `TestTuneBrighterLive` (gated on `SIDECHAIN_LIVE_*`, TAL
+    cutoff) is the AUTONOMOUS make-it-brighter loop: `maximize centroid_hz` starts dark and lands the cutoff bright.
   - **Power-fit survey (`scan_test.go`, gated on `SIDECHAIN_SCAN_*`).** Probes every param on a running host and
     flags any clean analytic power fit; a survey aid, not a CI assertion.
 - **The CI matrix.**
@@ -521,7 +531,8 @@ prose). The remaining `SIDECHAIN_*` variables are test gates, not runtime config
   ("Param 47") or hundreds of undifferentiated entries. The Phase-1 semantic layer recovers real units from value
   text where the plugin renders them (a param that renders bare numbers stays "normalized only"); the Phase-3
   store lets the agent attach a durable name-to-meaning layer (roles) on top, but the roles are agent-supplied, not
-  inferred by the bridge. Turning intent into param moves over that map ("make it brighter", Phase 4) is future work.
+  inferred by the bridge. Turning intent into param moves over that map ("make it brighter") is Phase 4: `tune_param`
+  provides the objective search; the agent still supplies the intent -> (param, measure, direction) mapping.
 - **Real units only on native ranged params by default.** A hosted VST3/AU param arrives as
   `HostedAudioProcessorParameter` with no `NormalisableRange`, so its catalog range is a bare 0..1
   (`hasRealRange: false`); real-unit targeting on it goes through the value-text probe (`set_param real=`), not a

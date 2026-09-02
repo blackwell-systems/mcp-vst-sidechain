@@ -20,6 +20,13 @@ func TestRenderAndMeasure(t *testing.T) {
 		t.Fatalf("connect_live: %v", err)
 	}
 
+	// The fake's centroid responds to the "cutoff" param (200 + norm*3800 Hz), so set a clean position to get a
+	// deterministic 2100 Hz (200 + 0.5*3800). The other measurement fields are canned constants.
+	half := 0.5
+	if _, _, err := s.handleSetParam(ctx, nil, setParamIn{ID: "cutoff", Normalized: &half}); err != nil {
+		t.Fatalf("set cutoff: %v", err)
+	}
+
 	res, out, err := s.handleRenderAndMeasure(ctx, nil, renderAndMeasureIn{Note: 60, Velocity: 0.8, GateMs: 500, DurationMs: 2000})
 	if err != nil {
 		t.Fatalf("render_and_measure: %v", err)
@@ -42,7 +49,7 @@ func TestRenderAndMeasure(t *testing.T) {
 	if m.SampleRate != 48000 || m.Channels != 2 {
 		t.Fatalf("measurement header wrong: sr=%v ch=%d", m.SampleRate, m.Channels)
 	}
-	if m.PeakDb != -6.2 || m.RmsDb != -18.4 || m.Crest != 12.2 || m.CentroidHz != 1840 {
+	if m.PeakDb != -6.2 || m.RmsDb != -18.4 || m.Crest != 12.2 || m.CentroidHz != 2100 {
 		t.Fatalf("measurement values did not parse: %+v", m)
 	}
 	if m.Bands.LowDb != -20.1 || m.Bands.MidDb != -16.8 || m.Bands.HighDb != -28.0 {
@@ -57,7 +64,7 @@ func TestRenderAndMeasure(t *testing.T) {
 	if txt != rr.Summary {
 		t.Fatalf("text reply %q != structured summary %q", txt, rr.Summary)
 	}
-	for _, want := range []string{"peak -6.2 dBFS", "RMS -18.4 dB", "centroid 1.84 kHz", "not clipped"} {
+	for _, want := range []string{"peak -6.2 dBFS", "RMS -18.4 dB", "centroid 2.10 kHz", "not clipped"} {
 		if !strings.Contains(txt, want) {
 			t.Fatalf("summary %q missing %q", txt, want)
 		}
