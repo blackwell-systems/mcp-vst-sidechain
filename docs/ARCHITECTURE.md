@@ -252,7 +252,7 @@ bytes on the one socket. Commands mirror the MCP tools closely, so the Go server
 | `get_state` | - | `{ok, count, params}` |
 | `govern` | `{op, group?}` | `{ok, resolution, governed}` |
 | `get_governed` | - | `{ok, governed, sections}` |
-| `render` | `{note?, velocity?, channel?, gate_ms?, duration_ms?, input_kind?, input_freq?, input_level?, temporal?, frame_ms?}` (all optional) | `{ok, measurement}` (measurement gains a `modulation` block when `temporal`) |
+| `render` | `{note?, velocity?, channel?, gate_ms?, duration_ms?, input_kind?, input_freq?, input_level?, temporal?, frame_ms?, notes?, mpe?}` (all optional; `notes` is a phrase of `{note,start_ms,gate_ms,velocity,bend?,pressure?}`) | `{ok, measurement}` (measurement gains a `modulation` block when `temporal`) |
 
 The server also PUSHES unsolicited events (no reply id): `{event: "param_changed", param, normalized, value, text, by}` on any parameter change, and `{event: "governed_changed", governed, resolution, by}` on a lease/generation change. `ping` additionally returns the connection's `client` id.
 
@@ -290,13 +290,17 @@ agent sets a param, renders, and reads back an objective measurement ("brighter"
 
 **Tier 2.5 (modulation-aware / temporal).** A request may add `temporal: true` (and optional `frame_ms`, default
 25); the reply then carries a `modulation` block: `{frame_ms, centroid:{rate_hz, depth, regular, confidence},
-rms:{...}, dominant}`. The bridge re-analyzes the SAME render in short frames over the SUSTAIN window only (skip the
-attack guard; for an instrument stop at note-off so the release tail is excluded), builds the per-frame centroid and
-rms envelopes, and estimates each one's dominant periodicity (LFO rate) via a smoothed-envelope autocorrelation
-(`analyzeEnvelope` in `RenderAnalysis.h`, pure and unit-tested). This makes time-varying patches legible: a filter
-LFO shows on `centroid`, a tremolo on `rms`, `dominant` names the stronger. The decision signal is `dominant` +
-`regular`; `rate_hz` is best-effort. `tune_param` reads nested modulation measures (`modulation.centroid.rate_hz`
-etc.) and auto-enables `temporal`, so "tune the LFO to 6 Hz" is the same loop as "make it brighter." See
+rms:{...}, pitch:{...}, dominant}`. The bridge re-analyzes the SAME render in short frames over the SUSTAIN window
+only (skip the attack guard; for an instrument stop at the LAST note-off so the release tail is excluded), builds the
+per-frame centroid, rms, and f0 (pitch, via `estimateF0`) envelopes, and estimates each one's dominant periodicity
+(LFO rate) via a smoothed-envelope autocorrelation (`analyzeEnvelope` in `RenderAnalysis.h`, pure and unit-tested).
+This makes time-varying patches legible: a filter LFO shows on `centroid`, a tremolo on `rms`, a vibrato on `pitch`
+(depth in semitones), `dominant` names the strongest. The decision signal is `dominant` + `regular`; `rate_hz` is
+best-effort (and frame-based f0 smears for wide/fast vibrato). `tune_param`/`tune_params` read nested modulation
+measures (`modulation.centroid.rate_hz`, `modulation.pitch.depth`, etc.) and auto-enable `temporal`, so "tune the
+LFO to 6 Hz" and "add vibrato" are the same loop as "make it brighter." A render can also be driven by a `notes`
+phrase (chords/arps, with per-note `bend`/`pressure` and an `mpe` channel-per-note mode) instead of one held note.
+See
 `docs/RENDER-SCOPING.md` Tier 2.5.
 
 ## The MCP tool surface
@@ -322,7 +326,7 @@ headless session otherwise.
 | `get_leases` | The current instance/section lease holders, the leasable sections, the patch generation, and your controller id. Live only. |
 | `poll_events` | Drain the server-pushed `param_changed` / `governed_changed` events since the last poll (deduped to latest-per-param, other controllers only by default). Live only. |
 | `render_and_measure` | Offline-render the current patch (a MIDI note for anything that accepts MIDI, else a synthesized `inputKind` signal for a pure effect) and return an objective `measurement` (peak/RMS/crest dB, spectral centroid, three-band split, silent/clipped) plus a one-line human summary. The Phase-4 feedback signal: set a param, render, read back whether it got brighter/louder. Live only. |
-| `tune_param` | Drive ONE param toward a goal (`maximize`/`minimize`/`target`) on ONE `measure` (centroid_hz/peak_db/rms_db/crest/band, or a nested modulation measure like `modulation.centroid.rate_hz`/`.depth`), rendering + measuring at each step (a bounded coarse-seed + golden-section search; temporal auto-enabled for modulation measures). The agent picks the param/measure/direction from the semantic map; the tool converges it and returns the value it settled on plus the search trace. The autonomous make-it-brighter (and set-the-LFO-rate) loop (Phase 4). Live only. |
+| `tune_param` | Drive ONE param toward a goal (`maximize`/`minimize`/`target`) on ONE `measure` (centroid_hz/peak_db/rms_db/crest/band, or a nested modulation measure like `modulation.centroid.rate_hz`/`.depth`/`modulation.pitch.*`), rendering + measuring at each step (a bounded coarse-seed + golden-section search; temporal auto-enabled for modulation measures). The agent picks the param/measure/direction from the semantic map; the tool converges it and returns the value it settled on plus the search trace. The autonomous make-it-brighter (and set-the-LFO-rate) loop (Phase 4). Live only. |
 | `tune_params` | Co-optimize SEVERAL params at once by coordinate descent: a list of `knobs`, each `{id, measure, goal, target?}`, tuned in turn each round (holding the others at their best) until a round moves nothing. For compositional intents one param cannot express ("punchier" = attack + drive toward higher crest; "wobble" = LFO rate toward a target AND amount toward more depth). Temporal auto-enabled if any knob is a modulation measure. Live only. |
 
 ### The four ways to set one value

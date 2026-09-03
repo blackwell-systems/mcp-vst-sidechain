@@ -8,6 +8,21 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Phrase render + per-note expression, and pitch (vibrato) tracking.** Two render upgrades borrowed from the
+  midi2-hub project. (1) `render_and_measure` (and `tune_param`/`tune_params`, which inherit it) can be driven by a
+  `notes` phrase, an array of `{note, startMs, gateMs, velocity, bend?, pressure?}`, instead of one held note, so
+  chords, arps, and short sequences are measurable; an `mpe` flag places each note on its own channel for
+  independent per-note bend/pressure. The temporal analysis window ends at the last note-off. (2) The Tier 2.5
+  `modulation` block gains a third signal, `pitch`: a JUCE-free autocorrelation pitch detector (`estimateF0`,
+  unit-tested on synthetic tones within 3%) tracks the fundamental per frame, and the semitone envelope feeds the
+  existing `analyzeEnvelope`, so a vibrato (a pitch LFO) reports `modulation.pitch.{rate_hz, depth-in-semitones,
+  regular, confidence}` alongside centroid and rms. `dominant` now includes `"pitch"`, and
+  `modulation.pitch.rate_hz`/`.depth` are tunable, so "add a 6 Hz vibrato" is the same closed loop as "make it
+  brighter." Honest limit: a frame-based f0 smears for a wide/fast vibrato (the `regular` flag can flip); the hard
+  guarantees are the `estimateF0` unit test and the in-memory tune test. Proven end to end on TAL-NoiseMaker
+  (`TestRenderPhraseLive` a chord shifts the spectrum; `TestRenderTemporalLive`/`TestRenderPitchBlockLive` a routed
+  osc-tune LFO reads as a regular pitch modulation). See `docs/RENDER-SCOPING.md`.
+
 - **Phase 4 increment 2: `tune_params`, multi-parameter co-optimization.** Where `tune_param` drives one param
   toward one measure, `tune_params` co-optimizes a SET of knobs (each `{id, measure, goal, target?}`) by coordinate
   descent over the render loop: each round tunes every knob's param in turn with the shared 1-D search (the search

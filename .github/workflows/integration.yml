@@ -285,13 +285,14 @@ jobs:
           SIDECHAIN_LIVE_PORT=52021 SIDECHAIN_LIVE_CATALOG=brite.json SIDECHAIN_LIVE_PARAM="$CUTOFF" \
             go test -run 'TestRenderBrighter|TestTuneBrighterLive' -v .
 
-      # Modulation-aware measurement (Tier 2.5) + LFO tuning + multi-param co-tune: the temporal analysis payoff on a
-      # REAL LFO. Route TAL's Lfo 1 to the filter cutoff (Destination = the cutoff option, Waveform = sine) so the
-      # spectral centroid visibly modulates, then: TestRenderTemporalLive asserts the modulation block reports a
-      # clean periodic LFO on the centroid; TestTuneModulationRateLive tunes the LFO RATE toward a target rate; and
-      # TestTuneParamsWobbleLive (Phase 4 tune_params) CO-tunes the rate toward a target AND the amount toward more
-      # modulation depth by coordinate descent. Measurable, tunable, and co-tunable end to end. REQUIRED. Ids by label.
-      - name: Modulation (LFO) measure + tune + co-tune loop (TAL Lfo 1) - REQUIRED
+      # Modulation-aware measurement (Tier 2.5) + LFO tuning + multi-param co-tune + phrase render: the temporal
+      # analysis payoff on a REAL LFO. Route TAL's Lfo 1 to Destination 0.30 with a sine wave: on TAL-NoiseMaker this
+      # is an OSC-TUNE (pitch) modulation, so pitch dominates and the spectral centroid moves as a harmonic side
+      # effect. TestRenderTemporalLive asserts a clean periodic LFO on the DOMINANT signal; TestRenderPitchBlockLive
+      # checks the pitch (vibrato) block is well formed; TestTuneModulationRateLive tunes the LFO RATE toward a
+      # target; TestTuneParamsWobbleLive (Phase 4 tune_params) CO-tunes rate + amount by coordinate descent; and
+      # TestRenderPhraseLive renders a chord and asserts the phrase changes the spectrum. REQUIRED. Ids by label.
+      - name: Modulation + pitch + tune + co-tune + phrase (TAL Lfo 1) - REQUIRED
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
@@ -300,8 +301,9 @@ jobs:
           trap 'kill $HP 2>/dev/null || true' EXIT
           for i in $(seq 1 30); do [ -s mod.json ] && break; sleep 1; done
           test -s mod.json || { echo "host did not write a catalog"; cat host-mod.log; exit 1; }
-          # Route Lfo 1 -> filter cutoff and resolve the LFO rate id. Destination 0.30 selects the cutoff on
-          # TAL-NoiseMaker (it renders as the bipolar value "-0.40"); verified against the shipped plugin.
+          # Route Lfo 1 into the signal path and resolve the LFO rate/amount ids. Destination 0.30 on TAL-NoiseMaker
+          # is an osc-tune (pitch) modulation (it renders as the bipolar value "-0.40"); it drives a vibrato and the
+          # centroid moves with the harmonics. Verified against the shipped plugin.
           python3 - mod.json 52022 rate.txt <<'PY'
           import json, socket, time, sys
           d = json.load(open(sys.argv[1])); port = int(sys.argv[2])
@@ -329,7 +331,7 @@ jobs:
           read -r RATE AMOUNT < rate.txt
           echo "TAL Lfo 1 routed to filter; rate id=$RATE amount id=$AMOUNT"
           SIDECHAIN_LIVE_PORT=52022 SIDECHAIN_LIVE_CATALOG=mod.json SIDECHAIN_LIVE_PARAM="$RATE" SIDECHAIN_LIVE_PARAM2="$AMOUNT" SIDECHAIN_LIVE_LFO_TARGET=4 \
-            go test -run 'TestRenderTemporalLive|TestTuneModulationRateLive|TestTuneParamsWobbleLive' -v .
+            go test -run 'TestRenderTemporalLive|TestRenderPitchBlockLive|TestTuneModulationRateLive|TestTuneParamsWobbleLive|TestRenderPhraseLive' -v .
 
       # Flat-plugin section leases (C3): TAL exposes NO parameter-tree groups, so the host derives leasable sections
       # from shared label prefixes (computeSections, a port of sections.go). This exercises that fallback end to

@@ -178,6 +178,37 @@ best-effort estimate even when there is no real periodicity). Validated end to e
 (a routed LFO reads `regular` at an LFO-band rate) and `TestTuneModulationRateLive` (tune the LFO rate param toward
 a target rate: 3.6 Hz -> 4.0 Hz), both REQUIRED in CI against TAL.
 
+### Phrase render + per-note expression (IMPLEMENTED)
+
+The render can be driven by a note LIST, not just one held note, so patches that only reveal themselves under a
+PATTERN (chords: voice-stacking, filter tracking; arps; a 2-bar sequence) are measurable, and `tune_param` /
+`tune_params` inherit it for free. The request gains `notes`: an array of `{note, start_ms, gate_ms, velocity, bend,
+pressure}` (snake_case on the wire; `bend` in semitones, `pressure` 0..1, both optional), plus an `mpe` flag. When
+`notes` is non-empty it drives the render (the single-note fields are ignored); `duration_ms` still bounds it, and
+the temporal analysis window ends at the LAST note-off. With `mpe`, note `i` is placed on its own MIDI channel
+(2..16) so per-note `bend`/`pressure` are independent (MPE-style); otherwise all notes share channel 1. Per-note
+bend maps to the pitch wheel with an assumed range (48 st for MPE, 2 st otherwise), since the plugin's real bend
+range is not knowable; 16-bit velocity (a MIDI 2.0 feature) is out of scope, as JUCE hosting delivers 7-bit MIDI.
+Proven by `TestRenderPhraseLive` (a C-major chord shifts the spectrum vs a single note).
+
+### Pitch (f0) modulation: vibrato (IMPLEMENTED)
+
+The temporal `modulation` block gains a third signal, `pitch`, so a PITCH LFO (vibrato) is legible the way a filter
+LFO shows on `centroid` and a tremolo on `rms`. A pure autocorrelation pitch detector (`estimateF0`, JUCE-free,
+unit-tested on synthetic tones within 3%) estimates the fundamental per frame; the per-frame f0 (in semitones,
+holding the last voiced value through unvoiced frames) feeds the same `analyzeEnvelope`, giving `pitch.{rate_hz,
+depth (semitones), regular, confidence}`. `dominant` now includes `"pitch"`, and `tune_param`/`tune_params` accept
+`modulation.pitch.rate_hz` / `.depth` (so "vibrato at 6 Hz" is the same loop as "brighter"). HONEST LIMIT: a
+frame-based f0 is reliable for a static pitch and MODERATE vibrato, but a WIDE or FAST vibrato moves the pitch
+within a 25 ms frame and smears the estimate (the `regular` flag can flip); the hard guarantees come from the
+`estimateF0` unit test and the in-memory tune test, with the real-host `TestRenderPitchBlockLive` checking the block
+is well formed. (On TAL-NoiseMaker the only strong LFO destination is osc-tune, so the CI modulation tests exercise
+a pitch LFO, not a filter one; the earlier "filter" framing was the pitch shift's centroid side effect.) A
+pitch-synchronous or shorter-frame detector would tighten this later.
+
+Both extensions are ideas borrowed from the midi2-hub project (its SMF2 clip format -> phrase render; its
+audio-to-MIDI service, reduced to a monophonic pitch tracker -> f0/vibrato).
+
 ### Tier 3 (deferred): a linear plugin chain
 
 Load N instances and process them in series (output of A -> input of B), measuring the final output: synth ->

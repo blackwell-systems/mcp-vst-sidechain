@@ -80,15 +80,26 @@ func TestRenderTemporalLive(t *testing.T) {
 	t.Logf("rms modulation: rate=%.2f Hz depth=%.2f dB regular=%v confidence=%.2f",
 		mod.Rms.RateHz, mod.Rms.Depth, mod.Rms.Regular, mod.Rms.Confidence)
 
-	// With an LFO routed to the filter, the centroid must show a clean, periodic modulation at an LFO-band rate.
-	if mod.Dominant != "centroid" {
-		t.Fatalf("expected the filter LFO to dominate the centroid, got dominant=%q (is an LFO routed to the cutoff?)", mod.Dominant)
+	// With an LFO routed into the signal path, the render must show a clean, periodic modulation at an LFO-band
+	// rate on the DOMINANT signal. Which lens dominates is plugin-specific (on TAL-NoiseMaker the harness routes the
+	// LFO to osc tune, so pitch dominates and the centroid moves as a harmonic side effect); the claim under test is
+	// that the modulation is measured, not which signal carries it.
+	if mod.Dominant == "none" {
+		t.Fatalf("no regular modulation detected (is an LFO routed into the signal path?): centroid reg=%v pitch reg=%v rms reg=%v",
+			mod.Centroid.Regular, mod.Pitch.Regular, mod.Rms.Regular)
 	}
-	if !mod.Centroid.Regular {
-		t.Fatalf("centroid modulation not flagged regular (rate=%.2f Hz, depth=%.0f Hz, conf=%.2f)", mod.Centroid.RateHz, mod.Centroid.Depth, mod.Centroid.Confidence)
+	dom := mod.Centroid
+	switch mod.Dominant {
+	case "pitch":
+		dom = mod.Pitch
+	case "rms":
+		dom = mod.Rms
 	}
-	if mod.Centroid.RateHz < 0.5 || mod.Centroid.RateHz > 15.0 {
-		t.Fatalf("centroid LFO rate %.2f Hz is outside the plausible LFO band (0.5..15 Hz)", mod.Centroid.RateHz)
+	if !dom.Regular {
+		t.Fatalf("dominant signal %q not flagged regular (rate=%.2f Hz, depth=%.3f, conf=%.2f)", mod.Dominant, dom.RateHz, dom.Depth, dom.Confidence)
+	}
+	if dom.RateHz < 0.5 || dom.RateHz > 15.0 {
+		t.Fatalf("%s LFO rate %.2f Hz is outside the plausible LFO band (0.5..15 Hz)", mod.Dominant, dom.RateHz)
 	}
 }
 
