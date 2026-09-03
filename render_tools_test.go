@@ -84,6 +84,84 @@ func TestRenderAndMeasure(t *testing.T) {
 	}
 }
 
+// TestRenderPhraseAndMpe sends a Notes phrase (3 notes) with Mpe=true and asserts the render returns a
+// measurement. The fake host accepts notes/mpe without DSP and records the note count.
+func TestRenderPhraseAndMpe(t *testing.T) {
+	fh := startFakeHost(t)
+	defer fh.stop()
+	s := newLiveTestSession()
+	ctx := context.Background()
+	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: fh.port()}); err != nil {
+		t.Fatalf("connect_live: %v", err)
+	}
+
+	phrase := []NoteEvent{
+		{Note: 60, StartMs: 0, GateMs: 500, Velocity: 0.8},
+		{Note: 64, StartMs: 100, GateMs: 400, Velocity: 0.7, Bend: 0.5},
+		{Note: 67, StartMs: 200, GateMs: 300, Velocity: 0.6, Pressure: 0.3},
+	}
+	res, out, err := s.handleRenderAndMeasure(ctx, nil, renderAndMeasureIn{
+		Notes: phrase, Mpe: true, DurationMs: 2000,
+	})
+	if err != nil {
+		t.Fatalf("render phrase: %v", err)
+	}
+	rr, ok := out.(renderResult)
+	if !ok {
+		t.Fatalf("structured output not a renderResult: %T (%s)", out, textOf(res))
+	}
+	// The fake must return a valid measurement (it accepts notes without error).
+	m := rr.Measurement
+	if m.SampleRate != 48000 {
+		t.Fatalf("phrase render measurement.sampleRate = %.0f, want 48000", m.SampleRate)
+	}
+	// The fake recorded the phrase note count.
+	fh.mu.Lock()
+	noteCount := fh.lastNoteCount
+	fh.mu.Unlock()
+	if noteCount != 3 {
+		t.Fatalf("fake host lastNoteCount = %d, want 3", noteCount)
+	}
+}
+
+// TestRenderTemporalPitchBlock exercises Tier 2.5 temporal rendering with the pitch signal: a temporal render
+// must decode Measurement.Modulation.Pitch from the fake host's reply.
+func TestRenderTemporalPitchBlock(t *testing.T) {
+	fh := startFakeHost(t)
+	defer fh.stop()
+	s := newLiveTestSession()
+	ctx := context.Background()
+	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: fh.port()}); err != nil {
+		t.Fatalf("connect_live: %v", err)
+	}
+
+	// No vibrato param set, so pitch block should be the low/irregular stub.
+	res, out, err := s.handleRenderAndMeasure(ctx, nil, renderAndMeasureIn{Note: 60, Temporal: true})
+	if err != nil {
+		t.Fatalf("render temporal (no vibrato): %v", err)
+	}
+	rr, ok := out.(renderResult)
+	if !ok {
+		t.Fatalf("structured output not a renderResult: %T (%s)", out, textOf(res))
+	}
+	m := rr.Measurement
+	if m.Modulation == nil {
+		t.Fatalf("temporal render: Modulation is nil")
+	}
+	// Pitch block must be present and decoded; stub has rate 0, depth 0, regular=false.
+	pitch := m.Modulation.Pitch
+	if pitch.Regular {
+		t.Fatalf("pitch.regular should be false for no-vibrato stub, got true")
+	}
+	if pitch.Confidence > 0.1 {
+		t.Fatalf("pitch.confidence = %.2f, want <= 0.1 for stub", pitch.Confidence)
+	}
+	// dominant stays "centroid" as before.
+	if m.Modulation.Dominant != "centroid" {
+		t.Fatalf("dominant = %q, want centroid", m.Modulation.Dominant)
+	}
+}
+
 // TestRenderAndMeasureTemporal exercises the Tier 2.5 temporal path: requesting Temporal=true causes the fake host
 // to return a modulation block, which parseMeasurement decodes into Measurement.Modulation. The fake's rate is
 // 1 + cutoff*9 Hz, so at cutoff=0.5 we expect rate ~ 5.5 Hz; depth = cutoff*2000 = 1000 Hz.

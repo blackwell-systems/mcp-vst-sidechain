@@ -71,16 +71,17 @@ func renderFor(id string, norm float64) string {
 // fakeHost is a minimal stand-in for cpp/ControlServer: it accepts one client and answers the same commands
 // over the same line-delimited JSON protocol, backed by an in-memory normalized-value map.
 type fakeHost struct {
-	ln      net.Listener
-	mu      sync.Mutex
-	params  map[string]float64 // id -> normalized (set_param with `normalized`)
-	reals   map[string]float64 // id -> real value (set_param with `value`; skew-aware forwards land here)
-	notes   []int              // notes turned on
-	panics  int                // all_notes_off count
-	renders int                // render count
-	state   string             // last-saved / loaded opaque state
-	resets  int                // reset_init count
-	cmds    map[string]int     // per-command call counts (e.g. how many get_param probes the sweep issued)
+	ln            net.Listener
+	mu            sync.Mutex
+	params        map[string]float64 // id -> normalized (set_param with `normalized`)
+	reals         map[string]float64 // id -> real value (set_param with `value`; skew-aware forwards land here)
+	notes         []int              // notes turned on
+	panics        int                // all_notes_off count
+	renders       int                // render count
+	lastNoteCount int                // note count from the last phrase render (0 if a single-note render)
+	state         string             // last-saved / loaded opaque state
+	resets        int                // reset_init count
+	cmds          map[string]int     // per-command call counts (e.g. how many get_param probes the sweep issued)
 
 	// C2/C3: identity + a minimal in-memory governed model (enough to exercise the governed MCP tools; the full
 	// conflict tier is proven in governed_test.go and the gated live tests).
@@ -255,8 +256,13 @@ func (fh *fakeHost) dispatch(req map[string]any, client int) map[string]any {
 		// real gradient to climb; the other numbers are canned. Mirrors the wire contract shape.
 		//
 		// When the request carries "temporal": true, the reply also includes a "modulation" block whose
-		// centroid.rate_hz responds to the cutoff param (1 + cutoff*9, so 1..10 Hz), making it tunable.
+		// centroid.rate_hz responds to the cutoff param (1 + cutoff*9, so 1..10 Hz), making it tunable. A "vibrato"
+		// param drives pitch.rate_hz (1 + vibrato*9) and pitch.depth (vibrato*2 semitones); when vibrato is 0, the
+		// pitch block is a low/irregular stub. dominant stays "centroid" so existing modulation tests are stable.
 		// When temporal is absent/false, the modulation block is omitted so existing non-temporal tests are stable.
+		//
+		// A "notes" array in the request is accepted without error (the fake has no DSP; it just records the count).
+		// "mpe" is also accepted without error.
 		fh.renders++
 		cutoff := fh.params["cutoff"] // dispatch already holds fh.mu
 		centroid := 200.0 + cutoff*3800.0
@@ -269,6 +275,12 @@ func (fh *fakeHost) dispatch(req map[string]any, client int) map[string]any {
 			"bands":  map[string]any{"low_db": -20.1, "mid_db": -16.8, "high_db": -28.0},
 			"silent": false, "clipped": false,
 		}
+		// Record phrase note count if the request included a notes array.
+		if notesArr, ok := req["notes"].([]any); ok {
+			fh.lastNoteCount = len(notesArr)
+		} else {
+			fh.lastNoteCount = 0
+		}
 		if temporal, _ := req["temporal"].(bool); temporal {
 			frameMs := 25
 			if f, ok := req["frame_ms"].(float64); ok && f > 0 {
@@ -276,6 +288,19 @@ func (fh *fakeHost) dispatch(req map[string]any, client int) map[string]any {
 			}
 			rate := 1.0 + cutoff*9.0 // 1..10 Hz, monotonic in cutoff
 			depth := cutoff * 2000.0 // 0..2000 Hz depth
+			vibrato := fh.params["vibrato"]
+			var pitchBlock map[string]any
+			if vibrato > 0 {
+				// Vibrato param drives pitch modulation: rate = 1 + vibrato*9 Hz, depth = vibrato*2 semitones.
+				pitchBlock = map[string]any{
+					"rate_hz": 1.0 + vibrato*9.0, "depth": vibrato * 2.0, "regular": true, "confidence": 0.9,
+				}
+			} else {
+				// No vibrato: low/irregular pitch stub.
+				pitchBlock = map[string]any{
+					"rate_hz": 0.0, "depth": 0.0, "regular": false, "confidence": 0.05,
+				}
+			}
 			meas["modulation"] = map[string]any{
 				"frame_ms": frameMs,
 				"centroid": map[string]any{
@@ -284,6 +309,7 @@ func (fh *fakeHost) dispatch(req map[string]any, client int) map[string]any {
 				"rms": map[string]any{
 					"rate_hz": 0.0, "depth": 1.2, "regular": false, "confidence": 0.1,
 				},
+				"pitch":    pitchBlock,
 				"dominant": "centroid",
 			}
 		}

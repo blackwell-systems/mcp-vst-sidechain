@@ -14,16 +14,18 @@ import (
 )
 
 type renderAndMeasureIn struct {
-	Note       int     `json:"note,omitempty" jsonschema:"MIDI note for an instrument render (0..127; 60 = middle C). Ignored for an effect. Host default if omitted."`
-	Velocity   float64 `json:"velocity,omitempty" jsonschema:"note velocity 0..1 (instrument). Host default if omitted."`
-	Channel    int     `json:"channel,omitempty" jsonschema:"MIDI channel 1..16 (instrument). Host default if omitted."`
-	GateMs     int     `json:"gateMs,omitempty" jsonschema:"note-on..note-off gate in ms (instrument): how long the note is held before the release tail. Host default if omitted."`
-	DurationMs int     `json:"durationMs,omitempty" jsonschema:"total render length in ms (gate + release tail). Host default if omitted."`
-	InputKind  string  `json:"inputKind,omitempty" jsonschema:"effect excitation signal: sine | noise | impulse | silence. Ignored for an instrument. Host default (sine) if omitted."`
-	InputFreq  float64 `json:"inputFreq,omitempty" jsonschema:"sine frequency in Hz when inputKind=sine (effect)."`
-	InputLevel float64 `json:"inputLevel,omitempty" jsonschema:"input signal level 0..1 (effect)."`
-	Temporal   bool    `json:"temporal,omitempty" jsonschema:"opt in to Tier 2.5 temporal analysis: the reply will include a modulation block (rate/depth for centroid and rms) so LFO rate and depth are measurable. Off by default."`
-	FrameMs    int     `json:"frameMs,omitempty" jsonschema:"analysis frame size in ms for temporal analysis (default 25 ms when omitted)."`
+	Note       int         `json:"note,omitempty" jsonschema:"MIDI note for an instrument render (0..127; 60 = middle C). Ignored for an effect. Host default if omitted."`
+	Velocity   float64     `json:"velocity,omitempty" jsonschema:"note velocity 0..1 (instrument). Host default if omitted."`
+	Channel    int         `json:"channel,omitempty" jsonschema:"MIDI channel 1..16 (instrument). Host default if omitted."`
+	GateMs     int         `json:"gateMs,omitempty" jsonschema:"note-on..note-off gate in ms (instrument): how long the note is held before the release tail. Host default if omitted."`
+	DurationMs int         `json:"durationMs,omitempty" jsonschema:"total render length in ms (gate + release tail). Host default if omitted."`
+	InputKind  string      `json:"inputKind,omitempty" jsonschema:"effect excitation signal: sine | noise | impulse | silence. Ignored for an instrument. Host default (sine) if omitted."`
+	InputFreq  float64     `json:"inputFreq,omitempty" jsonschema:"sine frequency in Hz when inputKind=sine (effect)."`
+	InputLevel float64     `json:"inputLevel,omitempty" jsonschema:"input signal level 0..1 (effect)."`
+	Temporal   bool        `json:"temporal,omitempty" jsonschema:"opt in to Tier 2.5 temporal analysis: the reply will include a modulation block (rate/depth for centroid, rms, and pitch) so LFO rate and depth are measurable. Off by default."`
+	FrameMs    int         `json:"frameMs,omitempty" jsonschema:"analysis frame size in ms for temporal analysis (default 25 ms when omitted)."`
+	Notes      []NoteEvent `json:"notes,omitempty" jsonschema:"phrase render: an array of note events (chords, arps, sequences). Each note carries note (0..127), startMs (offset from render start), gateMs (held duration), velocity (0..1), and optional bend (semitones) and pressure (0..1). When non-empty, drives the render instead of the top-level note/gateMs fields; durationMs still bounds the total render."`
+	Mpe        bool        `json:"mpe,omitempty" jsonschema:"MPE mode: when true, each note in the Notes phrase is placed on its own MIDI channel. Ignored when Notes is empty."`
 }
 
 // renderResult is the structured payload: the full measurement object plus the one-line human summary that the
@@ -53,14 +55,22 @@ func renderSummary(m Measurement) string {
 		mod := m.Modulation
 		if mod.Dominant != "" && mod.Dominant != "none" {
 			var sig ModSignal
-			if mod.Dominant == "centroid" {
+			switch mod.Dominant {
+			case "centroid":
 				sig = mod.Centroid
-			} else {
+			case "pitch":
+				sig = mod.Pitch
+			default:
 				sig = mod.Rms
 			}
 			depthUnit := "Hz"
-			if mod.Dominant == "rms" {
+			switch mod.Dominant {
+			case "rms":
 				depthUnit = "dB"
+			case "pitch":
+				depthUnit = "st"
+				base += fmt.Sprintf("; vibrato ~%.1f Hz on pitch (depth %.1f %s)", sig.RateHz, sig.Depth, depthUnit)
+				return base
 			}
 			base += fmt.Sprintf("; LFO ~%.1f Hz on %s (depth %.0f %s)", sig.RateHz, mod.Dominant, sig.Depth, depthUnit)
 		} else {
@@ -77,8 +87,8 @@ func (s *session) handleRenderAndMeasure(ctx context.Context, _ *mcp.CallToolReq
 	if lc == nil {
 		return textResult("render_and_measure: not live. Call connect_live first (rendering needs the running plugin)."), nil, nil
 	}
-	// renderAndMeasureIn and RenderSpec have identical fields (the JSON tags differ, which conversion ignores),
-	// so the input converts directly to the wire spec.
+	// renderAndMeasureIn and RenderSpec share the same field names, types, and order (the JSON tags differ,
+	// which conversion ignores), so the input converts directly to the wire spec. Notes and Mpe carry through.
 	m, err := lc.Render(RenderSpec(in))
 	if err != nil {
 		return textResult("render_and_measure failed: " + err.Error()), nil, nil

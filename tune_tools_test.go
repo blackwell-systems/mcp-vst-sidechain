@@ -168,6 +168,8 @@ func TestMeasureValueModulationNilGuard(t *testing.T) {
 		"modulation.centroid.depth",
 		"modulation.rms.rate_hz",
 		"modulation.rms.depth",
+		"modulation.pitch.rate_hz",
+		"modulation.pitch.depth",
 	}
 	for _, name := range tests {
 		if _, ok := measureValue(m, name); ok {
@@ -179,12 +181,85 @@ func TestMeasureValueModulationNilGuard(t *testing.T) {
 	m.Modulation = &Modulation{
 		Centroid: ModSignal{RateHz: 3.5, Depth: 500},
 		Rms:      ModSignal{RateHz: 1.0, Depth: 2.0},
+		Pitch:    ModSignal{RateHz: 5.5, Depth: 0.8},
 	}
 	for _, name := range tests {
 		if v, ok := measureValue(m, name); !ok {
 			t.Errorf("measureValue(withModulation, %q) returned ok=false, want a value", name)
 		} else if v == 0 {
 			t.Errorf("measureValue(withModulation, %q) = 0, expected non-zero for this fixture", name)
+		}
+	}
+}
+
+// vibratoSession connects a session with a "vibrato" param to the fake host. The fake drives
+// pitch.rate_hz = 1 + vibrato*9 Hz and pitch.depth = vibrato*2 semitones when temporal=true.
+func vibratoSession(t *testing.T) (*session, context.Context, func()) {
+	t.Helper()
+	fh := startFakeHost(t)
+	cat := NewCatalog([]ParamDef{
+		{ID: "vibrato", Label: "Vibrato", Type: "float", Min: 0, Max: 1, Default: 0, Group: "mod"},
+	})
+	s := newSession(cat)
+	ctx := context.Background()
+	if _, _, err := s.handleConnectLive(ctx, nil, connectLiveIn{Host: "127.0.0.1", Port: fh.port()}); err != nil {
+		fh.stop()
+		t.Fatalf("connect_live: %v", err)
+	}
+	return s, ctx, func() { s.handleDisconnectLive(ctx, nil, emptyIn{}); fh.stop() }
+}
+
+// TestTunePitchRateHz verifies that tune_param with measure=modulation.pitch.rate_hz converges toward the target
+// using the fake's vibrato-param mapping: rate = 1 + vibrato*9 Hz, so targeting 5.5 Hz implies vibrato = (5.5-1)/9
+// = 0.5. Temporal is auto-enabled by the modulation measure.
+func TestTunePitchRateHz(t *testing.T) {
+	s, ctx, done := vibratoSession(t)
+	defer done()
+
+	rr := tune(t, s, ctx, tuneParamIn{
+		ID: "vibrato", Measure: "modulation.pitch.rate_hz", Goal: "target", Target: 5.5,
+	})
+
+	// The best value should be near 5.5 Hz.
+	if rr.BestValue < 4.5 || rr.BestValue > 6.5 {
+		t.Fatalf("target 5.5 Hz pitch rate: BestValue = %.2f Hz, want near 5.5", rr.BestValue)
+	}
+	// Expected normalized position: (5.5-1)/9 = 0.5.
+	if rr.BestNormalized < 0.4 || rr.BestNormalized > 0.65 {
+		t.Fatalf("target 5.5 Hz pitch rate: BestNormalized = %.3f, want near 0.5", rr.BestNormalized)
+	}
+	// Final measurement must have a non-nil Modulation block (temporal auto-enabled).
+	if rr.Measurement.Modulation == nil {
+		t.Fatalf("tune with pitch measure should return a Measurement with Modulation block")
+	}
+	t.Logf("pitch rate tune: %s", rr.Summary)
+}
+
+// TestMeasureValuePitchNilGuard verifies that measureValue with nil Modulation returns ok=false for pitch measures,
+// and ok=true with a non-nil Modulation block.
+func TestMeasureValuePitchNilGuard(t *testing.T) {
+	m := Measurement{} // Modulation is nil
+	pitchMeasures := []string{"modulation.pitch.rate_hz", "modulation.pitch.depth"}
+	for _, name := range pitchMeasures {
+		if _, ok := measureValue(m, name); ok {
+			t.Errorf("measureValue(nilModulation, %q) returned ok=true, want false", name)
+		}
+	}
+	// With a non-nil Modulation block, pitch measures must succeed.
+	m.Modulation = &Modulation{
+		Pitch: ModSignal{RateHz: 5.5, Depth: 0.8},
+	}
+	for _, name := range pitchMeasures {
+		if v, ok := measureValue(m, name); !ok {
+			t.Errorf("measureValue(withModulation, %q) returned ok=false, want a value", name)
+		} else if v == 0 {
+			t.Errorf("measureValue(withModulation, %q) = 0, expected non-zero for this fixture", name)
+		}
+	}
+	// isModulationMeasure must recognise pitch measure names.
+	for _, name := range pitchMeasures {
+		if !isModulationMeasure(name) {
+			t.Errorf("isModulationMeasure(%q) = false, want true", name)
 		}
 	}
 }
@@ -204,6 +279,7 @@ func TestTuneModulationNoBlockGuard(t *testing.T) {
 	for _, name := range []string{
 		"modulation.centroid.rate_hz", "modulation.centroid.depth",
 		"modulation.rms.rate_hz", "modulation.rms.depth",
+		"modulation.pitch.rate_hz", "modulation.pitch.depth",
 	} {
 		if !isModulationMeasure(name) {
 			t.Errorf("isModulationMeasure(%q) = false, want true", name)

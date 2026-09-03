@@ -61,22 +61,40 @@ type LiveEndpoint interface {
 	Close()
 }
 
+// NoteEvent is one note in a phrase render: the note number, timing, velocity, and optional per-note expression.
+// StartMs is the offset from the start of the render in ms; GateMs is the note-on to note-off duration. Bend is
+// a pitch offset in semitones (0 = no bend); Pressure is channel pressure / polyphonic aftertouch 0..1.
+// When a Notes phrase is provided in the RenderSpec, these drive the render; the top-level Note/Velocity/GateMs
+// fields are ignored. The wire uses snake_case keys (note, start_ms, gate_ms, velocity, bend, pressure).
+type NoteEvent struct {
+	Note     int     `json:"note"`               // MIDI note number 0..127
+	StartMs  int     `json:"startMs"`            // offset from render start in ms (>= 0)
+	GateMs   int     `json:"gateMs"`             // note-on..note-off duration in ms (> 0)
+	Velocity float64 `json:"velocity"`           // note velocity 0..1
+	Bend     float64 `json:"bend,omitempty"`     // pitch bend in semitones (0 = no bend)
+	Pressure float64 `json:"pressure,omitempty"` // polyphonic pressure 0..1 (0 = none)
+}
+
 // RenderSpec is the render request the render_and_measure tool forwards over the wire. Every field is optional;
 // the host auto-detects instrument vs effect and applies its own defaults for anything left zero. Note/Velocity/
 // Channel/GateMs drive an instrument; InputKind/InputFreq/InputLevel synthesize the excitation for an effect;
 // DurationMs bounds the total render (gate + tail). Temporal opts in to the Tier 2.5 modulation block (rate/depth
-// per signal); FrameMs sets the analysis frame size (default 25 ms when zero).
+// per signal); FrameMs sets the analysis frame size (default 25 ms when zero). Notes drives a phrase render (chords,
+// arps, sequences); when non-empty the top-level Note/Velocity/GateMs are ignored. Mpe puts each note on its own
+// MIDI channel (MPE mode).
 type RenderSpec struct {
-	Note       int     // MIDI note number for an instrument (0..127); 0 leaves the host default
-	Velocity   float64 // note velocity 0..1
-	Channel    int     // MIDI channel 1..16
-	GateMs     int     // note-on..note-off gate in ms (instrument)
-	DurationMs int     // total render length in ms (gate + tail)
-	InputKind  string  // effect excitation: sine | noise | impulse | silence
-	InputFreq  float64 // sine frequency in Hz (effect, InputKind=sine)
-	InputLevel float64 // input signal level 0..1 (effect)
-	Temporal   bool    // opt in to the modulation block (Tier 2.5); false = no temporal analysis
-	FrameMs    int     // analysis frame size in ms (Temporal only); 0 leaves the host default (25 ms)
+	Note       int         // MIDI note number for an instrument (0..127); 0 leaves the host default
+	Velocity   float64     // note velocity 0..1
+	Channel    int         // MIDI channel 1..16
+	GateMs     int         // note-on..note-off gate in ms (instrument)
+	DurationMs int         // total render length in ms (gate + tail)
+	InputKind  string      // effect excitation: sine | noise | impulse | silence
+	InputFreq  float64     // sine frequency in Hz (effect, InputKind=sine)
+	InputLevel float64     // input signal level 0..1 (effect)
+	Temporal   bool        // opt in to the modulation block (Tier 2.5); false = no temporal analysis
+	FrameMs    int         // analysis frame size in ms (Temporal only); 0 leaves the host default (25 ms)
+	Notes      []NoteEvent // phrase render: list of note events; when non-empty drives the render instead of Note/GateMs
+	Mpe        bool        // when true, each note in Notes is placed on its own MIDI channel (MPE mode)
 }
 
 // Bands is the coarse 3-band energy split of the rendered output (dBFS): <200 Hz / 200 Hz..2 kHz / >2 kHz.
@@ -96,12 +114,14 @@ type ModSignal struct {
 }
 
 // Modulation is the Tier 2.5 temporal analysis block returned when the render was requested with Temporal=true.
-// Centroid captures filter LFO / spectral sweeps; Rms captures tremolo / volume LFOs; Dominant names the stronger.
+// Centroid captures filter LFO / spectral sweeps; Rms captures tremolo / volume LFOs; Pitch captures vibrato
+// (an f0 LFO, depth in semitones); Dominant names the strongest signal.
 type Modulation struct {
 	FrameMs  int       `json:"frameMs"`  // frame size used for the analysis in ms
 	Centroid ModSignal `json:"centroid"` // modulation on the spectral centroid (brightness)
 	Rms      ModSignal `json:"rms"`      // modulation on the RMS level (tremolo)
-	Dominant string    `json:"dominant"` // "centroid" | "rms" | "none"
+	Pitch    ModSignal `json:"pitch"`    // modulation on the fundamental pitch (vibrato); depth is in semitones
+	Dominant string    `json:"dominant"` // "centroid" | "rms" | "pitch" | "none"
 }
 
 // Measurement is the objective analysis of a rendered buffer (Tier 2 of docs/RENDER-SCOPING.md): level, dynamics,
@@ -437,6 +457,28 @@ func (lc *liveClient) Render(spec RenderSpec) (Measurement, error) {
 			req["frame_ms"] = spec.FrameMs
 		}
 	}
+	if len(spec.Notes) > 0 {
+		notes := make([]map[string]any, len(spec.Notes))
+		for i, n := range spec.Notes {
+			ev := map[string]any{
+				"note":     n.Note,
+				"start_ms": n.StartMs,
+				"gate_ms":  n.GateMs,
+				"velocity": n.Velocity,
+			}
+			if n.Bend != 0 {
+				ev["bend"] = n.Bend
+			}
+			if n.Pressure != 0 {
+				ev["pressure"] = n.Pressure
+			}
+			notes[i] = ev
+		}
+		req["notes"] = notes
+		if spec.Mpe {
+			req["mpe"] = true
+		}
+	}
 	resp, err := lc.request(req)
 	if err != nil {
 		return Measurement{}, err
@@ -497,6 +539,7 @@ func parseModulation(mod map[string]any) *Modulation {
 		FrameMs:  int(num("frame_ms")),
 		Centroid: parseSignal(mod["centroid"]),
 		Rms:      parseSignal(mod["rms"]),
+		Pitch:    parseSignal(mod["pitch"]),
 		Dominant: dominant,
 	}
 }

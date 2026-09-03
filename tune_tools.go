@@ -18,7 +18,7 @@ import (
 
 type tuneParamIn struct {
 	ID      string  `json:"id" jsonschema:"the plugin parameter id to tune (a continuous param; use set_param choice= for discrete lists)"`
-	Measure string  `json:"measure" jsonschema:"the objective measurement: centroid_hz | peak_db | rms_db | crest | low_db | mid_db | high_db, or a nested modulation measure: modulation.centroid.rate_hz | modulation.centroid.depth | modulation.rms.rate_hz | modulation.rms.depth"`
+	Measure string  `json:"measure" jsonschema:"the objective measurement: centroid_hz | peak_db | rms_db | crest | low_db | mid_db | high_db, or a nested modulation measure: modulation.centroid.rate_hz | modulation.centroid.depth | modulation.rms.rate_hz | modulation.rms.depth | modulation.pitch.rate_hz | modulation.pitch.depth"`
 	Goal    string  `json:"goal" jsonschema:"maximize | minimize | target"`
 	Target  float64 `json:"target,omitempty" jsonschema:"the target value in the measure's unit; required when goal=target (e.g. rms_db target -12)"`
 	Seeds   int     `json:"seeds,omitempty" jsonschema:"coarse uniform samples across the normalized range (default 5, min 2)"`
@@ -62,9 +62,10 @@ type tuneResult struct {
 
 // measureValue pulls one named scalar out of a Measurement. The name matches the snake_case wire vocabulary so the
 // agent names the same measure it sees in render_and_measure output. Nested modulation measures
-// (modulation.centroid.rate_hz, modulation.centroid.depth, modulation.rms.rate_hz, modulation.rms.depth) read from
-// m.Modulation and return ok=false when the Modulation block is nil (temporal was not requested or not returned).
-// Both snake_case (rate_hz) and camelCase (rateHz) variants are accepted for friendliness.
+// (modulation.centroid.rate_hz, modulation.centroid.depth, modulation.rms.rate_hz, modulation.rms.depth,
+// modulation.pitch.rate_hz, modulation.pitch.depth) read from m.Modulation and return ok=false when the Modulation
+// block is nil (temporal was not requested or not returned). Both snake_case (rate_hz) and camelCase (rateHz)
+// variants are accepted for friendliness.
 func measureValue(m Measurement, measure string) (float64, bool) {
 	key := strings.ToLower(strings.TrimSpace(measure))
 	switch key {
@@ -103,6 +104,16 @@ func measureValue(m Measurement, measure string) (float64, bool) {
 			return 0, false
 		}
 		return m.Modulation.Rms.Depth, true
+	case "modulation.pitch.rate_hz", "modulation.pitch.ratehz":
+		if m.Modulation == nil {
+			return 0, false
+		}
+		return m.Modulation.Pitch.RateHz, true
+	case "modulation.pitch.depth":
+		if m.Modulation == nil {
+			return 0, false
+		}
+		return m.Modulation.Pitch.Depth, true
 	}
 	return 0, false
 }
@@ -141,7 +152,7 @@ func (s *session) handleTuneParam(ctx context.Context, _ *mcp.CallToolRequest, i
 		return textResult(fmt.Sprintf("tune_param: %q is a choice param, not a continuum. Use set_param choice=<name> and render_and_measure to compare.", in.ID)), nil, nil
 	}
 	if _, ok := measureValue(Measurement{Modulation: &Modulation{}}, in.Measure); !ok {
-		return textResult(fmt.Sprintf("tune_param: unknown measure %q. Use one of centroid_hz, peak_db, rms_db, crest, low_db, mid_db, high_db, or modulation.centroid.rate_hz / modulation.centroid.depth / modulation.rms.rate_hz / modulation.rms.depth.", in.Measure)), nil, nil
+		return textResult(fmt.Sprintf("tune_param: unknown measure %q. Use one of centroid_hz, peak_db, rms_db, crest, low_db, mid_db, high_db, or modulation.centroid.rate_hz / modulation.centroid.depth / modulation.rms.rate_hz / modulation.rms.depth / modulation.pitch.rate_hz / modulation.pitch.depth.", in.Measure)), nil, nil
 	}
 	goal := strings.ToLower(strings.TrimSpace(in.Goal))
 	switch goal {
@@ -321,7 +332,7 @@ func tuneAxis(lc LiveEndpoint, ax axisSpec, spec RenderSpec) (axisOutcome, error
 
 // formatMeasure renders a measure value with a unit hint for the human summary line: Hz for the centroid and for
 // any modulation rate (a couple of decimals, since LFO rates are small), Hz for the centroid modulation depth, dB
-// for levels/bands and the rms modulation depth, a bare number for crest.
+// for levels/bands and the rms modulation depth, st (semitones) for pitch modulation depth, a bare number for crest.
 func formatMeasure(measure string, v float64) string {
 	key := strings.ToLower(strings.TrimSpace(measure))
 	switch {
@@ -329,6 +340,8 @@ func formatMeasure(measure string, v float64) string {
 		return fmt.Sprintf("%.2f Hz", v) // LFO / modulation rate
 	case key == "centroid_hz" || key == "centroidhz" || key == "centroid" || key == "modulation.centroid.depth":
 		return fmt.Sprintf("%.0f Hz", v) // spectral centroid, or centroid modulation depth (Hz excursion)
+	case key == "modulation.pitch.depth":
+		return fmt.Sprintf("%.2f st", v) // pitch modulation depth in semitones
 	case key == "crest":
 		return fmt.Sprintf("%.1f", v)
 	default:
