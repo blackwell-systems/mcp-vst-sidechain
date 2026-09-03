@@ -3,16 +3,18 @@
 **An agent's control input for any plugin. One MCP endpoint, every VST.**
 
 `mcp-vst-sidechain` is a generic [MCP](https://modelcontextprotocol.io) bridge that hosts any VST3/AU plugin
-and exposes its parameters to an AI agent in realtime. Point it at your licensed Serum, Diva, or Kontakt (or a
-free effect), and through a single MCP endpoint an agent can enumerate the plugin's full automatable control
-surface, read and set any parameter live (by real units like "1000 Hz", even on plugins that only expose a raw
-0..1), play notes, save or recall its complete state, and build up a durable map of what each parameter means.
-Several agents can drive one instance at once without fighting over the same controls.
+and gives an AI agent its full control surface. Point it at your licensed Serum, Diva, or Kontakt (or a free
+effect), and through a single MCP endpoint an agent can enumerate every automatable parameter, read and set each
+one live in real units (like "1000 Hz", even on plugins that only expose a raw 0..1), play notes, and save or
+recall complete state. Two properties make that control deep rather than mechanical: a **semantic layer** recovers
+what each parameter MEANS (unit, range, curve, or discrete labels) and persists it across sessions, so an agent
+reasons about roles, not opaque ids; and the host is **multi-controller**, so several agents can drive one instance
+at once, each with its own identity and edit leases, without fighting over the same knobs.
 
-Crucially, the agent can also **hear**: it renders the plugin offline, measures the result objectively (brightness,
-loudness, dynamics, modulation, even vibrato), and tunes parameters toward an intent on its own. So "make it
-brighter" is not a blind guess, it is a closed loop that renders, measures the spectral centroid, and converges the
-filter until the sound actually got brighter.
+On top of that control layer the agent can also **hear** its edits: it renders the plugin offline and measures the
+output objectively (level, brightness, dynamics, modulation, even vibrato), which turns a vague intent into a
+verified change. "Make it brighter" becomes a closed loop, render, measure the spectral centroid, and tune the
+filter until the sound actually got brighter, rather than nudging a knob and hoping.
 
 Sidechain talks to plugins only through the standard VST3/AU API, the same way a DAW hosts thousands of
 closed-source commercial plugins without ever seeing their source. You bring your own licensed binaries;
