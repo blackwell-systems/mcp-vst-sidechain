@@ -324,9 +324,9 @@ jobs:
                       return m
           for p, v in [(amount, 0.95), (dest, 0.30), (wave, 0.0), (rate, 0.45)]:
               req({"cmd": "set_param", "param": p, "normalized": v})
-          open(sys.argv[3], "w").write(str(rate) + " " + str(amount))
+          open(sys.argv[3], "w").write(str(rate) + " " + str(amount) + "\n")
           PY
-          read RATE AMOUNT < rate.txt
+          read -r RATE AMOUNT < rate.txt
           echo "TAL Lfo 1 routed to filter; rate id=$RATE amount id=$AMOUNT"
           SIDECHAIN_LIVE_PORT=52022 SIDECHAIN_LIVE_CATALOG=mod.json SIDECHAIN_LIVE_PARAM="$RATE" SIDECHAIN_LIVE_PARAM2="$AMOUNT" SIDECHAIN_LIVE_LFO_TARGET=4 \
             go test -run 'TestRenderTemporalLive|TestTuneModulationRateLive|TestTuneParamsWobbleLive' -v .
