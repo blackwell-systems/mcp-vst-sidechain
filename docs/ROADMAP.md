@@ -53,9 +53,13 @@ not two version-matched artifacts. Everything else in this horizon can follow th
   struct, so each new C++ measure forces a two-sided change plus a wire-contract sync. Make Go forward the
   `measurement`/`modulation` JSON more opaquely and only type the fields a tool reasons over. This cuts most of the
   recurring Go/C++ seam tax (see the cross-cutting note) so future audio work stops taxing the Go layer.
-- **Intent playbook.** `[next]` S. Docs, not code: worked agent transcripts mapping common intents (brighter,
-  warmer, punchier, wider, vibrato) to (role, measure, direction) over the semantic map. The "how to actually use
-  this" that makes the agent good without putting an ontology in the bridge.
+- **Intent playbook / knowledge layers.** `[next]` S to M. The first layers of the knowledge architecture in
+  [KNOWLEDGE-SCOPING.md](KNOWLEDGE-SCOPING.md): synthesis-paradigm theory (recognize + reason about an unseen
+  plugin), a cross-paradigm intent -> mechanism map, and interpretation heuristics, as retrievable data the agent
+  consults (not ontology in the bridge). This is the embedded special knowledge that makes the agent behave like a
+  producer, and the transparent, model-portable alternative to fine-tuning. The empirical per-plugin store (bottom
+  layer) and the render/tune verifier already exist; reference signatures (a bridge to "taste") are the later
+  addition.
 - **Adjacent-projects landscape in POSITIONING.** `[next]` S. A layer map (anira = ML-as-DSP, midi2-hub =
   generation/sync/collab, per-DAW MCPs = arrangement, sidechain = the plugin-depth gap) so the positioning stays
   current as the "AI + audio" corner fills in.
