@@ -492,10 +492,12 @@ algorithm (`cpp/tests/section_derivation_test.cpp`) and the pure render-analysis
   - **AU load+drive smoke (`au_live_test.go`, gated on `SIDECHAIN_AU_*`).** Loads an Apple built-in AU by
     component identifier, enumerates its catalog, and drives it over the socket, closing the AU gap (everything
     else exercises VST3).
-  - **Full tool surface (`full_tool_surface_test.go`, gated, run per plugin).** `TestFullToolSurfaceLive` drives
-    EVERY MCP tool handler against the real host in one run - reads, writes, state (save/load/reset), MIDI, the
-    governed leases, the semantic tools, and `poll_events` surfacing a real change pushed by a second controller -
-    so no tool is only unit- or fake-host-tested. All 19 handlers are exercised end to end.
+  - **Full tool surface (`full_tool_surface_test.go`, gated, run per plugin).** `TestFullToolSurfaceLive` drives the
+    param/state/MIDI/governed/semantic tool handlers against the real host in one run - reads, writes, state
+    (save/load/reset), MIDI, the governed leases, the semantic tools, and `poll_events` surfacing a real change
+    pushed by a second controller - so those handlers are not only unit- or fake-host-tested. The render, tune, and
+    modulation tools (`render_and_measure`, `tune_param`, `tune_params`) have their own dedicated gated E2E tests
+    (below), so every tool is exercised end to end across the suite.
   - **Sectioning + semantic store (gated on the sweep env, run per plugin by `drive_plugin.sh`).**
     `TestSectionLockstep` asserts the host's emitted per-param `section` equals the Go reference derivation (so the
     two implementations cannot drift); `TestSemanticStoreLive` probes a real param once, then a second HEADLESS
@@ -515,11 +517,16 @@ algorithm (`cpp/tests/section_derivation_test.cpp`) and the pure render-analysis
     maximize/minimize/target converge and the set/restore landing is correct. `TestTuneBrighterLive` (gated, TAL
     cutoff) is the AUTONOMOUS make-it-brighter loop; `TestTuneParamsWobbleLive` (gated, TAL Lfo 1) co-tunes the LFO
     rate toward a target AND the amount toward more modulation depth.
-  - **Modulation-aware measurement (Tier 2.5, `render_analysis_test.cpp` for the pure envelope core;
-    `modulation_live_test.go` gated).** The C++ unit test asserts `analyzeEnvelope` on synthetic envelopes (2 Hz
-    sine -> rate ~2 + regular, ramp -> not periodic, noise -> irregular). `TestRenderTemporalLive` and
-    `TestTuneModulationRateLive` (gated, run against TAL with Lfo 1 routed to the cutoff by the CI step) prove a
-    real LFO is measured (`regular` at an LFO-band rate) and tunable (`tune_param` on the LFO rate -> a target rate).
+  - **Modulation, pitch, and phrase (Tier 2.5 + the render extensions).** The C++ unit test
+    (`render_analysis_test.cpp`) asserts the pure cores: `analyzeEnvelope` on synthetic envelopes (2 Hz sine -> rate
+    ~2 + regular, ramp -> not periodic, noise -> irregular) and `estimateF0` on synthetic tones (within 3%, silence
+    unvoiced). The gated real-host tests run against TAL with Lfo 1 routed by the CI step (on TAL that destination is
+    an OSC-TUNE / pitch LFO, so pitch dominates and the centroid moves as a side effect): `TestRenderTemporalLive`
+    asserts a regular LFO on the DOMINANT signal at an LFO-band rate (signal-agnostic); `TestRenderPitchBlockLive`
+    checks the vibrato (`pitch`) block is well formed; `TestTuneModulationRateLive` / `TestTuneParamsWobbleLive` tune
+    and co-tune the LFO; `TestRenderPhraseLive` renders a chord and asserts the phrase changes the spectrum. The f0
+    hard guarantees are the `estimateF0` unit test plus the in-memory pitch tune, since a frame-based detector smears
+    for wide/fast vibrato (the `regular` flag can flip on a real host).
   - **Power-fit survey (`scan_test.go`, gated on `SIDECHAIN_SCAN_*`).** Probes every param on a running host and
     flags any clean analytic power fit; a survey aid, not a CI assertion.
 - **The CI matrix.**
