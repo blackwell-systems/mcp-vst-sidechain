@@ -27,6 +27,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/blackwell-systems/mcp-vst-sidechain/internal/hostbin"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 )
 
@@ -244,13 +245,23 @@ func freePort() (int, error) {
 }
 
 // findHostBinary locates the sidechain-host executable. If explicit is set it is used verbatim (error if it does
-// not exist). Otherwise discovery order is: next to the running sidechain executable, then on PATH.
+// not exist). Otherwise discovery order is: an embedded host (a single-file `-tags embedhost` build, extracted to a
+// cache dir), then next to the running sidechain executable, then on PATH.
 func findHostBinary(explicit string) (string, error) {
 	if strings.TrimSpace(explicit) != "" {
 		if _, err := os.Stat(explicit); err != nil {
 			return "", fmt.Errorf("--host-bin %s: %w", explicit, err)
 		}
 		return explicit, nil
+	}
+
+	// A shipped single-file build carries the host embedded; extract and use it. An explicit --host-bin above still
+	// wins (for development against a freshly built host).
+	if p, embedded, err := hostbin.Extract(); embedded {
+		if err != nil {
+			return "", fmt.Errorf("extract embedded host: %w", err)
+		}
+		return p, nil
 	}
 
 	name := hostBinName()

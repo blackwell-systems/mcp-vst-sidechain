@@ -54,11 +54,12 @@ jobs:
 
       - name: Coverage summary + floor (>= 90%)
         run: |
-          # Measure the LIBRARY package only. cmd/sidechain/main.go is a thin CLI shim (flag parsing + a Run call)
-          # that is deliberately untested; including its 0% would drag the weighted total below the floor and punish
-          # the wrong thing. Filter it out of the profile before computing the total (the "mode:" line has no path,
-          # so grep -v keeps it).
-          grep -v 'mcp-vst-sidechain/cmd/' cover.out > cover.lib.out
+          # Measure the CORE LIBRARY only. cmd/sidechain/main.go is a thin CLI shim (flag parsing + a Run call) and
+          # internal/hostbin is release plumbing (go:embed + extract-to-cache, whose OS-error branches are defensive
+          # and hard to exercise); both are infra, not core logic, so including them would drag the weighted total
+          # and punish the wrong thing. Filter them out before computing the total (the "mode:" line has no path, so
+          # grep keeps it).
+          grep -vE 'mcp-vst-sidechain/(cmd|internal)/' cover.out > cover.lib.out
           go tool cover -func=cover.lib.out | tail -1
           echo '### Go coverage (library package)' >> "$GITHUB_STEP_SUMMARY"
           go tool cover -func=cover.lib.out | tail -1 >> "$GITHUB_STEP_SUMMARY"
