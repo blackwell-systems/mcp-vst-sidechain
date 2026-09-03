@@ -1,19 +1,18 @@
 name: Release
 
 # Tag-triggered release pipeline. On a v* tag it builds prebuilt, ready-to-run bundles so users skip the cold
-# JUCE build (roughly 20 minutes on a fresh checkout). Each bundle carries BOTH binaries together:
+# JUCE build (roughly 20 minutes on a fresh checkout). Each bundle is a SINGLE self-contained binary:
 #
-#   sidechain        the pure-Go MCP server (stdio). Cross-compiles trivially, built natively on each leg here.
-#   sidechain-host   the native JUCE plugin host. This is the load-bearing artifact: it needs per-platform
-#                    native toolchains plus a JUCE build, so GoReleaser / cross-compile cannot produce it. Its
-#                    build steps are copied verbatim from cpp.yml (deps, JUCE FetchContent cache, configure,
-#                    build the sidechain-host target in Release).
+#   sidechain        the Go MCP server (stdio) with the native JUCE host EMBEDDED via go:embed. The host still
+#                    needs per-platform native toolchains plus a JUCE build (built here from cpp.yml's steps),
+#                    but instead of shipping beside the server it is embedded into the Go binary and extracts
+#                    itself to a cache dir on first run (see internal/hostbin, scripts/build-embedded.sh).
 #
-# The server discovers the host beside itself (managed mode), so both ship in one archive per platform.
+# So there is one file per platform: managed mode extracts and spawns the embedded host, no adjacent binary.
 #
 # Job graph:
 #   build  (matrix: ubuntu-latest, macos-14, windows-latest)
-#     -> builds both binaries, packages one archive per platform, uploads it as a workflow artifact.
+#     -> builds the host, embeds it into the Go binary, packages one archive per platform, uploads it.
 #   smoke  (needs: build; matrix: same OSes)
 #     -> downloads that OS's archive, unpacks it, downloads a free plugin (Surge XT VST3, as integration.yml
 #        does, under xvfb on Linux) and runs the SHIPPED binary: sidechain --plugin <p> --selftest. This proves
@@ -105,29 +104,26 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "building version $version"
 
-      - name: Build Go server
+      # Build the SINGLE self-contained binary: embed the sidechain-host (built above) into the Go binary via
+      # go:embed, so the release ships one file that self-extracts and spawns the host at runtime.
+      - name: Build single-file server (host embedded)
         shell: bash
         run: |
           out="sidechain"
           if [ "${{ matrix.goos }}" = "windows" ]; then out="sidechain.exe"; fi
-          go build -o "$out" -ldflags "-s -w -X main.Version=${{ steps.ver.outputs.version }}" ./cmd/sidechain
+          SKIP_HOST_BUILD=1 VERSION="${{ steps.ver.outputs.version }}" scripts/build-embedded.sh "$out"
 
-      # --- package both binaries into one archive per platform (scripts/package_release.sh) ---
+      # --- package the single binary into one archive per platform (scripts/package_release.sh) ---
       - name: Package bundle
         id: pkg
         shell: bash
         run: |
           set -euo pipefail
-          if [ "${{ matrix.goos }}" = "windows" ]; then
-            host="cpp/build/sidechain-host_artefacts/Release/sidechain-host.exe"
-            go="sidechain.exe"
-          else
-            host="cpp/build/sidechain-host_artefacts/Release/sidechain-host"
-            go="sidechain"
-          fi
+          go="sidechain"
+          if [ "${{ matrix.goos }}" = "windows" ]; then go="sidechain.exe"; fi
           archive=$(scripts/package_release.sh \
             "${{ steps.ver.outputs.version }}" "${{ matrix.goos }}" "${{ matrix.arch }}" \
-            "$host" "$go" dist)
+            "$go" dist)
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
 
       - name: Upload bundle artifact
@@ -258,9 +254,9 @@ jobs:
             unzip -qo surge/surge.zip -d surge
           fi
 
-      # --- the smoke assertion: run the SHIPPED sidechain in managed self-test against the plugin, assert exit 0.
-      # Managed mode spawns the adjacent sidechain-host (kept beside it in the bundle), waits for its catalog,
-      # connects, sets a param. On Linux the host is wrapped in xvfb-run -a (integration.yml pattern). ---
+      # --- the smoke assertion: run the SHIPPED single-file sidechain in managed self-test against the plugin,
+      # assert exit 0. Managed mode extracts the EMBEDDED sidechain-host from the binary, spawns it, waits for its
+      # catalog, connects, sets a param. On Linux the host is wrapped in xvfb-run -a (integration.yml pattern). ---
       - name: Self-test the shipped binary (Linux/macOS)
         if: runner.os != 'Windows'
         shell: bash
@@ -318,8 +314,9 @@ jobs:
           {
             echo "## Sidechain v$v"
             echo
-            echo "Prebuilt, ready-to-run bundles. Each archive contains BOTH binaries in one directory: the Go"
-            echo "MCP server (\`sidechain\`) and the native JUCE host (\`sidechain-host\`). No JUCE build needed."
+            echo "Prebuilt, ready-to-run bundles. Each archive contains a SINGLE self-contained binary (\`sidechain\`):"
+            echo "the Go MCP server with the native JUCE host embedded, which it extracts and spawns at runtime. No"
+            echo "separate host to install and no JUCE build needed."
             echo
             echo "### Install"
             echo

@@ -152,6 +152,10 @@ cmake --build cpp/build --target sidechain-host
 (The first CMake configure fetches JUCE via FetchContent, so it is slow. VST3 hosting works everywhere; AU is
 macOS only.)
 
+For a **single self-contained binary** (the host embedded via `go:embed`, which is what tagged releases ship),
+run `scripts/build-embedded.sh` instead: it builds the host, embeds it, and produces one `sidechain` that
+extracts and spawns the host itself at runtime, no `--host-bin` needed.
+
 ### 2. Run it (managed mode: one command)
 
 Point `sidechain` at a plugin and it spawns and supervises the host for you, waits for the catalog, auto-connects

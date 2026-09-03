@@ -39,8 +39,8 @@ fi
 echo "==> embedding $HOST ($(wc -c < "$HOST" | tr -d ' ') bytes)"
 cp "$HOST" internal/hostbin/payload
 
-# 3. Build the single-file Go binary with the embed tag.
+# 3. Build the single-file Go binary with the embed tag (strip symbols for a smaller release binary).
 echo "==> go build -tags embedhost -o $OUT"
-go build -tags embedhost -ldflags "-X main.Version=$VERSION" -o "$OUT" ./cmd/sidechain
+go build -tags embedhost -ldflags "-s -w -X main.Version=$VERSION" -o "$OUT" ./cmd/sidechain
 
 echo "==> done: $OUT (single file; run with --plugin <path>, no --host-bin needed)"

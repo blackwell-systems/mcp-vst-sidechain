@@ -39,16 +39,16 @@ plugins live (in a DAW). Non-goal: becoming a DAW (arrangement, transport, timel
 Release order: **`go:embed` single-file packaging lands BEFORE `v0.1.0`** so the first release ships as one binary,
 not two version-matched artifacts. Everything else in this horizon can follow the tag.
 
-- **Single-file distribution via `go:embed` (v0.1.0 PREREQUISITE).** `[next]` S. Ship ONE binary per platform:
-  `go:embed` the matching `sidechain-host` into the Go binary and self-extract it to a cache dir at startup
-  (managed mode already spawns it). This collapses the two-binary version-matching + bundling problem, the only
-  cheaply-reversible part of the Go/C++ build cost (the native/JUCE/signing burden is inherent to self-hosting and
-  unchanged by any language choice, so a pure-C++ rewrite would not fix it while discarding the proven, tested Go
-  layer). Distribution becomes "download one file and run." Must be locked in before the tag so v0.1.0 is a single
-  artifact; the release pipeline embeds at package time. Pairs with the signing/notarization work below.
-- **Cut `v0.1.0`.** `[next]` S. GATED on `go:embed` above. The foundation is green and three capability layers are
-  proven; nothing else structural blocks a tag. Ships as a single embedded binary. Shipping makes it installable and
-  dogfoodable, which is the fastest way to learn what matters next.
+- **Single-file distribution via `go:embed` (v0.1.0 PREREQUISITE).** `[done]` The `sidechain-host` is embedded into
+  the Go binary (`internal/hostbin`, build tag `embedhost`, `scripts/build-embedded.sh`) and self-extracts to a
+  cache dir at startup; managed-mode discovery uses it, so a shipped build is ONE file that needs no adjacent host.
+  The release pipeline builds the single-file bundle (host embedded at package time), and the local packaging path
+  is validated end to end (package -> unpack -> `--selftest`). This collapses the two-binary version-matching +
+  bundling problem, the only cheaply-reversible part of the Go/C++ build cost (the native/JUCE/signing burden is
+  inherent to self-hosting, so a pure-C++ rewrite would not fix it while discarding the proven, tested Go layer).
+- **Cut `v0.1.0`.** `[next]` S. Prerequisite (`go:embed` single-file) is now done, so this is unblocked: the
+  foundation is green, three capability layers are proven, and the release ships as a single embedded binary.
+  Shipping makes it installable and dogfoodable, the fastest way to learn what matters next. Recommended next move.
 - **Opaque-measurement forwarding.** `[next]` M. Today the Go side mirrors every DSP measurement field as a typed
   struct, so each new C++ measure forces a two-sided change plus a wire-contract sync. Make Go forward the
   `measurement`/`modulation` JSON more opaquely and only type the fields a tool reasons over. This cuts most of the
