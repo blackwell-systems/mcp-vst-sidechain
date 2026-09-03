@@ -36,9 +36,19 @@ plugins live (in a DAW). Non-goal: becoming a DAW (arrangement, transport, timel
 
 ## Horizon 1: ship it and pay down the seam (near-term)
 
-- **Cut `v0.1.0`.** `[next]` S. The foundation is green and three capability layers are proven; nothing structural
-  blocks a tag. Shipping makes it installable and dogfoodable, which is the fastest way to learn what matters next.
-  Recommended first move.
+Release order: **`go:embed` single-file packaging lands BEFORE `v0.1.0`** so the first release ships as one binary,
+not two version-matched artifacts. Everything else in this horizon can follow the tag.
+
+- **Single-file distribution via `go:embed` (v0.1.0 PREREQUISITE).** `[next]` S. Ship ONE binary per platform:
+  `go:embed` the matching `sidechain-host` into the Go binary and self-extract it to a cache dir at startup
+  (managed mode already spawns it). This collapses the two-binary version-matching + bundling problem, the only
+  cheaply-reversible part of the Go/C++ build cost (the native/JUCE/signing burden is inherent to self-hosting and
+  unchanged by any language choice, so a pure-C++ rewrite would not fix it while discarding the proven, tested Go
+  layer). Distribution becomes "download one file and run." Must be locked in before the tag so v0.1.0 is a single
+  artifact; the release pipeline embeds at package time. Pairs with the signing/notarization work below.
+- **Cut `v0.1.0`.** `[next]` S. GATED on `go:embed` above. The foundation is green and three capability layers are
+  proven; nothing else structural blocks a tag. Ships as a single embedded binary. Shipping makes it installable and
+  dogfoodable, which is the fastest way to learn what matters next.
 - **Opaque-measurement forwarding.** `[next]` M. Today the Go side mirrors every DSP measurement field as a typed
   struct, so each new C++ measure forces a two-sided change plus a wire-contract sync. Make Go forward the
   `measurement`/`modulation` JSON more opaquely and only type the fields a tool reasons over. This cuts most of the
@@ -95,9 +105,14 @@ The Go + C++ split was the right call for the server-heavy first phase (semantic
 far cheaper and safer in Go). As the center of gravity moved into DSP (render, modulation, phrase, pitch), the split
 now taxes every feature that crosses the audio/control boundary: two-sided changes, a pinned wire contract, and
 CI-only compiler differences (a `<cstdint>` and a `-Wfloat-equal` slip this cycle, invisible to a local clang build).
-The mitigation is not a rewrite: (1) opaque-measurement forwarding (Horizon 1) removes most of the recurring mirror
-work, and (2) the bridge-plugin (Horizon 3) is C++-native, a natural point for more logic to consolidate there while
-Go shrinks toward the MCP front. Track this so the tax is a deliberate choice, not an accumulating drag.
+The mitigation is explicitly NOT a pure-C++ rewrite: that would discard thousands of lines of proven, tested Go
+(the MCP surface, semantic store, concurrency/governance, GCF), rewrite it in a language worse for that job, move
+the network-facing parsing surface into manual memory, and still not fix distribution (the native/JUCE/signing cost
+is inherent to self-hosting). The seam is paid down three cheaper ways instead: (1) opaque-measurement forwarding
+(Horizon 1) removes most of the recurring mirror work; (2) `go:embed` single-file packaging (Horizon 1) collapses
+the two-binary distribution cost; and (3) the bridge-plugin (Horizon 3) is C++-native, a natural point for more
+logic to consolidate there while Go shrinks toward the MCP front. Track this so the tax is a deliberate choice, not
+an accumulating drag.
 
 ## Non-goals
 
