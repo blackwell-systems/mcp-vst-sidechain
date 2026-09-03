@@ -115,6 +115,7 @@ void testEmpty()
 
 using sidechain::analyzeEnvelope;
 using sidechain::EnvStats;
+using sidechain::estimateF0;
 
 // A periodic sine envelope sampled at fsEnv=40 Hz for ~2 s (80 frames) at 2 Hz.
 // Expected: rateHz within ~10% of 2.0, regular=true, depth ~ 2*amplitude, confidence > 0.5.
@@ -203,6 +204,29 @@ void testTooShortEnvelope()
 
 } // namespace
 
+// estimateF0: a pure sine at a known frequency should be recovered within a small tolerance; silence is unvoiced.
+void testEstimateF0Sine()
+{
+    constexpr double sr = 48000.0;
+    constexpr std::size_t n = 1200;   // 25 ms frame
+    const double twoPi = 6.283185307179586;
+    for (double f0 : { 130.81, 220.0, 440.0 })   // C3, A3, A4
+    {
+        std::vector<float> x (n);
+        for (std::size_t i = 0; i < n; ++i)
+            x[i] = (float) std::sin (twoPi * f0 * (double) i / sr);
+        const double got = estimateF0 (x.data(), n, sr);
+        expectTrue (std::fabs (got - f0) / f0 < 0.03, "estimateF0 within 3% of the tone");
+    }
+}
+
+void testEstimateF0Silence()
+{
+    constexpr std::size_t n = 1200;
+    std::vector<float> x (n, 0.0f);
+    expectNear (estimateF0 (x.data(), n, 48000.0), 0.0, 1e-9, "estimateF0(silence) == 0 (unvoiced)");
+}
+
 int main()
 {
     testFullScaleSine();
@@ -217,6 +241,10 @@ int main()
     testNoiseEnvelope();
     testFlatEnvelope();
     testTooShortEnvelope();
+
+    // Pitch detection (for vibrato tracking).
+    testEstimateF0Sine();
+    testEstimateF0Silence();
 
     if (g_failures == 0)
     {

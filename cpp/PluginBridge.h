@@ -42,6 +42,18 @@ enum class SetForm { Normalized, Choice, Value };
 // `Impulse` a single unit sample; `Silence` no input (measures a self-oscillating or tail-only effect).
 enum class InputKind { Silence, Sine, Noise, Impulse };
 
+// One note in a phrase render (a chord/arp/sequence): a note-on at startMs and a note-off at startMs+gateMs, with
+// optional per-note expression. bend is in semitones (mapped to pitch-wheel), pressure is 0..1 (channel pressure).
+struct NoteEvent
+{
+    int   note     = 60;
+    int   startMs  = 0;
+    int   gateMs   = 500;
+    float velocity = 0.8f;
+    float bend     = 0.0f;   // semitones, 0 = none
+    float pressure = 0.0f;   // 0..1, 0 = none
+};
+
 // A render request: what to feed the hosted plugin and how long to render. All fields carry the wire defaults.
 // The host AUTO-DETECTS instrument (accepts MIDI, no audio input => driven by note/velocity/channel + gateMs) vs
 // effect (has an audio input => driven by inputKind/inputFreq/inputLevel); the caller need not choose.
@@ -62,6 +74,12 @@ struct RenderSpec
     // describing LFO rate/depth of any time variation is added to the measurement.
     bool temporal = false;
     int  frameMs  = 25;   // per-frame hop in ms for the temporal analysis; clamped to [5, 100]
+
+    // Phrase render (chords / arps / sequences): when non-empty, this note list drives the render instead of the
+    // single note/velocity/gateMs above. mpe places each note on its own MIDI channel so per-note bend/pressure are
+    // independent (MPE-style); otherwise every note shares channel 1.
+    std::vector<NoteEvent> notes;
+    bool                   mpe = false;
 };
 
 // Tier 2.5: per-signal modulation descriptor. Emitted for one envelope (centroid or rms) when temporal=true.
@@ -80,9 +98,10 @@ struct Modulation
 {
     bool      present  = false;       // false => not emitted; true => emit the modulation block
     int       frameMs  = 25;          // the actual frame length used, clamped to [5, 100]
-    ModSignal centroid;               // spectral-centroid envelope periodicity (filter LFO / pitch sweep shows here)
+    ModSignal centroid;               // spectral-centroid envelope periodicity (filter LFO / timbral sweep shows here)
     ModSignal rms;                    // RMS-level envelope periodicity (tremolo / volume LFO shows here)
-    std::string dominant = "none";    // "centroid", "rms", or "none" (which signal carries the stronger modulation)
+    ModSignal pitch;                  // fundamental-frequency envelope periodicity (vibrato = a pitch LFO shows here)
+    std::string dominant = "none";    // "centroid", "rms", "pitch", or "none" (which signal modulates the strongest)
 };
 
 // The measurement returned from a render. The peak/rms/crest/silent/clipped half is the JUCE-free

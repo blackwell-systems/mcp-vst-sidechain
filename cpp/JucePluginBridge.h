@@ -8,6 +8,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <algorithm>
 #include <utility>
 #include <vector>
 #include "PluginBridge.h"
@@ -232,6 +233,49 @@ public:
         const int note    = juce::jlimit (0, 127, spec.note);
         const float vel   = juce::jlimit (0.0f, 1.0f, spec.velocity);
 
+        // Build the MIDI schedule: a single held note, or a PHRASE (chord / arp / sequence) when spec.notes is set.
+        // Each entry is (absoluteSample, message), sorted by time; the block loop emits the events in each block's
+        // window. noteOffSample tracks the LAST note-off, which bounds the temporal analysis sustain window below.
+        std::vector<std::pair<int, juce::MidiMessage>> sched;
+        int noteOffSample = gateSample;
+        if (isInstrument)
+        {
+            if (! spec.notes.empty())
+            {
+                noteOffSample = 0;
+                for (std::size_t i = 0; i < spec.notes.size(); ++i)
+                {
+                    const auto& ne = spec.notes[i];
+                    const int   ch = spec.mpe ? (int) (i % 15) + 2 : 1;   // MPE member channels 2..16, else channel 1
+                    const int   nn = juce::jlimit (0, 127, ne.note);
+                    const float nv = juce::jlimit (0.0f, 1.0f, ne.velocity);
+                    const int startMs = juce::jmax (0, ne.startMs);
+                    const int onS  = juce::jlimit (0, juce::jmax (0, totalSamples - 1),
+                                                   (int) std::llround ((double) startMs * sampleRate / 1000.0));
+                    const int offS = juce::jlimit (onS + 1, totalSamples,
+                                                   (int) std::llround ((double) (startMs + juce::jmax (1, ne.gateMs)) * sampleRate / 1000.0));
+                    if (ne.bend != 0.0f)
+                    {
+                        const double bendRange = spec.mpe ? 48.0 : 2.0;   // assumed pitch-wheel range in semitones
+                        const int wheel = juce::jlimit (0, 16383, 8192 + (int) std::llround ((double) ne.bend / bendRange * 8191.0));
+                        sched.emplace_back (onS, juce::MidiMessage::pitchWheel (ch, wheel));
+                    }
+                    if (ne.pressure != 0.0f)
+                        sched.emplace_back (onS, juce::MidiMessage::channelPressureChange (ch, juce::jlimit (0, 127, (int) std::llround ((double) ne.pressure * 127.0))));
+                    sched.emplace_back (onS, juce::MidiMessage::noteOn (ch, nn, nv));
+                    sched.emplace_back (offS, juce::MidiMessage::noteOff (ch, nn));
+                    noteOffSample = juce::jmax (noteOffSample, offS);
+                }
+                std::sort (sched.begin(), sched.end(),
+                           [] (const std::pair<int, juce::MidiMessage>& a, const std::pair<int, juce::MidiMessage>& b) { return a.first < b.first; });
+            }
+            else
+            {
+                sched.emplace_back (0, juce::MidiMessage::noteOn (channel, note, vel));
+                sched.emplace_back (gateSample, juce::MidiMessage::noteOff (channel, note));
+            }
+        }
+
         // Accumulate the whole render summed to mono for the headline numbers (matches the analysis contract).
         std::vector<float> mono;
         mono.reserve ((std::size_t) totalSamples);
@@ -251,15 +295,11 @@ public:
                 fillInput (buffer, numInputs, thisBlock, spec, sampleRate, inputPhaseSamples, rng);
             inputPhaseSamples += (juce::uint64) thisBlock;
 
-            // ---- MIDI for an instrument (note-on / note-off land in the block that contains them) ----
+            // ---- MIDI for an instrument: emit every scheduled event that falls in this block ----
             juce::MidiBuffer midi;
-            if (isInstrument)
-            {
-                if (pos == 0)
-                    midi.addEvent (juce::MidiMessage::noteOn (channel, note, vel), 0);
-                if (gateSample >= pos && gateSample < pos + thisBlock)
-                    midi.addEvent (juce::MidiMessage::noteOff (channel, note), gateSample - pos);
-            }
+            for (const auto& ev : sched)
+                if (ev.first >= pos && ev.first < pos + thisBlock)
+                    midi.addEvent (ev.second, ev.first - pos);
 
             // Present exactly thisBlock samples to the processor, then accumulate.
             juce::AudioBuffer<float> view (buffer.getArrayOfWritePointers(), numChannels, thisBlock);
@@ -299,7 +339,7 @@ public:
             const int modFrameLen = juce::jmax (1, (int) std::llround ((double) modFrameMs * sampleRate / 1000.0));
             const int guard  = (int) std::llround (0.20 * sampleRate);            // 200 ms attack guard
             int aStart = juce::jmin (guard, totalSamples / 4);
-            int aEnd   = isInstrument ? juce::jmin (gateSample, totalSamples) : totalSamples;
+            int aEnd   = isInstrument ? juce::jmin (noteOffSample, totalSamples) : totalSamples;
             if (aEnd - aStart < 8 * modFrameLen)                                  // too little sustain to trust a window
             {
                 aStart = 0;                                                       // fall back to the whole buffer
@@ -496,6 +536,9 @@ private:
         // Envelope time series: one value per frame.
         std::vector<float> centroidEnv ((std::size_t) numFrames, 0.0f);
         std::vector<float> rmsDbEnv    ((std::size_t) numFrames, 0.0f);
+        std::vector<float> f0Env       ((std::size_t) numFrames, 0.0f);   // fundamental in semitones (for vibrato)
+        double lastVoicedSemi = 0.0;   // held through unvoiced frames so the pitch envelope stays continuous
+        int    firstVoiced    = -1;    // index of the first voiced frame (for backfilling leading unvoiced frames)
 
         for (int f = 0; f < numFrames; ++f)
         {
@@ -510,6 +553,17 @@ private:
             }
             const double rmsLinear = std::sqrt (sumSq / (double) frameLen);
             rmsDbEnv[(std::size_t) f] = (float) linearToDb (rmsLinear);
+
+            // Fundamental frequency of this frame -> semitones (vibrato tracking). Unvoiced/silent frames hold the
+            // last voiced value so the envelope has no artificial jumps.
+            const double f0 = estimateF0 (mono.data() + start, (std::size_t) frameLen, sampleRate);
+            if (f0 > 0.0)
+            {
+                lastVoicedSemi = hzToSemitones (f0);
+                if (firstVoiced < 0)
+                    firstVoiced = f;
+            }
+            f0Env[(std::size_t) f] = (float) lastVoicedSemi;
 
             // Spectral centroid of this frame via a single windowed FFT (only when the frame is long enough).
             if (canFFT)
@@ -532,9 +586,16 @@ private:
             // If canFFT is false (very short frame), centroid stays 0 for this frame.
         }
 
+        // Backfill leading unvoiced frames with the first voiced pitch, so a slow note onset does not read as a
+        // large one-shot pitch excursion. If nothing was ever voiced, the envelope stays flat (no pitch modulation).
+        if (firstVoiced > 0)
+            for (int f = 0; f < firstVoiced; ++f)
+                f0Env[(std::size_t) f] = f0Env[(std::size_t) firstVoiced];
+
         // Analyze each envelope for periodicity using the pure JUCE-free estimator.
-        const EnvStats centStat = analyzeEnvelope (centroidEnv.data(), (std::size_t) numFrames, fsEnv);
-        const EnvStats rmsStat  = analyzeEnvelope (rmsDbEnv.data(),    (std::size_t) numFrames, fsEnv);
+        const EnvStats centStat  = analyzeEnvelope (centroidEnv.data(), (std::size_t) numFrames, fsEnv);
+        const EnvStats rmsStat   = analyzeEnvelope (rmsDbEnv.data(),    (std::size_t) numFrames, fsEnv);
+        const EnvStats pitchStat = analyzeEnvelope (f0Env.data(),       (std::size_t) numFrames, fsEnv);
 
         // Fill the wire-visible ModSignal structs.
         out.modulation.centroid.rateHz     = centStat.rateHz;
@@ -547,16 +608,24 @@ private:
         out.modulation.rms.confidence = rmsStat.confidence;
         out.modulation.rms.regular    = rmsStat.regular;
 
-        // dominant: compare normalized strength scores. Normalize centroid depth by 2000 Hz and rms depth by
-        // 12 dB so both are on roughly the same [0, 1] scale. A signal only scores above zero when regular is
-        // true; irregular movement still gets a depth measurement but does not claim to be dominant.
-        const double centScore = centStat.regular ? centStat.confidence * (centStat.depth / 2000.0) : 0.0;
-        const double rmsScore  = rmsStat.regular  ? rmsStat.confidence  * (rmsStat.depth  / 12.0)   : 0.0;
-        const double kDomThreshold = 1.0e-4;   // below this, neither is meaningfully dominant
-        if (centScore > rmsScore && centScore > kDomThreshold)
+        out.modulation.pitch.rateHz     = pitchStat.rateHz;
+        out.modulation.pitch.depth      = pitchStat.depth;   // semitones (peak-to-peak vibrato)
+        out.modulation.pitch.confidence = pitchStat.confidence;
+        out.modulation.pitch.regular    = pitchStat.regular;
+
+        // dominant: compare normalized strength scores. Normalize centroid depth by 2000 Hz, rms by 12 dB, and pitch
+        // by 1 semitone so all three are on roughly the same [0, 1] scale. A signal only scores above zero when
+        // regular is true; irregular movement still gets a depth measurement but does not claim to be dominant.
+        const double centScore  = centStat.regular  ? centStat.confidence  * (centStat.depth  / 2000.0) : 0.0;
+        const double rmsScore   = rmsStat.regular   ? rmsStat.confidence   * (rmsStat.depth   / 12.0)   : 0.0;
+        const double pitchScore = pitchStat.regular ? pitchStat.confidence * (pitchStat.depth / 1.0)    : 0.0;
+        const double kDomThreshold = 1.0e-4;   // below this, none is meaningfully dominant
+        if (centScore >= rmsScore && centScore >= pitchScore && centScore > kDomThreshold)
             out.modulation.dominant = "centroid";
-        else if (rmsScore > centScore && rmsScore > kDomThreshold)
+        else if (rmsScore >= centScore && rmsScore >= pitchScore && rmsScore > kDomThreshold)
             out.modulation.dominant = "rms";
+        else if (pitchScore > kDomThreshold)
+            out.modulation.dominant = "pitch";
         else
             out.modulation.dominant = "none";
     }

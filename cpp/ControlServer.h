@@ -430,6 +430,25 @@ private:
         if (req.hasProperty ("frame_ms"))
             spec.frameMs = (int) req.getProperty ("frame_ms", spec.frameMs);
 
+        // Phrase render: an optional "notes" array (chords / arps / sequences) and an "mpe" flag. When "notes" is
+        // present and non-empty, it drives the render instead of the single note above.
+        if (req.hasProperty ("mpe"))
+            spec.mpe = (bool) req.getProperty ("mpe", false);
+        if (const juce::var& notes = req.getProperty ("notes", juce::var()); notes.isArray())
+        {
+            for (const auto& nv : *notes.getArray())
+            {
+                NoteEvent ne;
+                if (nv.hasProperty ("note"))     ne.note     = (int)   nv.getProperty ("note", ne.note);
+                if (nv.hasProperty ("start_ms")) ne.startMs  = (int)   nv.getProperty ("start_ms", ne.startMs);
+                if (nv.hasProperty ("gate_ms"))  ne.gateMs   = (int)   nv.getProperty ("gate_ms", ne.gateMs);
+                if (nv.hasProperty ("velocity")) ne.velocity = (float) (double) nv.getProperty ("velocity", ne.velocity);
+                if (nv.hasProperty ("bend"))     ne.bend     = (float) (double) nv.getProperty ("bend", ne.bend);
+                if (nv.hasProperty ("pressure")) ne.pressure = (float) (double) nv.getProperty ("pressure", ne.pressure);
+                spec.notes.push_back (ne);
+            }
+        }
+
         Command c; c.kind = Kind::Render; c.render = spec; c.clientId = clientId;
         auto done = submit (std::move (c), 5000);   // generous: a render is bounded but not instant
         if (done == nullptr)
@@ -478,6 +497,7 @@ private:
             mod->setProperty ("frame_ms",  m.modulation.frameMs);
             mod->setProperty ("centroid",  modSignalToVar (m.modulation.centroid));
             mod->setProperty ("rms",       modSignalToVar (m.modulation.rms));
+            mod->setProperty ("pitch",     modSignalToVar (m.modulation.pitch));
             mod->setProperty ("dominant",  juce::String (m.modulation.dominant));
             o->setProperty ("modulation",  juce::var (mod));
         }

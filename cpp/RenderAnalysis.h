@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <string>
@@ -227,6 +228,56 @@ inline EnvStats analyzeEnvelope (const float* env, std::size_t n, double fsEnv)
     result.confidence = rawConfidence < 0.0 ? 0.0 : (rawConfidence > 1.0 ? 1.0 : rawConfidence);
 
     return result;
+}
+
+// estimateF0 finds the fundamental frequency of a short mono frame by autocorrelation, for pitch tracking (the
+// per-frame f0 envelope feeds analyzeEnvelope to detect vibrato = a pitch LFO). Pure, JUCE-free. Searches lags for
+// pitches in [minHz, maxHz]; returns the frequency (Hz) of the strongest normalized-autocorrelation peak, or 0 when
+// the frame is silent or has no clear pitch (unvoiced). Taking the FIRST (shortest-lag) strongest peak avoids the
+// classic octave-down error: for a periodic signal the autocorrelation peaks at the true period and its multiples
+// with comparable height, and the shortest of those is the fundamental.
+inline double estimateF0 (const float* x, std::size_t n, double sr, double minHz = 60.0, double maxHz = 1000.0)
+{
+    if (x == nullptr || n < 64 || sr <= 0.0 || minHz <= 0.0 || maxHz <= minHz)
+        return 0.0;
+
+    const std::size_t minLag = (std::size_t) std::max (2.0, sr / maxHz);
+    const std::size_t maxLag = (std::size_t) std::min ((double) (n / 2), sr / minHz);
+    if (maxLag <= minLag)
+        return 0.0;
+
+    double energy = 0.0;
+    for (std::size_t i = 0; i < n; ++i)
+        energy += (double) x[i] * (double) x[i];
+    if (energy < 1.0e-9)
+        return 0.0;   // silent frame => unvoiced
+
+    double     bestNacf = 0.0;
+    std::size_t bestLag = 0;
+    for (std::size_t lag = minLag; lag <= maxLag; ++lag)
+    {
+        double ac = 0.0;
+        for (std::size_t i = 0; i + lag < n; ++i)
+            ac += (double) x[i] * (double) x[i + lag];
+        const double nacf = ac / energy;
+        if (nacf > bestNacf)   // strict > keeps the FIRST (shortest) lag among comparable peaks (the fundamental)
+        {
+            bestNacf = nacf;
+            bestLag  = lag;
+        }
+    }
+
+    if (bestLag == 0 || bestNacf < 0.5)
+        return 0.0;   // no sufficiently periodic peak => treat as unvoiced
+    return sr / (double) bestLag;
+}
+
+// hzToSemitones maps a frequency to semitones relative to A4 (440 Hz). Only differences are meaningful (a vibrato
+// depth in semitones), so the reference cancels; 0 Hz (unvoiced) maps to 0 by convention (callers hold the last
+// voiced value instead of using this).
+inline double hzToSemitones (double hz)
+{
+    return hz > 0.0 ? 12.0 * std::log2 (hz / 440.0) : 0.0;
 }
 
 } // namespace sidechain
