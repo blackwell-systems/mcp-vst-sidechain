@@ -9,21 +9,30 @@ surface, read and set any parameter live (by real units like "1000 Hz", even on 
 0..1), play notes, save or recall its complete state, and build up a durable map of what each parameter means.
 Several agents can drive one instance at once without fighting over the same controls.
 
+Crucially, the agent can also **hear**: it renders the plugin offline, measures the result objectively (brightness,
+loudness, dynamics, modulation, even vibrato), and tunes parameters toward an intent on its own. So "make it
+brighter" is not a blind guess, it is a closed loop that renders, measures the spectral centroid, and converges the
+filter until the sound actually got brighter.
+
 Sidechain talks to plugins only through the standard VST3/AU API, the same way a DAW hosts thousands of
 closed-source commercial plugins without ever seeing their source. You bring your own licensed binaries;
 nothing is patched and nothing is redistributed.
 
-> Status: early but working. The Go MCP layer, the C++ control server, and the child-plugin host (the JUCE
-> `AudioPluginFormatManager` wrapper) are tested end to end: an integration matrix drives real VST3/AU plugins on
-> macOS and Linux, multiple agents can control one instance at once (with edit leases so they do not collide), a
-> semantic layer recovers real-unit control from probe-only plugins, and the learned semantics persist across
-> sessions. No release is tagged yet.
+> Status: early but working, and deep. The Go MCP layer, the C++ control server, and the child-plugin host (the
+> JUCE `AudioPluginFormatManager` wrapper) are tested end to end: an integration matrix drives real VST3/AU plugins
+> on macOS and Linux. Multiple agents can control one instance at once (with edit leases so they do not collide); a
+> semantic layer recovers real-unit control from probe-only plugins and persists the learned meaning across
+> sessions; and an offline render + analysis loop lets the agent measure and autonomously tune its own edits
+> ("brighter", "louder", "add a 6 Hz vibrato") with the closed loop proven in CI on real plugins. No release is
+> tagged yet.
 
 ## Why
 
 Producers already automate plugins in a DAW. An LLM should be able to do the same thing conversationally:
 "open the filter a little," "make this pad wider," "give me a darker version of this patch." That needs a
-generic, realtime control bridge between an agent and an arbitrary plugin. Sidechain is that bridge.
+generic, realtime control bridge between an agent and an arbitrary plugin. Sidechain is that bridge, and for the
+intents that have an objective signal (brighter, louder, punchier, more vibrato) it closes the loop today: it
+renders, measures, and tunes until the target is hit, rather than nudging a knob and hoping.
 
 There's no polished, standalone tool for this yet. The existing attempts are prototypes, DAW-specific
 controllers, or heavy agent-DAWs; none is a cross-platform generic bridge, and none handles the token cost of
@@ -60,6 +69,30 @@ The control server accepts **many controllers at once**: several agents (or an a
 editor) can drive one instance concurrently, each with its own identity, and every change is pushed to the others
 as an event. Full detail: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/CONCURRENCY.md](docs/CONCURRENCY.md).
 
+## The closed loop: the agent hears and tunes
+
+Controlling parameters is half of sound design; the other half is judging the result. Sidechain gives the agent
+both.
+
+- **`render_and_measure` (its ears).** Sidechain renders the hosted plugin OFFLINE (no audio device, no realtime):
+  a MIDI note through an instrument, or a test signal through an effect. It then measures the output objectively:
+  peak / RMS / crest, spectral centroid (brightness), a three-band split, silence and clipping. Opt into temporal
+  analysis and it also reports MODULATION: the rate and depth of an LFO on the filter (centroid), the amplitude
+  (tremolo), or the pitch (vibrato). You can drive a whole PHRASE (a chord, an arp, a short sequence), not just one
+  note, so patches that only reveal themselves under a pattern are measurable too. Nothing else in the MCP audio
+  space can do this, because it needs to HOST the plugin and process its audio, which is exactly what Sidechain
+  does and a DAW-side controller cannot.
+- **`tune_param` / `tune_params` (autonomy).** Give the tool a parameter and a target ("maximize the spectral
+  centroid", "hit -12 dB RMS", "set the LFO rate to 6 Hz") and it renders + measures at each step, converging the
+  value with a bounded search. `tune_params` co-optimizes several knobs at once for intents one knob cannot express
+  ("punchier" = attack + drive toward more crest; "wobble at 4 Hz, deep" = LFO rate toward a target AND amount
+  toward more depth). The agent decides WHAT to tune from the semantic map; the server converges it. This is the
+  make-it-brighter loop, run to completion by the machine and proven end to end in CI on real plugins.
+
+The division of labor is deliberate: the meaning of an intent ("brighter" -> the filter cutoff, up) lives in the
+agent, and the objective search lives in the server. See [docs/RENDER-SCOPING.md](docs/RENDER-SCOPING.md) and
+[docs/PHASE4-SCOPING.md](docs/PHASE4-SCOPING.md).
+
 ## Supported formats
 
 Sidechain hosts **VST3** (all platforms) and **AU** (macOS) instruments and effects through JUCE's standard
@@ -80,6 +113,11 @@ reported directly (`hasRealRange: true`) only when Sidechain is embedded in a na
 curve. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Tools
+
+Roughly grouped: **read** (`list_params`, `get_param`, `describe_param`), **learn** (`annotate_params`,
+`get_semantic_map`, `forget_semantics`), **write** (`set_param`, `set_params`), **live/MIDI/state** (`connect_live`,
+`play_note`, `save_state`, `load_state`, `reset_init`), **coordinate** (`acquire_lease`, `get_leases`,
+`poll_events`), and **hear + tune** (`render_and_measure`, `tune_param`, `tune_params`).
 
 | Tool | What it does |
 |---|---|
@@ -103,43 +141,46 @@ curve. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Quickstart
 
-### 1. Build the Go server
+### 1. Build both binaries
 
 ```bash
 go build -o sidechain ./cmd/sidechain
-```
-
-### 2. Build the C++ host
-
-```bash
 cmake -S cpp -B cpp/build -DCMAKE_BUILD_TYPE=Release
 cmake --build cpp/build --target sidechain-host
 ```
 
-(The first configure fetches JUCE via FetchContent, so it is slow. VST3 hosting works everywhere; AU is macOS
-only.)
+(The first CMake configure fetches JUCE via FetchContent, so it is slow. VST3 hosting works everywhere; AU is
+macOS only.)
 
-### 3. Load a plugin and start the host
+### 2. Run it (managed mode: one command)
+
+Point `sidechain` at a plugin and it spawns and supervises the host for you, waits for the catalog, auto-connects
+the live endpoint, and serves MCP over stdio:
 
 ```bash
-./cpp/build/sidechain-host_artefacts/Release/sidechain-host \
+./sidechain \
     --plugin "/Library/Audio/Plug-Ins/VST3/YourSynth.vst3" \
-    --catalog plugin-catalog.json \
-    --port 51703
+    --host-bin ./cpp/build/sidechain-host_artefacts/Release/sidechain-host
 ```
 
-This loads the plugin, writes its parameter catalog to `plugin-catalog.json`, and starts the control server
-on `127.0.0.1:51703`.
+Register that command as an MCP server in your client (Claude Code / Desktop). Because it is already live, the
+agent can go straight to `list_params` (see the surface), `set_param` / `set_params` (drive it), and
+`render_and_measure` / `tune_param` (hear and tune it), no `connect_live` needed. Add `--selftest` to verify the
+whole managed startup in one shot without serving MCP.
 
-### 4. Run the MCP server and point an agent at it
+### External mode (attach to a running host)
+
+For advanced setups (a long-lived host, several servers attaching to one instance), run the host yourself and
+attach with `--catalog`:
 
 ```bash
+# terminal 1: start the host, which writes the catalog and listens on :51703
+./cpp/build/sidechain-host_artefacts/Release/sidechain-host \
+    --plugin "/Library/Audio/Plug-Ins/VST3/YourSynth.vst3" --catalog plugin-catalog.json --port 51703
+
+# terminal 2: attach the MCP server; the agent then calls connect_live to dial :51703
 ./sidechain --catalog plugin-catalog.json
 ```
-
-Register `./sidechain` as an MCP server in your client (Claude Code / Desktop). Then, from the agent:
-`connect_live` (dials the host on `51703`), `list_params` to see the surface, and `set_param` / `set_params`
-to drive it live.
 
 ## Configuration
 
