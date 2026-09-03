@@ -254,13 +254,13 @@ public:
                                                    (int) std::llround ((double) startMs * sampleRate / 1000.0));
                     const int offS = juce::jlimit (onS + 1, totalSamples,
                                                    (int) std::llround ((double) (startMs + juce::jmax (1, ne.gateMs)) * sampleRate / 1000.0));
-                    if (ne.bend != 0.0f)
+                    if (ne.bend < 0.0f || ne.bend > 0.0f)   // non-zero (relational form: -Wfloat-equal safe)
                     {
                         const double bendRange = spec.mpe ? 48.0 : 2.0;   // assumed pitch-wheel range in semitones
                         const int wheel = juce::jlimit (0, 16383, 8192 + (int) std::llround ((double) ne.bend / bendRange * 8191.0));
                         sched.emplace_back (onS, juce::MidiMessage::pitchWheel (ch, wheel));
                     }
-                    if (ne.pressure != 0.0f)
+                    if (ne.pressure > 0.0f)
                         sched.emplace_back (onS, juce::MidiMessage::channelPressureChange (ch, juce::jlimit (0, 127, (int) std::llround ((double) ne.pressure * 127.0))));
                     sched.emplace_back (onS, juce::MidiMessage::noteOn (ch, nn, nv));
                     sched.emplace_back (offS, juce::MidiMessage::noteOff (ch, nn));
