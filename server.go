@@ -115,6 +115,7 @@ func NewServer(name, version string, cat ParamCatalog) (*mcp.Server, *session) {
 	registerGovernedTools(srv, s)
 	registerRenderTools(srv, s)
 	registerTuneTools(srv, s)
+	registerTuneParamsTools(srv, s)
 	registerSemanticTools(srv, s)
 	return srv, s
 }

@@ -260,9 +260,12 @@ func (fh *fakeHost) dispatch(req map[string]any, client int) map[string]any {
 		fh.renders++
 		cutoff := fh.params["cutoff"] // dispatch already holds fh.mu
 		centroid := 200.0 + cutoff*3800.0
+		// rms_db responds to a "gain" param (default 0 keeps the historical -18.4), giving tune_params a SECOND
+		// independent axis to co-optimize (cutoff -> centroid, gain -> rms) in the in-memory tests.
+		rmsDb := -18.4 + fh.params["gain"]*18.0
 		meas := map[string]any{
 			"duration_sec": 2.0, "sample_rate": 48000.0, "channels": 2,
-			"peak_db": -6.2, "rms_db": -18.4, "crest": 12.2, "centroid_hz": centroid,
+			"peak_db": -6.2, "rms_db": rmsDb, "crest": 12.2, "centroid_hz": centroid,
 			"bands":  map[string]any{"low_db": -20.1, "mid_db": -16.8, "high_db": -28.0},
 			"silent": false, "clipped": false,
 		}

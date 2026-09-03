@@ -285,13 +285,13 @@ jobs:
           SIDECHAIN_LIVE_PORT=52021 SIDECHAIN_LIVE_CATALOG=brite.json SIDECHAIN_LIVE_PARAM="$CUTOFF" \
             go test -run 'TestRenderBrighter|TestTuneBrighterLive' -v .
 
-      # Modulation-aware measurement (Tier 2.5) + LFO tuning: the temporal analysis payoff on a REAL LFO. Route
-      # TAL's Lfo 1 to the filter cutoff (Amount high, Destination = the cutoff option, Waveform = sine) so the
+      # Modulation-aware measurement (Tier 2.5) + LFO tuning + multi-param co-tune: the temporal analysis payoff on a
+      # REAL LFO. Route TAL's Lfo 1 to the filter cutoff (Destination = the cutoff option, Waveform = sine) so the
       # spectral centroid visibly modulates, then: TestRenderTemporalLive asserts the modulation block reports a
-      # clean periodic LFO on the centroid (regular, LFO-band rate); TestTuneModulationRateLive tunes the LFO RATE
-      # param toward a target rate (measure=modulation.centroid.rate_hz, temporal auto-enabled) and asserts it
-      # converged. This proves modulation is both measurable and tunable end to end. REQUIRED. Ids resolved by label.
-      - name: Modulation (LFO) measurement + tune loop (TAL Lfo 1) - REQUIRED
+      # clean periodic LFO on the centroid; TestTuneModulationRateLive tunes the LFO RATE toward a target rate; and
+      # TestTuneParamsWobbleLive (Phase 4 tune_params) CO-tunes the rate toward a target AND the amount toward more
+      # modulation depth by coordinate descent. Measurable, tunable, and co-tunable end to end. REQUIRED. Ids by label.
+      - name: Modulation (LFO) measure + tune + co-tune loop (TAL Lfo 1) - REQUIRED
         if: ${{ !cancelled() }}
         run: |
           set -euo pipefail
@@ -324,12 +324,12 @@ jobs:
                       return m
           for p, v in [(amount, 0.95), (dest, 0.30), (wave, 0.0), (rate, 0.45)]:
               req({"cmd": "set_param", "param": p, "normalized": v})
-          open(sys.argv[3], "w").write(str(rate))
+          open(sys.argv[3], "w").write(str(rate) + " " + str(amount))
           PY
-          RATE=$(cat rate.txt)
-          echo "TAL Lfo 1 routed to filter; LFO rate param id = $RATE"
-          SIDECHAIN_LIVE_PORT=52022 SIDECHAIN_LIVE_CATALOG=mod.json SIDECHAIN_LIVE_PARAM="$RATE" SIDECHAIN_LIVE_LFO_TARGET=4 \
-            go test -run 'TestRenderTemporalLive|TestTuneModulationRateLive' -v .
+          read RATE AMOUNT < rate.txt
+          echo "TAL Lfo 1 routed to filter; rate id=$RATE amount id=$AMOUNT"
+          SIDECHAIN_LIVE_PORT=52022 SIDECHAIN_LIVE_CATALOG=mod.json SIDECHAIN_LIVE_PARAM="$RATE" SIDECHAIN_LIVE_PARAM2="$AMOUNT" SIDECHAIN_LIVE_LFO_TARGET=4 \
+            go test -run 'TestRenderTemporalLive|TestTuneModulationRateLive|TestTuneParamsWobbleLive' -v .
 
       # Flat-plugin section leases (C3): TAL exposes NO parameter-tree groups, so the host derives leasable sections
       # from shared label prefixes (computeSections, a port of sections.go). This exercises that fallback end to

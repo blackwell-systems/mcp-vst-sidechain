@@ -80,10 +80,27 @@ the trace makes that visible so the agent can decide to look elsewhere.
 - The tool does not touch the semantic store; it is pure mechanism. The agent may follow a successful tune with
   `annotate_params` to record what it learned (e.g. confirm a role).
 
-## Later increments (deferred)
+## Increment 2: `tune_params` (multi-param co-optimization) - IMPLEMENTED
 
-- **Multi-param tune** (`tune_params`): co-optimize a small set (coordinate descent over the render loop), for
-  intents that need two knobs (e.g. "punchier" = attack down + drive up). 1-D first; the loop generalizes.
+Co-optimize a SET of knobs, each `{id, measure, goal, target?}`, by COORDINATE DESCENT over the render loop: each
+round tunes every knob's param in turn with the same 1-D search (`tuneAxis`, factored out of `tune_param`), holding
+the others at their current best; rounds repeat until a whole round moves nothing (`convergedEps`) or the round
+budget is spent. This is for compositional intents one param cannot express, which the agent decomposes over the
+semantic map:
+
+- **Shared objective, several knobs:** "punchier" = attack and drive both toward higher `crest`.
+- **Independent targets:** "get it to -12 LUFS and 3 kHz" = `{gain, rms_db, target, -12}` and `{tone, centroid_hz,
+  target, 3000}`.
+- **Modulation (coupled):** "wobble at ~4 Hz, deep" = `{lfoRate, modulation.centroid.rate_hz, target, 4}` and
+  `{lfoAmount, modulation.centroid.depth, maximize}` (after the agent sets the LFO destination/waveform via
+  `set_param`). Temporal is auto-enabled when any knob is a modulation measure.
+
+Render budget is bounded (rounds x knobs x per-axis renders, with a joint baseline render). The bridge still holds
+no intent ontology: the agent picks the knobs and their objectives; the server co-optimizes them. Proven end to end
+by `TestTuneParamsWobbleLive` on TAL (rate 8 Hz -> ~3.6 Hz toward a 4 Hz target while amount deepens the modulation
+422 Hz -> 1365 Hz) and in-memory two-axis convergence tests.
+
+## Later increments (deferred)
 - **A worked "intent playbook"** (docs, not code): example agent transcripts mapping common intents (brighter,
   warmer, punchier, wider, cleaner) to (role, measure, direction) over the semantic map, so the agent has priors
   without an ontology in the bridge.

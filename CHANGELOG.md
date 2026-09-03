@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format is based on
 
 ### Added
 
+- **Phase 4 increment 2: `tune_params`, multi-parameter co-optimization.** Where `tune_param` drives one param
+  toward one measure, `tune_params` co-optimizes a SET of knobs (each `{id, measure, goal, target?}`) by coordinate
+  descent over the render loop: each round tunes every knob's param in turn with the shared 1-D search (the search
+  core was factored out of `tune_param` into `tuneAxis`), holding the others at their current best, until a whole
+  round moves nothing or the round budget is spent. This is for compositional intents one param cannot express, all
+  decomposed by the agent over the semantic map (no ontology in the bridge): "punchier" = attack + drive toward
+  higher crest; "get it to -12 LUFS and 3 kHz" = two independent targets; "wobble at ~4 Hz, deep" = the LFO rate
+  toward a target rate AND the LFO amount toward more modulation depth (temporal auto-enabled when any knob is a
+  modulation measure). `restore=true` makes it a joint what-if. Proven end to end by `TestTuneParamsWobbleLive` on
+  TAL (rate 8 Hz -> ~3.6 Hz toward a 4 Hz target while the amount deepens the modulation 422 Hz -> 1365 Hz, 3
+  rounds) and in-memory two-axis convergence tests. See `docs/PHASE4-SCOPING.md`.
+
 - **Tier 2.5: modulation-aware (temporal) measurement, so the agent can hear LFOs.** The static Tier-2 measurement
   collapses the whole render to one number per metric and is blind to anything time-varying. `render_and_measure`
   now accepts `temporal: true` (and optional `frameMs`, default 25) and, when set, returns a `modulation` block:

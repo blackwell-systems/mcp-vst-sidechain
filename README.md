@@ -98,6 +98,7 @@ curve. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 | `poll_events` | What changed on the plugin since your last poll: parameter and lease changes made by other controllers. |
 | `render_and_measure` | Offline-render the current patch (a MIDI note for anything that accepts MIDI, else a synthesized test signal for an effect) and get back objective measurements: peak/RMS/crest, spectral centroid, a three-band split, silent/clipped, plus a one-line summary. Lets an agent EVALUATE its own edit ("did it get brighter?") instead of tweaking blind. |
 | `tune_param` | Drive one param toward a goal (maximize/minimize, or hit a target) on one measurement, rendering and measuring at each step until it converges. You pick the param and measure (e.g. cutoff + centroid); the tool finds the value that gets there and reports the trace. The autonomous "make it brighter" loop. |
+| `tune_params` | Co-optimize several params at once (coordinate descent) for intents one knob can't express: "punchier" (attack + drive toward more crest), or "wobble at 4 Hz, deep" (LFO rate toward a target + amount toward more modulation depth). Give a list of {param, measure, goal}; the tool tunes them together and reports where each landed. |
 
 ## Quickstart
 

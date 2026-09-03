@@ -182,9 +182,10 @@ listener). To expose anything else over the same protocol, implement another `Pl
 - **Render + analysis (`render_tools.go`).** Registers `render_and_measure`; the `LiveEndpoint.Render` client
   method carries the `RenderSpec` over the wire and decodes the snake_case `Measurement` reply. The Phase-4
   feedback signal (see the render section under the wire protocol).
-- **Closed-loop tuning (`tune_tools.go`, Phase 4).** Registers `tune_param`: a bounded coarse-seed + golden-section
-  search that drives one param toward a goal on one measure, using `set_param` + `Render` as the objective. Pure
-  mechanism (no intent ontology); the agent picks what to tune from the semantic map. See `docs/PHASE4-SCOPING.md`.
+- **Closed-loop tuning (`tune_tools.go` + `tune_params.go`, Phase 4).** Registers `tune_param` (a bounded coarse-seed
+  + golden-section search on one param, `tuneAxis`) and `tune_params` (coordinate descent over several knobs, reusing
+  `tuneAxis` per axis), using `set_param` + `Render` as the objective. Pure mechanism (no intent ontology); the agent
+  picks what to tune from the semantic map. See `docs/PHASE4-SCOPING.md`.
 
 ### The seam interfaces
 
@@ -322,6 +323,7 @@ headless session otherwise.
 | `poll_events` | Drain the server-pushed `param_changed` / `governed_changed` events since the last poll (deduped to latest-per-param, other controllers only by default). Live only. |
 | `render_and_measure` | Offline-render the current patch (a MIDI note for anything that accepts MIDI, else a synthesized `inputKind` signal for a pure effect) and return an objective `measurement` (peak/RMS/crest dB, spectral centroid, three-band split, silent/clipped) plus a one-line human summary. The Phase-4 feedback signal: set a param, render, read back whether it got brighter/louder. Live only. |
 | `tune_param` | Drive ONE param toward a goal (`maximize`/`minimize`/`target`) on ONE `measure` (centroid_hz/peak_db/rms_db/crest/band, or a nested modulation measure like `modulation.centroid.rate_hz`/`.depth`), rendering + measuring at each step (a bounded coarse-seed + golden-section search; temporal auto-enabled for modulation measures). The agent picks the param/measure/direction from the semantic map; the tool converges it and returns the value it settled on plus the search trace. The autonomous make-it-brighter (and set-the-LFO-rate) loop (Phase 4). Live only. |
+| `tune_params` | Co-optimize SEVERAL params at once by coordinate descent: a list of `knobs`, each `{id, measure, goal, target?}`, tuned in turn each round (holding the others at their best) until a round moves nothing. For compositional intents one param cannot express ("punchier" = attack + drive toward higher crest; "wobble" = LFO rate toward a target AND amount toward more depth). Temporal auto-enabled if any knob is a modulation measure. Live only. |
 
 ### The four ways to set one value
 
@@ -503,10 +505,12 @@ algorithm (`cpp/tests/section_derivation_test.cpp`) and the pure render-analysis
     and deliberately not asserted. `TestRenderBrighter` (gated on `SIDECHAIN_LIVE_*`, run against TAL-NoiseMaker's
     Filter Cutoff, whose init patch has an active lowpass) is the canonical make-it-brighter proof: render low
     cutoff, render high cutoff, assert the spectral centroid rose (~10x in practice).
-  - **Closed-loop tuning (`tune_tools_test.go` in-memory, `tune_live_test.go` gated).** The in-memory tests drive
-    `tune_param` against the fake host (whose centroid responds to the param) and assert maximize/minimize/target
-    converge and the set/restore landing is correct. `TestTuneBrighterLive` (gated on `SIDECHAIN_LIVE_*`, TAL
-    cutoff) is the AUTONOMOUS make-it-brighter loop: `maximize centroid_hz` starts dark and lands the cutoff bright.
+  - **Closed-loop tuning (`tune_tools_test.go` + `tune_params_test.go` in-memory, `tune_live_test.go` +
+    `tune_params_live_test.go` gated).** The in-memory tests drive `tune_param` and `tune_params` against the fake
+    host (centroid responds to `cutoff`, rms to `gain`, so there are two independent axes) and assert
+    maximize/minimize/target converge and the set/restore landing is correct. `TestTuneBrighterLive` (gated, TAL
+    cutoff) is the AUTONOMOUS make-it-brighter loop; `TestTuneParamsWobbleLive` (gated, TAL Lfo 1) co-tunes the LFO
+    rate toward a target AND the amount toward more modulation depth.
   - **Modulation-aware measurement (Tier 2.5, `render_analysis_test.cpp` for the pure envelope core;
     `modulation_live_test.go` gated).** The C++ unit test asserts `analyzeEnvelope` on synthetic envelopes (2 Hz
     sine -> rate ~2 + regular, ramp -> not periodic, noise -> irregular). `TestRenderTemporalLive` and

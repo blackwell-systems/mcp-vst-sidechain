@@ -172,122 +172,151 @@ func (s *session) handleTuneParam(ctx context.Context, _ *mcp.CallToolRequest, i
 		spec.Temporal = true
 	}
 
-	// The starting position, so we can restore it and report the delta.
-	_, startNorm, _, err := lc.GetParam(p.ID)
+	// The whole 1-D search is factored into tuneAxis so tune_params can reuse it per axis. It leaves the param at
+	// the best value found.
+	ax := axisSpec{p: p, measure: in.Measure, goal: goal, target: in.Target, seeds: seeds, refine: refine}
+	ao, err := tuneAxis(lc, ax, spec)
 	if err != nil {
-		return textResult("tune_param: could not read the current value: " + err.Error()), nil, nil
+		return textResult("tune_param: " + err.Error()), nil, nil
 	}
 
-	// renderAt sets the param to a normalized position and renders, returning the measure's value there plus the
-	// full measurement. Every call is recorded in the trace, and the running best (by score) is tracked.
-	var evals []tuneEval
-	var bestNorm, bestVal, bestScore float64
-	var bestMeas Measurement
-	haveBest := false
-	renderAt := func(norm float64) (float64, error) {
-		norm = math.Max(0, math.Min(1, norm))
-		if _, _, _, e := lc.SetParam(p.ID, norm, false); e != nil {
-			return 0, e
-		}
-		m, e := lc.Render(spec)
-		if e != nil {
-			return 0, e
-		}
-		// Guard: a modulation measure requires the host to have returned a modulation block. When the block is
-		// absent (the plugin/host does not support temporal analysis, or Temporal was not set), fail early with
-		// an actionable message rather than silently scoring as zero.
-		if isModulationMeasure(in.Measure) && m.Modulation == nil {
-			return 0, fmt.Errorf("host returned no modulation block; the plugin/host may not support temporal analysis")
-		}
-		v, _ := measureValue(m, in.Measure)
-		evals = append(evals, tuneEval{Normalized: norm, Value: v})
-		sc := tuneScore(v, goal, in.Target)
-		if !haveBest || sc > bestScore {
-			haveBest, bestScore, bestNorm, bestVal, bestMeas = true, sc, norm, v, m
-		}
-		return v, nil
-	}
-
-	// Baseline at the starting position (so startValue reflects the patch as found, and it competes as a candidate).
-	startVal, err := renderAt(startNorm)
-	if err != nil {
-		return textResult("tune_param: baseline render failed: " + err.Error()), nil, nil
-	}
-
-	// Coarse pass: uniform seeds across [0,1] inclusive. Find the best, then bracket it with its neighbors.
-	for i := 0; i < seeds; i++ {
-		x := float64(i) / float64(seeds-1)
-		if _, err := renderAt(x); err != nil {
-			return textResult("tune_param: render failed during coarse pass: " + err.Error()), nil, nil
-		}
-	}
-	step := 1.0 / float64(seeds-1)
-	a := math.Max(0, bestNorm-step)
-	b := math.Min(1, bestNorm+step)
-
-	// Golden-section refine within the bracket. Standard 0.618 shrink; one new render per iteration after the two
-	// interior seeds. Reuses the score already collected via renderAt's running best.
-	if b-a > 1e-6 && refine > 0 {
-		const gr = 0.6180339887498949
-		c := b - gr*(b-a)
-		d := a + gr*(b-a)
-		fc, err := renderAt(c)
-		if err != nil {
-			return textResult("tune_param: refine render failed: " + err.Error()), nil, nil
-		}
-		fd, err := renderAt(d)
-		if err != nil {
-			return textResult("tune_param: refine render failed: " + err.Error()), nil, nil
-		}
-		scoreOf := func(v float64) float64 { return tuneScore(v, goal, in.Target) }
-		for i := 0; i < refine; i++ {
-			if scoreOf(fc) > scoreOf(fd) {
-				b, d, fd = d, c, fc
-				c = b - gr*(b-a)
-				if fc, err = renderAt(c); err != nil {
-					return textResult("tune_param: refine render failed: " + err.Error()), nil, nil
-				}
-			} else {
-				a, c, fc = c, d, fd
-				d = a + gr*(b-a)
-				if fd, err = renderAt(d); err != nil {
-					return textResult("tune_param: refine render failed: " + err.Error()), nil, nil
-				}
-			}
-		}
-	}
-
-	// Land the param: at the best value found, or restored to the start for a measure-only what-if.
-	landNorm := bestNorm
+	// Restore to the start for a measure-only what-if (tuneAxis already left it at the best value otherwise).
 	if in.Restore {
-		landNorm = startNorm
-	}
-	if _, _, _, e := lc.SetParam(p.ID, landNorm, false); e != nil {
-		return textResult("tune_param: failed to set the final value: " + e.Error()), nil, nil
+		if _, _, _, e := lc.SetParam(p.ID, ao.startNorm, false); e != nil {
+			return textResult("tune_param: failed to restore the start value: " + e.Error()), nil, nil
+		}
 	}
 
 	// Sort the trace by position for a readable curve (the search order is not monotonic).
-	sort.SliceStable(evals, func(i, j int) bool { return evals[i].Normalized < evals[j].Normalized })
+	sort.SliceStable(ao.evals, func(i, j int) bool { return ao.evals[i].Normalized < ao.evals[j].Normalized })
 
 	var tgt *float64
 	if goal == "target" {
 		t := in.Target
 		tgt = &t
 	}
-	landDesc := fmt.Sprintf("left at normalized %.3f", bestNorm)
+	landDesc := fmt.Sprintf("left at normalized %.3f", ao.bestNorm)
 	if in.Restore {
-		landDesc = fmt.Sprintf("restored to normalized %.3f (best was %.3f)", startNorm, bestNorm)
+		landDesc = fmt.Sprintf("restored to normalized %.3f (best was %.3f)", ao.startNorm, ao.bestNorm)
 	}
 	summary := fmt.Sprintf("tuned %s: %s %s -> %s over %d renders (%s)",
-		p.Label, in.Measure, formatMeasure(in.Measure, startVal), formatMeasure(in.Measure, bestVal), len(evals), landDesc)
+		p.Label, in.Measure, formatMeasure(in.Measure, ao.startVal), formatMeasure(in.Measure, ao.bestVal), len(ao.evals), landDesc)
 
 	out := tuneResult{
 		ID: p.ID, Measure: in.Measure, Goal: goal, Target: tgt,
-		StartNormalized: startNorm, StartValue: startVal,
-		BestNormalized: bestNorm, BestValue: bestVal, Restored: in.Restore,
-		Evaluations: evals, Measurement: bestMeas, Summary: summary,
+		StartNormalized: ao.startNorm, StartValue: ao.startVal,
+		BestNormalized: ao.bestNorm, BestValue: ao.bestVal, Restored: in.Restore,
+		Evaluations: ao.evals, Measurement: ao.meas, Summary: summary,
 	}
 	return textResult(summary), out, nil
+}
+
+// axisSpec is one 1-D tuning objective: drive param p toward goal on measure (target used when goal=="target"),
+// searching with seeds coarse points then refine golden-section steps.
+type axisSpec struct {
+	p       *ParamDef
+	measure string
+	goal    string
+	target  float64
+	seeds   int
+	refine  int
+}
+
+// axisOutcome is the result of a 1-D search: the starting and best positions/values, the full render trace, and the
+// complete measurement at the best position.
+type axisOutcome struct {
+	startNorm, startVal float64
+	bestNorm, bestVal   float64
+	evals               []tuneEval
+	meas                Measurement
+}
+
+// tuneAxis runs the coarse-seed + golden-section search on one param against one measure/goal, rendering with the
+// given spec at each step, and LEAVES the param set at the best value found (so a coordinate-descent caller tunes
+// each subsequent axis against the others' current values). Returns an error on a render/set failure or a missing
+// modulation block. The caller is responsible for input validation (param exists, measure/goal valid, seeds >= 2).
+func tuneAxis(lc LiveEndpoint, ax axisSpec, spec RenderSpec) (axisOutcome, error) {
+	var out axisOutcome
+	var bestScore float64
+	haveBest := false
+	modMeasure := isModulationMeasure(ax.measure)
+
+	renderAt := func(norm float64) (float64, error) {
+		norm = math.Max(0, math.Min(1, norm))
+		if _, _, _, e := lc.SetParam(ax.p.ID, norm, false); e != nil {
+			return 0, e
+		}
+		m, e := lc.Render(spec)
+		if e != nil {
+			return 0, e
+		}
+		// A modulation measure requires the host to have returned a modulation block; fail early (not a silent
+		// zero score) when it is absent.
+		if modMeasure && m.Modulation == nil {
+			return 0, fmt.Errorf("host returned no modulation block; the plugin/host may not support temporal analysis")
+		}
+		v, _ := measureValue(m, ax.measure)
+		out.evals = append(out.evals, tuneEval{Normalized: norm, Value: v})
+		sc := tuneScore(v, ax.goal, ax.target)
+		if !haveBest || sc > bestScore {
+			haveBest, bestScore, out.bestNorm, out.bestVal, out.meas = true, sc, norm, v, m
+		}
+		return v, nil
+	}
+
+	_, startNorm, _, err := lc.GetParam(ax.p.ID)
+	if err != nil {
+		return out, fmt.Errorf("could not read %s: %w", ax.p.ID, err)
+	}
+	out.startNorm = startNorm
+	if out.startVal, err = renderAt(startNorm); err != nil {
+		return out, err
+	}
+
+	for i := 0; i < ax.seeds; i++ {
+		if _, err := renderAt(float64(i) / float64(ax.seeds-1)); err != nil {
+			return out, err
+		}
+	}
+	step := 1.0 / float64(ax.seeds-1)
+	a := math.Max(0, out.bestNorm-step)
+	b := math.Min(1, out.bestNorm+step)
+
+	if b-a > 1e-6 && ax.refine > 0 {
+		const gr = 0.6180339887498949
+		c := b - gr*(b-a)
+		d := a + gr*(b-a)
+		fc, err := renderAt(c)
+		if err != nil {
+			return out, err
+		}
+		fd, err := renderAt(d)
+		if err != nil {
+			return out, err
+		}
+		scoreOf := func(v float64) float64 { return tuneScore(v, ax.goal, ax.target) }
+		for i := 0; i < ax.refine; i++ {
+			if scoreOf(fc) > scoreOf(fd) {
+				b, d, fd = d, c, fc
+				c = b - gr*(b-a)
+				if fc, err = renderAt(c); err != nil {
+					return out, err
+				}
+			} else {
+				a, c, fc = c, d, fd
+				d = a + gr*(b-a)
+				if fd, err = renderAt(d); err != nil {
+					return out, err
+				}
+			}
+		}
+	}
+
+	// Land at the best value found (the search's last render is not necessarily the best).
+	if _, _, _, e := lc.SetParam(ax.p.ID, out.bestNorm, false); e != nil {
+		return out, e
+	}
+	return out, nil
 }
 
 // formatMeasure renders a measure value with a unit hint for the human summary line: Hz for the centroid and for
